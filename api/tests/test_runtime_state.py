@@ -111,3 +111,74 @@ def test_reset_clears_runtime_fields():
     assert state["temporary_constraints"] == []
     assert state["reset_after_turn"] is False
     assert state["trace_refs"] == []
+
+
+def test_explicit_null_update_fields_are_ignored():
+    client = TestClient(app)
+    base = {
+        "request_id": "rid-5",
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "dev",
+    }
+    client.post(
+        "/v1/runtime/state/update",
+        json={
+            **base,
+            "updates": {
+                "temporary_constraints": ["preserve_flow"],
+                "trace_refs": ["rid-5"],
+                "reset_after_turn": True,
+            },
+        },
+    )
+
+    update = client.post(
+        "/v1/runtime/state/update",
+        json={
+            **base,
+            "updates": {
+                "temporary_constraints": None,
+                "trace_refs": None,
+                "reset_after_turn": None,
+            },
+        },
+    )
+
+    assert update.status_code == 200
+    state = update.json()["runtime_state"]
+    assert state["temporary_constraints"] == ["preserve_flow"]
+    assert state["trace_refs"] == ["rid-5"]
+    assert state["reset_after_turn"] is True
+
+
+def test_oversized_constraint_labels_are_rejected():
+    client = TestClient(app)
+    response = client.post(
+        "/v1/runtime/state/update",
+        json={
+            "request_id": "rid-6",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "updates": {"temporary_constraints": ["x" * 65]},
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_oversized_trace_refs_are_rejected():
+    client = TestClient(app)
+    response = client.post(
+        "/v1/runtime/state/update",
+        json={
+            "request_id": "rid-7",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "updates": {"trace_refs": ["x" * 121]},
+        },
+    )
+
+    assert response.status_code == 422

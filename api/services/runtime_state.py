@@ -60,7 +60,7 @@ def update_state(
     updates: RuntimeStateUpdate,
 ) -> RuntimeState:
     state = resolve_state(owner_id=owner_id, conversation_id=conversation_id, surface=surface)
-    update_payload = updates.model_dump(exclude_unset=True)
+    update_payload = updates.model_dump(exclude_unset=True, exclude_none=True)
     next_state = RuntimeState(
         **{
             **state.model_dump(),
