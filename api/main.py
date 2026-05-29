@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 from models import (
+    CompanionPolicyCompileRequest,
+    CompanionPolicyCompileResponse,
     RuntimeOverlayResponse,
     RuntimeStateResetRequest,
     RuntimeStateResetResponse,
@@ -9,6 +11,7 @@ from models import (
     RuntimeStateResponse,
     RuntimeStateUpdateRequest,
 )
+from services.companion_policy import compile_policy
 from services.runtime_state import build_overlay, reset_state, resolve_state, update_state
 
 app = FastAPI(title="Cognitive Runtime", version="0.1.0")
@@ -64,3 +67,17 @@ async def runtime_overlay(body: RuntimeStateResolveRequest) -> RuntimeOverlayRes
         omitted=overlay is None,
         omission_reason=omission_reason,
     )
+
+@app.post("/v1/companion/policy/compile", response_model=CompanionPolicyCompileResponse)
+async def companion_policy_compile(
+    body: CompanionPolicyCompileRequest,
+) -> CompanionPolicyCompileResponse:
+    state = resolve_state(
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+    )
+    return CompanionPolicyCompileResponse(
+        **compile_policy(state=state, requested_scene=body.requested_scene)
+    )
+
