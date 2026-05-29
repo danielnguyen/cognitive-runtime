@@ -58,6 +58,44 @@ def test_explicit_scene_resolves_scene_policy():
     assert "Scene policy: planning" in body["overlays"][2]["content"]
 
 
+def test_requested_scene_aliases_return_canonical_scene_ids():
+    client = TestClient(app)
+
+    aliases = {
+        "coding": "coding_build",
+        "coding_build_mode": "coding_build",
+        "reflective_conversation": "reflective",
+        "notifications_briefings": "briefing",
+    }
+    for alias, canonical in aliases.items():
+        response = client.post(
+            "/v1/companion/policy/compile",
+            json={**_base(), "requested_scene": alias},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["scene_id"] == canonical
+        assert body["scene_source"] == "requested_scene"
+        assert body["warnings"] == []
+
+
+def test_runtime_scene_alias_returns_canonical_scene_id():
+    client = TestClient(app)
+    client.post(
+        "/v1/runtime/state/update",
+        json={**_base(), "updates": {"active_scene": "coding_build_mode"}},
+    )
+
+    response = client.post("/v1/companion/policy/compile", json=_base())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scene_id"] == "coding_build"
+    assert body["scene_source"] == "runtime_state"
+    assert body["warnings"] == []
+
+
 def test_unknown_requested_scene_falls_back_without_using_runtime_scene():
     client = TestClient(app)
     client.post(

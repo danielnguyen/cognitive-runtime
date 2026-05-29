@@ -28,6 +28,13 @@ _CONTRACT_CONTENT = (
     "forward progress."
 )
 
+_SCENE_ALIASES = {
+    "coding": "coding_build",
+    "coding_build_mode": "coding_build",
+    "reflective_conversation": "reflective",
+    "notifications_briefings": "briefing",
+}
+
 _SCENE_POLICIES = {
     "general": (
         "Scene policy: use the general operating mode. Match the task context, "
@@ -39,12 +46,7 @@ _SCENE_POLICIES = {
         "first. Defer non-urgent branching and suppress long caveats unless they "
         "are safety-critical."
     ),
-    "coding": (
-        "Scene policy: coding/build mode. Emphasize diagnosis, concrete deltas, "
-        "and the next move. Prefer checklists, commands, tests, and diffs over "
-        "abstract discussion."
-    ),
-    "coding_build_mode": (
+    "coding_build": (
         "Scene policy: coding/build mode. Emphasize diagnosis, concrete deltas, "
         "and the next move. Prefer checklists, commands, tests, and diffs over "
         "abstract discussion."
@@ -57,7 +59,7 @@ _SCENE_POLICIES = {
         "Scene policy: planning. Clarify goal, constraints, sequencing, and "
         "tradeoffs. Prefer a concrete next-step path over broad possibility space."
     ),
-    "reflective_conversation": (
+    "reflective": (
         "Scene policy: reflective conversation. Allow more synthesis and careful "
         "abstraction while interrupting speculative loops when value drops."
     ),
@@ -65,7 +67,7 @@ _SCENE_POLICIES = {
         "Scene policy: travel/logistics. Prioritize timing, dependencies, "
         "locations, contingencies, and concise decision support."
     ),
-    "notifications_briefings": (
+    "briefing": (
         "Scene policy: notifications/briefings. Start with a one-line or short "
         "brief, state why it matters, and keep dismissal easy."
     ),
@@ -78,6 +80,13 @@ _SCENE_POLICIES = {
         "on improvements, prefer one next step, and keep phrasing calm and direct."
     ),
 }
+
+
+def _canonical_scene(scene_id: str) -> str | None:
+    canonical = _SCENE_ALIASES.get(scene_id, scene_id)
+    if canonical in _SCENE_POLICIES:
+        return canonical
+    return None
 
 
 def _overlay_id(*, overlay_type: str, scene_id: str) -> str:
@@ -109,13 +118,15 @@ def _resolve_scene(
     runtime_scene: str | None,
 ) -> tuple[str, float, str, list[str]]:
     if requested_scene is not None:
-        if requested_scene in _SCENE_POLICIES:
-            return requested_scene, 1.0, "requested_scene", []
+        canonical = _canonical_scene(requested_scene)
+        if canonical:
+            return canonical, 1.0, "requested_scene", []
         return GENERAL_SCENE_ID, 0.0, "fallback_general", ["unknown_requested_scene"]
 
     if runtime_scene:
-        if runtime_scene in _SCENE_POLICIES:
-            return runtime_scene, 0.8, "runtime_state", []
+        canonical = _canonical_scene(runtime_scene)
+        if canonical:
+            return canonical, 0.8, "runtime_state", []
         return GENERAL_SCENE_ID, 0.0, "fallback_general", ["unknown_runtime_scene"]
 
     return GENERAL_SCENE_ID, 0.5, "general", []
