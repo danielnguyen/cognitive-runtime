@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 AttentionStatus = Literal["active", "paused", "resolved"]
 BoundedLabel = Annotated[str, Field(min_length=1, max_length=64)]
 BoundedTraceRef = Annotated[str, Field(min_length=1, max_length=120)]
+BoundedCompanionContent = Annotated[str, Field(min_length=1, max_length=1200)]
+BoundedScene = Annotated[str, Field(min_length=1, max_length=64)]
 
 
 class AttentionFocus(BaseModel):
@@ -78,3 +80,37 @@ class RuntimeOverlayResponse(BaseModel):
 class RuntimeStateResetResponse(BaseModel):
     runtime_state: RuntimeState
     reset: bool
+
+class CompanionPolicyCompileRequest(RuntimeStateResolveRequest):
+    requested_scene: BoundedScene | None = None
+
+
+class CompanionPolicyOverlay(BaseModel):
+    overlay_id: str
+    overlay_type: Literal[
+        "interaction_contract",
+        "companion_profile",
+        "scene_policy",
+    ]
+    priority: Literal["companion_policy"] = "companion_policy"
+    role: Literal["system"] = "system"
+    content: BoundedCompanionContent
+
+
+class CompanionPolicyCompileResponse(BaseModel):
+    profile_id: str
+    profile_version: int
+    contract_id: str
+    contract_version: int
+    scene_id: str
+    scene_confidence: float = Field(ge=0.0, le=1.0)
+    scene_source: Literal[
+        "requested_scene",
+        "runtime_state",
+        "general",
+        "fallback_general",
+    ]
+    warnings: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+    runtime_state: RuntimeState
+    overlays: list[CompanionPolicyOverlay] = Field(min_length=3, max_length=3)
+
