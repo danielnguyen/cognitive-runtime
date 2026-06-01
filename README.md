@@ -1,8 +1,8 @@
 # cognitive-runtime
 
-Cluster 7.5 keeps this repo as an R40 runtime-state boundary scaffold only.
+`cognitive-runtime` owns the R40 runtime-state boundary scaffold and the current Cluster 8 companion policy scaffold. The companion policy compiler includes a practical R19 static/default interaction contract substrate so downstream R24 work can inspect boundary and repair constraints without hardcoding them into prompt text.
 
-The runtime-state boundary may eventually own temporary, inspectable interaction state such as active scene, interaction mode, temporary task state, reset semantics, and trace references. That state must remain separate from canonical memory in `basic-memory-store` and from prompt assembly in `chat-orchestrator`.
+The runtime-state boundary may eventually own temporary, inspectable interaction state such as active scene, interaction mode, temporary task state, reset semantics, and trace references. That state must remain separate from canonical memory in `basic-memory-store` and from prompt assembly in `chat-orchestrator`. The R19 contract substrate remains static/default in this pass: it is not personalized, persisted, or full R17/R18/R19 completion.
 
 Out of scope for Cluster 7.5:
 
@@ -11,6 +11,7 @@ Out of scope for Cluster 7.5:
 - worker or persistence layer
 - full conversational runtime engine
 - Phase 3 R41/R42 live-state, turn negotiation, timing, pause, backchannel, or interruption behavior
+- R24 interrupt detection, grounding execution, trigger evaluation, or interrupt event persistence
 
 ## Local run
 
