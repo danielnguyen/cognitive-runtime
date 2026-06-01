@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from hashlib import sha256
 
-from models import CompanionPolicyOverlay, RuntimeState
+from models import (
+    CompanionPolicyOverlay,
+    InteractionContract,
+    InteractionContractTrace,
+    RuntimeState,
+)
 
 PROFILE_ID = "companion_profile_r17_mvp"
 PROFILE_VERSION = 1
-CONTRACT_ID = "interaction_contract_r19_mvp"
-CONTRACT_VERSION = 1
+CONTRACT_ID = "interaction_contract_r19_default_static"
+CONTRACT_VERSION = 2
 GENERAL_SCENE_ID = "general"
 
 _PROFILE_CONTENT = (
@@ -19,14 +24,55 @@ _PROFILE_CONTENT = (
     "sycophantic, theatrically sentient, or tonally erratic behavior."
 )
 
-_CONTRACT_CONTENT = (
-    "Interaction contract: preserve the user's attention and time. Be candid, "
-    "reliable, and useful under disagreement. Do not imply memory that does not "
-    "exist, use continuity as performance, pressure continued engagement, or add "
-    "relational framing that the task does not call for. When wrong, acknowledge "
-    "the miss clearly, correct the substance, avoid apology loops, and restore "
-    "forward progress."
-)
+_CONTRACT_RULES = {
+    "trust_rules": [
+        "Be explicit when uncertainty is material to the user's decision.",
+        "Do not imply memory, continuity, evidence, or capability that is not available.",
+        "Preserve usefulness and candor even when disagreeing with the user.",
+    ],
+    "interaction_boundaries": [
+        "Do not use guilt language, pressure, pseudo-attachment, or exclusivity framing.",
+        "Do not add relational intensity beyond the task context.",
+        "Respect task context over unnecessary companion framing.",
+    ],
+    "repair_rules": [
+        "When wrong, acknowledge the miss clearly and briefly.",
+        "Correct the substance before explaining process.",
+        "Avoid apology loops and restore forward progress.",
+    ],
+    "memory_or_recall_boundaries": [
+        "Mention remembered details only when they materially improve the current task.",
+        "Do not surface memory to perform closeness or imply unsupported intimacy.",
+        "If memory confidence is weak or source context is missing, say so or omit it.",
+    ],
+    "autonomy_rules": [
+        "The user can decline, redirect, or override advice without friction.",
+        "Do not frame disagreement as disloyalty or resistance as a problem to solve.",
+        "Prefer options and consequences over coercive language.",
+    ],
+    "tone_constraints": [
+        "Keep tone candid, calm, concise, and operationally useful.",
+        "Avoid sycophancy, melodrama, sterile detachment, and theatrical sentience.",
+        "Use warmth only where it supports the task or repair path.",
+    ],
+    "allowed_intervention_styles": [
+        "soft_redirect",
+        "candid_challenge",
+        "boundary_reminder",
+        "repair_acknowledgement",
+    ],
+    "disallowed_intervention_styles": [
+        "guilt_pressure",
+        "pseudo_attachment",
+        "coercive_persistence",
+        "performative_memory",
+    ],
+    "defer_conditions": [
+        "Defer when the user explicitly chooses a harmless path after the tradeoff is clear.",
+        "Defer when added relational framing would distract from the task.",
+        "Defer when available evidence is too thin to support a useful challenge.",
+    ],
+}
 
 _SCENE_ALIASES = {
     "coding": "coding_build",
@@ -61,7 +107,7 @@ _SCENE_POLICIES = {
     ),
     "reflective": (
         "Scene policy: reflective conversation. Allow more synthesis and careful "
-        "abstraction while interrupting speculative loops when value drops."
+        "abstraction while keeping speculative threads bounded when value drops."
     ),
     "travel_logistics": (
         "Scene policy: travel/logistics. Prioritize timing, dependencies, "
@@ -79,6 +125,16 @@ _SCENE_POLICIES = {
         "Scene policy: overload/recovery. Reduce optional complexity, avoid piling "
         "on improvements, prefer one next step, and keep phrasing calm and direct."
     ),
+}
+
+_KNOWN_SURFACES = {
+    "unknown",
+    "dev",
+    "vscode",
+    "web",
+    "telegram",
+    "alexa",
+    "car",
 }
 
 
@@ -132,20 +188,86 @@ def _resolve_scene(
     return GENERAL_SCENE_ID, 0.5, "general", []
 
 
+def _contract_overlay_content(contract: InteractionContract) -> str:
+    return (
+        "Interaction contract: be candid and useful while respecting boundaries. "
+        f"Trust: {contract.trust_rules[0]} "
+        f"Boundaries: {contract.interaction_boundaries[0]} "
+        f"Memory: {contract.memory_or_recall_boundaries[0]} "
+        f"Autonomy: {contract.autonomy_rules[0]} "
+        f"Repair: {contract.repair_rules[0]} {contract.repair_rules[1]} "
+        f"Tone: {contract.tone_constraints[0]}"
+    )
+
+
+def resolve_interaction_contract(
+    *,
+    owner_id: str,
+    surface: str,
+    requested_scene: str | None,
+    runtime_state: RuntimeState,
+) -> tuple[InteractionContract, InteractionContractTrace]:
+    warnings = ["default_static_contract"]
+    if surface not in _KNOWN_SURFACES:
+        warnings.append("unknown_surface_default_contract")
+    if requested_scene is not None and _canonical_scene(requested_scene) is None:
+        warnings.append("unknown_requested_scene")
+    elif requested_scene is None and runtime_state.active_scene:
+        if _canonical_scene(runtime_state.active_scene) is None:
+            warnings.append("unknown_runtime_scene")
+
+    contract = InteractionContract(
+        contract_id=CONTRACT_ID,
+        contract_version=CONTRACT_VERSION,
+        owner_id=owner_id,
+        scope="global_default",
+        source="default_static",
+        **_CONTRACT_RULES,
+    )
+    trace = InteractionContractTrace(
+        contract_id=contract.contract_id,
+        contract_version=contract.contract_version,
+        source=contract.source,
+        scope=contract.scope,
+        selected_rule_groups=[
+            "trust_rules",
+            "interaction_boundaries",
+            "repair_rules",
+            "memory_or_recall_boundaries",
+            "autonomy_rules",
+            "tone_constraints",
+            "allowed_intervention_styles",
+            "disallowed_intervention_styles",
+            "defer_conditions",
+        ],
+        selected_boundary_rules=contract.interaction_boundaries,
+        selected_repair_rules=contract.repair_rules,
+        warnings=warnings,
+    )
+    return contract, trace
+
+
 def compile_policy(
     *,
     state: RuntimeState,
     requested_scene: str | None = None,
 ) -> dict[str, object]:
-    scene_id, scene_confidence, scene_source, warnings = _resolve_scene(
+    scene_id, scene_confidence, scene_source, scene_warnings = _resolve_scene(
         requested_scene=requested_scene,
         runtime_scene=state.active_scene,
     )
+    contract, contract_trace = resolve_interaction_contract(
+        owner_id=state.owner_id,
+        surface=state.surface,
+        requested_scene=requested_scene,
+        runtime_state=state,
+    )
+    warnings = list(dict.fromkeys([*scene_warnings, *contract_trace.warnings]))
     overlays = [
         _overlay(
             overlay_type="interaction_contract",
             scene_id=scene_id,
-            content=_CONTRACT_CONTENT,
+            content=_contract_overlay_content(contract),
         ),
         _overlay(
             overlay_type="companion_profile",
@@ -161,12 +283,14 @@ def compile_policy(
     return {
         "profile_id": PROFILE_ID,
         "profile_version": PROFILE_VERSION,
-        "contract_id": CONTRACT_ID,
-        "contract_version": CONTRACT_VERSION,
+        "contract_id": contract.contract_id,
+        "contract_version": contract.contract_version,
         "scene_id": scene_id,
         "scene_confidence": scene_confidence,
         "scene_source": scene_source,
         "warnings": warnings,
+        "interaction_contract": contract,
+        "contract_trace": contract_trace,
         "runtime_state": state,
         "overlays": overlays,
     }

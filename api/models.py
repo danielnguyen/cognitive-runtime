@@ -9,6 +9,7 @@ BoundedLabel = Annotated[str, Field(min_length=1, max_length=64)]
 BoundedTraceRef = Annotated[str, Field(min_length=1, max_length=120)]
 BoundedCompanionContent = Annotated[str, Field(min_length=1, max_length=1200)]
 BoundedScene = Annotated[str, Field(min_length=1, max_length=64)]
+BoundedRule = Annotated[str, Field(min_length=1, max_length=240)]
 
 
 class AttentionFocus(BaseModel):
@@ -81,6 +82,44 @@ class RuntimeStateResetResponse(BaseModel):
     runtime_state: RuntimeState
     reset: bool
 
+
+class InteractionContract(BaseModel):
+    contract_id: str = Field(max_length=120)
+    contract_version: int
+    owner_id: str = Field(max_length=120)
+    scope: Literal["global_default", "owner_default"] = "global_default"
+    source: Literal["default_static", "persisted"] = "default_static"
+    trust_rules: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    interaction_boundaries: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    repair_rules: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    memory_or_recall_boundaries: list[BoundedRule] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+    autonomy_rules: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    tone_constraints: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    allowed_intervention_styles: list[BoundedLabel] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+    disallowed_intervention_styles: list[BoundedLabel] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+    defer_conditions: list[BoundedRule] = Field(default_factory=list, max_length=8)
+
+
+class InteractionContractTrace(BaseModel):
+    contract_id: str = Field(max_length=120)
+    contract_version: int
+    source: Literal["default_static", "persisted"]
+    scope: Literal["global_default", "owner_default"]
+    selected_rule_groups: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    selected_boundary_rules: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    selected_repair_rules: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    warnings: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+
+
 class CompanionPolicyCompileRequest(RuntimeStateResolveRequest):
     requested_scene: BoundedScene | None = None
 
@@ -111,6 +150,8 @@ class CompanionPolicyCompileResponse(BaseModel):
         "fallback_general",
     ]
     warnings: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+    interaction_contract: InteractionContract
+    contract_trace: InteractionContractTrace
     runtime_state: RuntimeState
     overlays: list[CompanionPolicyOverlay] = Field(min_length=3, max_length=3)
 
