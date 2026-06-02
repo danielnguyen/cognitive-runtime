@@ -4,6 +4,8 @@ from fastapi import FastAPI
 from models import (
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
+    InterruptEvaluateRequest,
+    InterruptEvaluateResponse,
     RuntimeOverlayResponse,
     RuntimeStateResetRequest,
     RuntimeStateResetResponse,
@@ -12,6 +14,7 @@ from models import (
     RuntimeStateUpdateRequest,
 )
 from services.companion_policy import compile_policy
+from services.interrupt_policy import evaluate_interrupt_policy
 from services.runtime_state import build_overlay, reset_state, resolve_state, update_state
 
 app = FastAPI(title="Cognitive Runtime", version="0.1.0")
@@ -81,3 +84,7 @@ async def companion_policy_compile(
         **compile_policy(state=state, requested_scene=body.requested_scene)
     )
 
+
+@app.post("/v1/interrupt/evaluate", response_model=InterruptEvaluateResponse)
+async def interrupt_evaluate(body: InterruptEvaluateRequest) -> InterruptEvaluateResponse:
+    return evaluate_interrupt_policy(body)
