@@ -9,11 +9,13 @@ from models import (
     RuntimeState,
 )
 
-PROFILE_ID = "companion_profile_r17_mvp"
+PROFILE_ID = "default_companion_profile"
 PROFILE_VERSION = 1
-CONTRACT_ID = "interaction_contract_r19_default_static"
+CONTRACT_ID = "default_interaction_contract"
 CONTRACT_VERSION = 2
 GENERAL_SCENE_ID = "general"
+DEFAULT_CONTRACT_SOURCE = "default_compiled"
+DEFAULT_CONTRACT_WARNING = "default_contract_applied"
 
 _PROFILE_CONTENT = (
     "Companion profile: act as a personal intelligence companion and executive "
@@ -207,7 +209,7 @@ def resolve_interaction_contract(
     requested_scene: str | None,
     runtime_state: RuntimeState,
 ) -> tuple[InteractionContract, InteractionContractTrace]:
-    warnings = ["default_static_contract"]
+    warnings = [DEFAULT_CONTRACT_WARNING]
     if surface not in _KNOWN_SURFACES:
         warnings.append("unknown_surface_default_contract")
     if requested_scene is not None and _canonical_scene(requested_scene) is None:
@@ -221,7 +223,7 @@ def resolve_interaction_contract(
         contract_version=CONTRACT_VERSION,
         owner_id=owner_id,
         scope="global_default",
-        source="default_static",
+        source=DEFAULT_CONTRACT_SOURCE,
         **_CONTRACT_RULES,
     )
     trace = InteractionContractTrace(

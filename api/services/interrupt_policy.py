@@ -373,7 +373,7 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
 
     if body.surface not in {"unknown", "dev", "vscode", "web", "telegram", "alexa", "car"}:
         warnings.append("unknown_surface_interrupt_policy")
-    if interaction_contract.source == "default_static":
+    if interaction_contract.source in {"default_compiled", "default_static"}:
         warnings.append("default_contract_source")
 
     detector_signals = {
@@ -386,6 +386,11 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
         "casual_or_low_stakes": low_stakes,
         "message_count": len(recent_messages),
     }
+
+    normalized_contract_warnings = [
+        "default_contract_applied" if warning == "default_static_contract" else warning
+        for warning in contract_trace.warnings
+    ]
 
     return InterruptEvaluateResponse(
         request_id=body.request_id,
@@ -407,7 +412,7 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
             "requested_scene": requested_scene,
         },
         contract_constraints_applied=contract_constraints,
-        warnings=list(dict.fromkeys(warnings + list(contract_trace.warnings))),
+        warnings=list(dict.fromkeys(warnings + normalized_contract_warnings)),
         debug={
             "detector_signals": detector_signals,
             "advisory_text": advisory_text,
