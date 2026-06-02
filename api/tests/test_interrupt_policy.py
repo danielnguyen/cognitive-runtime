@@ -227,4 +227,5 @@ def test_interrupt_evaluate_accepts_legacy_default_static_contract_source():
     assert body["should_defer"] is True
     assert "no_contract_permitted_style" in body["reason_json"]["defer_reasons"]
     assert "default_contract_source" in body["warnings"]
-    assert "default_static_contract" in body["warnings"]
+    assert "default_contract_applied" in body["warnings"]
+    assert "default_static_contract" not in body["warnings"]

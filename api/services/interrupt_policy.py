@@ -387,6 +387,11 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
         "message_count": len(recent_messages),
     }
 
+    normalized_contract_warnings = [
+        "default_contract_applied" if warning == "default_static_contract" else warning
+        for warning in contract_trace.warnings
+    ]
+
     return InterruptEvaluateResponse(
         request_id=body.request_id,
         owner_id=body.owner_id,
@@ -407,7 +412,7 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
             "requested_scene": requested_scene,
         },
         contract_constraints_applied=contract_constraints,
-        warnings=list(dict.fromkeys(warnings + list(contract_trace.warnings))),
+        warnings=list(dict.fromkeys(warnings + normalized_contract_warnings)),
         debug={
             "detector_signals": detector_signals,
             "advisory_text": advisory_text,
