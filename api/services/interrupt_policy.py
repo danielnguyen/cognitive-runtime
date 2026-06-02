@@ -373,7 +373,7 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
 
     if body.surface not in {"unknown", "dev", "vscode", "web", "telegram", "alexa", "car"}:
         warnings.append("unknown_surface_interrupt_policy")
-    if interaction_contract.source == "default_static":
+    if interaction_contract.source in {"default_compiled", "default_static"}:
         warnings.append("default_contract_source")
 
     detector_signals = {

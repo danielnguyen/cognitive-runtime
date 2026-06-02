@@ -23,13 +23,13 @@ def test_compile_returns_bounded_ordered_policy_overlays():
 
     assert response.status_code == 200
     body = response.json()
-    assert body["profile_id"] == "companion_profile_r17_mvp"
+    assert body["profile_id"] == "default_companion_profile"
     assert body["profile_version"] == 1
-    assert body["contract_id"] == "interaction_contract_r19_default_static"
+    assert body["contract_id"] == "default_interaction_contract"
     assert body["contract_version"] == 2
     assert body["scene_id"] == "general"
     assert body["scene_source"] == "general"
-    assert body["warnings"] == ["default_static_contract"]
+    assert body["warnings"] == ["default_contract_applied"]
     assert [overlay["overlay_type"] for overlay in body["overlays"]] == [
         "interaction_contract",
         "companion_profile",
@@ -47,11 +47,11 @@ def test_compile_returns_structured_r19_interaction_contract():
 
     assert response.status_code == 200
     contract = response.json()["interaction_contract"]
-    assert contract["contract_id"] == "interaction_contract_r19_default_static"
+    assert contract["contract_id"] == "default_interaction_contract"
     assert contract["contract_version"] == 2
     assert contract["owner_id"] == "owner"
     assert contract["scope"] == "global_default"
-    assert contract["source"] == "default_static"
+    assert contract["source"] == "default_compiled"
     for field in (
         "trust_rules",
         "interaction_boundaries",
@@ -75,11 +75,11 @@ def test_compile_returns_inspectable_contract_trace():
 
     assert response.status_code == 200
     trace = response.json()["contract_trace"]
-    assert trace["contract_id"] == "interaction_contract_r19_default_static"
+    assert trace["contract_id"] == "default_interaction_contract"
     assert trace["contract_version"] == 2
-    assert trace["source"] == "default_static"
+    assert trace["source"] == "default_compiled"
     assert trace["scope"] == "global_default"
-    assert trace["warnings"] == ["default_static_contract"]
+    assert trace["warnings"] == ["default_contract_applied"]
     assert trace["selected_rule_groups"] == [
         "trust_rules",
         "interaction_boundaries",
@@ -130,7 +130,7 @@ def test_explicit_scene_resolves_scene_policy():
     assert body["scene_id"] == "planning"
     assert body["scene_confidence"] == 1.0
     assert body["scene_source"] == "requested_scene"
-    assert body["warnings"] == ["default_static_contract"]
+    assert body["warnings"] == ["default_contract_applied"]
     assert "Scene policy: planning" in body["overlays"][2]["content"]
 
 
@@ -153,7 +153,7 @@ def test_requested_scene_aliases_return_canonical_scene_ids():
         body = response.json()
         assert body["scene_id"] == canonical
         assert body["scene_source"] == "requested_scene"
-        assert body["warnings"] == ["default_static_contract"]
+        assert body["warnings"] == ["default_contract_applied"]
 
 
 def test_runtime_scene_alias_returns_canonical_scene_id():
@@ -169,7 +169,7 @@ def test_runtime_scene_alias_returns_canonical_scene_id():
     body = response.json()
     assert body["scene_id"] == "coding_build"
     assert body["scene_source"] == "runtime_state"
-    assert body["warnings"] == ["default_static_contract"]
+    assert body["warnings"] == ["default_contract_applied"]
 
 
 def test_unknown_requested_scene_falls_back_without_using_runtime_scene():
@@ -188,9 +188,9 @@ def test_unknown_requested_scene_falls_back_without_using_runtime_scene():
     body = response.json()
     assert body["scene_id"] == "general"
     assert body["scene_source"] == "fallback_general"
-    assert body["warnings"] == ["unknown_requested_scene", "default_static_contract"]
+    assert body["warnings"] == ["unknown_requested_scene", "default_contract_applied"]
     assert body["contract_trace"]["warnings"] == [
-        "default_static_contract",
+        "default_contract_applied",
         "unknown_requested_scene",
     ]
 
@@ -205,13 +205,13 @@ def test_unknown_surface_falls_back_to_default_contract_with_warning():
 
     assert response.status_code == 200
     body = response.json()
-    assert body["interaction_contract"]["source"] == "default_static"
+    assert body["interaction_contract"]["source"] == "default_compiled"
     assert body["contract_trace"]["warnings"] == [
-        "default_static_contract",
+        "default_contract_applied",
         "unknown_surface_default_contract",
     ]
     assert body["warnings"] == [
-        "default_static_contract",
+        "default_contract_applied",
         "unknown_surface_default_contract",
     ]
 
@@ -229,7 +229,7 @@ def test_runtime_scene_used_only_when_requested_scene_absent():
     body = response.json()
     assert body["scene_id"] == "planning"
     assert body["scene_source"] == "runtime_state"
-    assert body["warnings"] == ["default_static_contract"]
+    assert body["warnings"] == ["default_contract_applied"]
 
 
 def test_unknown_runtime_scene_falls_back_with_warning():
@@ -245,9 +245,9 @@ def test_unknown_runtime_scene_falls_back_with_warning():
     body = response.json()
     assert body["scene_id"] == "general"
     assert body["scene_source"] == "fallback_general"
-    assert body["warnings"] == ["unknown_runtime_scene", "default_static_contract"]
+    assert body["warnings"] == ["unknown_runtime_scene", "default_contract_applied"]
     assert body["contract_trace"]["warnings"] == [
-        "default_static_contract",
+        "default_contract_applied",
         "unknown_runtime_scene",
     ]
 
