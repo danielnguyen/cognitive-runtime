@@ -227,3 +227,77 @@ class InterruptEvaluateResponse(BaseModel):
     contract_constraints_applied: dict[str, Any] = Field(default_factory=dict)
     warnings: list[BoundedLabel] = Field(default_factory=list, max_length=12)
     debug: InterruptDebug
+
+DiagnosticResult = Literal["pass", "warn", "fail"]
+DiagnosticSeverity = Literal["none", "low", "medium", "high"]
+SceneSource = Literal["requested_scene", "runtime_state", "general", "fallback_general"]
+
+
+class ScenePolicyDetail(BaseModel):
+    scene_id: str = Field(max_length=64)
+    scene_version: int
+    aliases: list[BoundedScene] = Field(default_factory=list, max_length=8)
+    content: BoundedCompanionContent
+    active: bool
+    status: str = Field(max_length=64)
+    constraints_json: dict[str, Any] = Field(default_factory=dict)
+    initiative_policy_json: dict[str, Any] = Field(default_factory=dict)
+    interrupt_policy_json: dict[str, Any] = Field(default_factory=dict)
+    recall_policy_json: dict[str, Any] = Field(default_factory=dict)
+    format_policy_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class SceneResolveRequest(RuntimeStateResolveRequest):
+    requested_scene: BoundedScene | None = None
+
+
+class SceneResolveResponse(BaseModel):
+    scene_id: str = Field(max_length=64)
+    scene_version: int
+    scene_confidence: float = Field(ge=0.0, le=1.0)
+    scene_source: SceneSource
+    warnings: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+    signals_json: dict[str, Any] = Field(default_factory=dict)
+    used_fallback: bool
+    used_default_scene: bool
+    policy: ScenePolicyDetail
+
+
+class DiagnosticFinding(BaseModel):
+    finding_type: BoundedLabel
+    severity: DiagnosticSeverity
+    message: str = Field(max_length=240)
+
+
+class InteractionContractValidateRequest(RuntimeStateResolveRequest):
+    text: BoundedText
+    requested_scene: BoundedScene | None = None
+    interaction_contract: InteractionContract | None = None
+
+
+class InteractionContractValidateResponse(BaseModel):
+    diagnostic_only: Literal[True] = True
+    result: DiagnosticResult
+    severity: DiagnosticSeverity
+    warnings: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    findings: list[DiagnosticFinding] = Field(default_factory=list, max_length=12)
+    contract_id: str = Field(max_length=120)
+    contract_version: int
+    reason_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class RepairSimulateRequest(RuntimeStateResolveRequest):
+    miss_description: BoundedText
+    corrected_substance: BoundedText
+    requested_scene: BoundedScene | None = None
+
+
+class RepairSimulateResponse(BaseModel):
+    diagnostic_only: Literal[True] = True
+    repair_text: BoundedText
+    result: DiagnosticResult
+    severity: DiagnosticSeverity
+    warnings: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    contract_id: str = Field(max_length=120)
+    contract_version: int
+    reason_json: dict[str, Any] = Field(default_factory=dict)

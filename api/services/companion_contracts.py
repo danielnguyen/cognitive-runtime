@@ -298,6 +298,39 @@ class CompanionContractsRepository:
                     updated_at TEXT NOT NULL,
                     UNIQUE(owner_id, contract_id, profile_id, profile_version, contract_version)
                 );
+                
+                CREATE TABLE IF NOT EXISTS scene_resolution_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    surface TEXT NOT NULL,
+                    requested_scene TEXT,
+                    runtime_scene TEXT,
+                    resolved_scene_id TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    signals_json TEXT NOT NULL,
+                    used_fallback INTEGER NOT NULL,
+                    used_default_scene INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS interaction_boundary_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    surface TEXT NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    contract_version INTEGER NOT NULL,
+                    check_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    input_summary TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    reason_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._seed(conn)
@@ -518,7 +551,111 @@ class CompanionContractsRepository:
                 "interaction_contracts": int(
                     conn.execute("SELECT COUNT(*) FROM interaction_contracts;").fetchone()[0]
                 ),
+                "scene_resolution_events": int(
+                    conn.execute("SELECT COUNT(*) FROM scene_resolution_events;").fetchone()[0]
+                ),
+                "interaction_boundary_events": int(
+                    conn.execute("SELECT COUNT(*) FROM interaction_boundary_events;").fetchone()[0]
+                ),
             }
+
+    def record_scene_resolution_event(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        requested_scene: str | None,
+        runtime_scene: str | None,
+        resolved_scene_id: str,
+        confidence: float,
+        source: str,
+        signals_json: dict[str, Any],
+        used_fallback: bool,
+        used_default_scene: bool,
+    ) -> None:
+        created_at = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scene_resolution_events (
+                    request_id, owner_id, conversation_id, surface, requested_scene,
+                    runtime_scene, resolved_scene_id, confidence, source,
+                    signals_json, used_fallback, used_default_scene, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    request_id,
+                    owner_id,
+                    conversation_id,
+                    surface,
+                    requested_scene,
+                    runtime_scene,
+                    resolved_scene_id,
+                    confidence,
+                    source,
+                    _json(signals_json),
+                    int(used_fallback),
+                    int(used_default_scene),
+                    created_at,
+                ),
+            )
+
+    def record_interaction_boundary_event(
+        self,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        contract_id: str,
+        contract_version: int,
+        check_type: str,
+        severity: str,
+        input_summary: str,
+        result: str,
+        reason_json: dict[str, Any],
+    ) -> None:
+        created_at = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO interaction_boundary_events (
+                    request_id, owner_id, conversation_id, surface, contract_id,
+                    contract_version, check_type, severity, input_summary, result,
+                    reason_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    request_id,
+                    owner_id,
+                    conversation_id,
+                    surface,
+                    contract_id,
+                    contract_version,
+                    check_type,
+                    severity,
+                    input_summary,
+                    result,
+                    _json(reason_json),
+                    created_at,
+                ),
+            )
+
+    def list_scene_resolution_events_for_tests(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scene_resolution_events ORDER BY id ASC;"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_interaction_boundary_events_for_tests(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM interaction_boundary_events ORDER BY id ASC;"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def _scene_from_row(self, row: sqlite3.Row) -> ScenePolicyRecord:
         return ScenePolicyRecord(

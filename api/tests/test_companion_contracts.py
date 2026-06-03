@@ -26,6 +26,8 @@ def test_repository_creates_parent_directory_and_seed_records(tmp_path):
         "companion_profiles": 1,
         "scene_policies": len(SCENE_POLICIES),
         "interaction_contracts": 1,
+        "scene_resolution_events": 0,
+        "interaction_boundary_events": 0,
     }
 
 
@@ -40,6 +42,8 @@ def test_repository_initialization_is_idempotent(tmp_path):
         "companion_profiles": 1,
         "scene_policies": len(SCENE_POLICIES),
         "interaction_contracts": 1,
+        "scene_resolution_events": 0,
+        "interaction_boundary_events": 0,
     }
 
 
