@@ -40,7 +40,7 @@ def test_compile_returns_bounded_ordered_policy_overlays():
         assert 0 < len(overlay["content"]) <= 1200
 
 
-def test_compile_returns_structured_r19_interaction_contract():
+def test_compile_returns_structured_interaction_contract():
     client = TestClient(app)
 
     response = client.post("/v1/companion/policy/compile", json=_base())
@@ -95,7 +95,7 @@ def test_compile_returns_inspectable_contract_trace():
     assert trace["selected_repair_rules"]
 
 
-def test_interaction_contract_overlay_is_concise_and_not_r24_execution():
+def test_interaction_contract_overlay_is_concise_and_not_interrupt_execution():
     client = TestClient(app)
 
     response = client.post("/v1/companion/policy/compile", json=_base())

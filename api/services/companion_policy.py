@@ -122,7 +122,23 @@ def _contract_model(
     )
 
 
+def _validate_interaction_contract(contract: InteractionContract) -> None:
+    if not contract.trust_rules:
+        raise RuntimeError("invalid_interaction_contract_record: trust_rules")
+    if not contract.interaction_boundaries:
+        raise RuntimeError("invalid_interaction_contract_record: interaction_boundaries")
+    if not contract.memory_or_recall_boundaries:
+        raise RuntimeError("invalid_interaction_contract_record: memory_or_recall_boundaries")
+    if not contract.autonomy_rules:
+        raise RuntimeError("invalid_interaction_contract_record: autonomy_rules")
+    if len(contract.repair_rules) < 2:
+        raise RuntimeError("invalid_interaction_contract_record: repair_rules")
+    if not contract.tone_constraints:
+        raise RuntimeError("invalid_interaction_contract_record: tone_constraints")
+
+
 def _contract_overlay_content(contract: InteractionContract) -> str:
+    _validate_interaction_contract(contract)
     return (
         "Interaction contract: be candid and useful while respecting boundaries. "
         f"Trust: {contract.trust_rules[0]} "
@@ -165,6 +181,7 @@ def resolve_interaction_contract(
         profile_version=profile.version,
     )
     contract = _contract_model(owner_id=owner_id, contract=contract_record)
+    _validate_interaction_contract(contract)
     trace = InteractionContractTrace(
         contract_id=contract.contract_id,
         contract_version=contract.contract_version,
@@ -207,6 +224,7 @@ def compile_policy(
         profile_version=profile.version,
     )
     contract = _contract_model(owner_id=state.owner_id, contract=contract_record)
+    _validate_interaction_contract(contract)
     contract_trace = InteractionContractTrace(
         contract_id=contract.contract_id,
         contract_version=contract.contract_version,

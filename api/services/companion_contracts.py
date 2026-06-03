@@ -306,25 +306,12 @@ class CompanionContractsRepository:
         now = datetime.now(UTC).isoformat()
         conn.execute(
             """
-            INSERT INTO companion_profiles (
+            INSERT OR IGNORE INTO companion_profiles (
                 owner_id, profile_id, name, version, scope, source, active, status,
                 role_label, content, core_traits_json, behavioral_laws_json,
                 style_constraints_json, surface_overrides_json, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(owner_id, profile_id, version) DO UPDATE SET
-                name = excluded.name,
-                scope = excluded.scope,
-                source = excluded.source,
-                active = excluded.active,
-                status = excluded.status,
-                role_label = excluded.role_label,
-                content = excluded.content,
-                core_traits_json = excluded.core_traits_json,
-                behavioral_laws_json = excluded.behavioral_laws_json,
-                style_constraints_json = excluded.style_constraints_json,
-                surface_overrides_json = excluded.surface_overrides_json,
-                updated_at = excluded.updated_at;
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 "",
@@ -364,23 +351,12 @@ class CompanionContractsRepository:
         for scene_id, data in SCENE_POLICIES.items():
             conn.execute(
                 """
-                INSERT INTO scene_policies (
+                INSERT OR IGNORE INTO scene_policies (
                     scene_id, version, active, status, aliases_json, content,
                     constraints_json, initiative_policy_json, interrupt_policy_json,
                     recall_policy_json, format_policy_json, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(scene_id, version) DO UPDATE SET
-                    active = excluded.active,
-                    status = excluded.status,
-                    aliases_json = excluded.aliases_json,
-                    content = excluded.content,
-                    constraints_json = excluded.constraints_json,
-                    initiative_policy_json = excluded.initiative_policy_json,
-                    interrupt_policy_json = excluded.interrupt_policy_json,
-                    recall_policy_json = excluded.recall_policy_json,
-                    format_policy_json = excluded.format_policy_json,
-                    updated_at = excluded.updated_at;
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     scene_id,
@@ -401,7 +377,7 @@ class CompanionContractsRepository:
 
         conn.execute(
             """
-            INSERT INTO interaction_contracts (
+            INSERT OR IGNORE INTO interaction_contracts (
                 owner_id, contract_id, profile_id, profile_version, contract_version,
                 scope, source, active, status, trust_rules_json,
                 interaction_boundaries_json, repair_rules_json,
@@ -409,24 +385,7 @@ class CompanionContractsRepository:
                 allowed_intervention_styles_json, disallowed_intervention_styles_json,
                 defer_conditions_json, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(
-                owner_id, contract_id, profile_id, profile_version, contract_version
-            ) DO UPDATE SET
-                scope = excluded.scope,
-                source = excluded.source,
-                active = excluded.active,
-                status = excluded.status,
-                trust_rules_json = excluded.trust_rules_json,
-                interaction_boundaries_json = excluded.interaction_boundaries_json,
-                repair_rules_json = excluded.repair_rules_json,
-                memory_or_recall_boundaries_json = excluded.memory_or_recall_boundaries_json,
-                autonomy_rules_json = excluded.autonomy_rules_json,
-                tone_constraints_json = excluded.tone_constraints_json,
-                allowed_intervention_styles_json = excluded.allowed_intervention_styles_json,
-                disallowed_intervention_styles_json = excluded.disallowed_intervention_styles_json,
-                defer_conditions_json = excluded.defer_conditions_json,
-                updated_at = excluded.updated_at;
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 "",
