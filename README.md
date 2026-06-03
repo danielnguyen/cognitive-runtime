@@ -19,7 +19,17 @@ Out of scope for Cluster 7.5:
 2. Copy `api/.env.example` to `api/.env` if local environment overrides are needed
 3. Run `make dev-start` from repo root, or `uvicorn main:app --host 0.0.0.0 --port 4371 --reload` from `api/`
 
-For local host-run, `api/.env` is reserved as the canonical app config location. This scaffold currently has no required environment variables.
+For local host-run, `api/.env` is reserved as the canonical app config location.
+
+### Companion contract storage
+
+`cognitive-runtime` persists companion contract data in SQLite.
+
+- Config key: `COMPANION_CONTRACTS_DB_PATH`
+- Local default: `./data/companion_contracts.sqlite3`
+- Docker path: `/data/companion_contracts.sqlite3`
+- The app creates the parent directory automatically if it does not exist.
+- Docker deployments should mount `/data` as a persistent volume to retain seeded/default contract data across container restarts.
 
 ## Health check
 

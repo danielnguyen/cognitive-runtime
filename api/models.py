@@ -142,6 +142,20 @@ class CompanionPolicyCompileRequest(RuntimeStateResolveRequest):
     requested_scene: BoundedScene | None = None
 
 
+class CompanionProfileActiveResponse(BaseModel):
+    profile_id: str = Field(max_length=120)
+    profile_version: int
+    name: str = Field(max_length=120)
+    scope: Literal["global_default", "owner_default"] = "global_default"
+    source: str = Field(max_length=64)
+    status: str = Field(max_length=64)
+    role_label: str = Field(max_length=120)
+    core_traits_json: dict[str, Any] = Field(default_factory=dict)
+    behavioral_laws_json: list[BoundedRule] = Field(default_factory=list, max_length=16)
+    style_constraints_json: dict[str, Any] = Field(default_factory=dict)
+    surface_overrides_json: dict[str, Any] = Field(default_factory=dict)
+
+
 class CompanionPolicyOverlay(BaseModel):
     overlay_id: str
     overlay_type: Literal[
