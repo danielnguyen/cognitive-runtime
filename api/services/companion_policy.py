@@ -10,12 +10,12 @@ from models import (
 )
 from services.companion_contracts import (
     DEFAULT_CONTRACT_WARNING,
-    GENERAL_SCENE_ID,
     CompanionProfileRecord,
     InteractionContractRecord,
     ScenePolicyRecord,
     companion_contracts_repository,
 )
+from services.scene_resolution import SceneResolutionResult, resolve_scene_policy
 
 _KNOWN_SURFACES = {
     "unknown",
@@ -32,29 +32,16 @@ def active_profile() -> CompanionProfileRecord:
     return companion_contracts_repository().active_profile()
 
 
-def _resolve_scene_policy(
+def resolve_scene(
     *,
     requested_scene: str | None,
     runtime_scene: str | None,
-) -> tuple[ScenePolicyRecord, float, str, list[str]]:
-    repository = companion_contracts_repository()
-    if requested_scene is not None:
-        scene = repository.scene_policy(requested_scene)
-        if scene is not None:
-            return scene, 1.0, "requested_scene", []
-        return repository.default_scene_policy(), 0.0, "fallback_general", [
-            "unknown_requested_scene"
-        ]
-
-    if runtime_scene:
-        scene = repository.scene_policy(runtime_scene)
-        if scene is not None:
-            return scene, 0.8, "runtime_state", []
-        return repository.default_scene_policy(), 0.0, "fallback_general", [
-            "unknown_runtime_scene"
-        ]
-
-    return repository.default_scene_policy(), 0.5, GENERAL_SCENE_ID, []
+) -> SceneResolutionResult:
+    return resolve_scene_policy(
+        repository=companion_contracts_repository(),
+        requested_scene=requested_scene,
+        runtime_scene=runtime_scene,
+    )
 
 
 def _overlay_id(
@@ -215,10 +202,14 @@ def compile_policy(
     requested_scene: str | None = None,
 ) -> dict[str, object]:
     profile = active_profile()
-    scene, scene_confidence, scene_source, scene_warnings = _resolve_scene_policy(
+    scene_resolution = resolve_scene(
         requested_scene=requested_scene,
         runtime_scene=state.active_scene,
     )
+    scene = scene_resolution.scene
+    scene_confidence = scene_resolution.confidence
+    scene_source = scene_resolution.source
+    scene_warnings = scene_resolution.warnings
     contract_record = companion_contracts_repository().active_interaction_contract(
         profile_id=profile.profile_id,
         profile_version=profile.version,
