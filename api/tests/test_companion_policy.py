@@ -40,7 +40,7 @@ def test_compile_returns_bounded_ordered_policy_overlays():
         assert 0 < len(overlay["content"]) <= 1200
 
 
-def test_compile_returns_structured_r19_interaction_contract():
+def test_compile_returns_structured_interaction_contract():
     client = TestClient(app)
 
     response = client.post("/v1/companion/policy/compile", json=_base())
@@ -95,7 +95,7 @@ def test_compile_returns_inspectable_contract_trace():
     assert trace["selected_repair_rules"]
 
 
-def test_interaction_contract_overlay_is_concise_and_not_r24_execution():
+def test_interaction_contract_overlay_is_concise_and_not_interrupt_execution():
     client = TestClient(app)
 
     response = client.post("/v1/companion/policy/compile", json=_base())
@@ -287,3 +287,48 @@ def test_oversized_requested_scene_is_rejected():
     )
 
     assert response.status_code == 422
+
+
+def test_active_profile_endpoint_returns_seeded_default_record():
+    client = TestClient(app)
+
+    response = client.get("/v1/companion/profile/active")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["profile_id"] == "default_companion_profile"
+    assert body["profile_version"] == 1
+    assert body["scope"] == "global_default"
+    assert body["source"] == "seeded_default"
+    assert body["status"] == "active"
+    assert body["role_label"] == "personal_intelligence_companion"
+    assert body["core_traits_json"]["directness"] == "high"
+
+
+def test_profile_compile_endpoint_matches_policy_compile_alias():
+    client = TestClient(app)
+    payload = {**_base(), "requested_scene": "planning"}
+
+    profile_response = client.post("/v1/companion/profile/compile", json=payload)
+    policy_response = client.post("/v1/companion/policy/compile", json=payload)
+
+    assert profile_response.status_code == 200
+    assert policy_response.status_code == 200
+    assert profile_response.json() == policy_response.json()
+
+
+def test_compile_uses_seeded_general_scene_for_unknown_scene():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/companion/profile/compile",
+        json={**_base(), "requested_scene": "unknown_scene"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scene_id"] == "general"
+    assert body["scene_source"] == "fallback_general"
+    assert "Scene policy: use the general operating mode" in body["overlays"][2]["content"]
+    assert body["profile_version"] == 1
+    assert body["contract_version"] == 2

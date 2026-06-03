@@ -106,7 +106,7 @@ class InteractionContract(BaseModel):
     contract_version: int
     owner_id: str = Field(max_length=120)
     scope: Literal["global_default", "owner_default"] = "global_default"
-    source: Literal["default_compiled", "default_static", "persisted"] = "default_compiled"
+    source: Literal["default_compiled", "persisted"] = "default_compiled"
     trust_rules: list[BoundedRule] = Field(default_factory=list, max_length=8)
     interaction_boundaries: list[BoundedRule] = Field(default_factory=list, max_length=8)
     repair_rules: list[BoundedRule] = Field(default_factory=list, max_length=8)
@@ -130,7 +130,7 @@ class InteractionContract(BaseModel):
 class InteractionContractTrace(BaseModel):
     contract_id: str = Field(max_length=120)
     contract_version: int
-    source: Literal["default_compiled", "default_static", "persisted"]
+    source: Literal["default_compiled", "persisted"]
     scope: Literal["global_default", "owner_default"]
     selected_rule_groups: list[BoundedLabel] = Field(default_factory=list, max_length=12)
     selected_boundary_rules: list[BoundedRule] = Field(default_factory=list, max_length=8)
@@ -140,6 +140,20 @@ class InteractionContractTrace(BaseModel):
 
 class CompanionPolicyCompileRequest(RuntimeStateResolveRequest):
     requested_scene: BoundedScene | None = None
+
+
+class CompanionProfileActiveResponse(BaseModel):
+    profile_id: str = Field(max_length=120)
+    profile_version: int
+    name: str = Field(max_length=120)
+    scope: Literal["global_default", "owner_default"] = "global_default"
+    source: str = Field(max_length=64)
+    status: str = Field(max_length=64)
+    role_label: str = Field(max_length=120)
+    core_traits_json: dict[str, Any] = Field(default_factory=dict)
+    behavioral_laws_json: list[BoundedRule] = Field(default_factory=list, max_length=16)
+    style_constraints_json: dict[str, Any] = Field(default_factory=dict)
+    surface_overrides_json: dict[str, Any] = Field(default_factory=dict)
 
 
 class CompanionPolicyOverlay(BaseModel):

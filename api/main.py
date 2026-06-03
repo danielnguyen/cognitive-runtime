@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from models import (
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
+    CompanionProfileActiveResponse,
     InterruptEvaluateRequest,
     InterruptEvaluateResponse,
     RuntimeOverlayResponse,
@@ -13,7 +14,7 @@ from models import (
     RuntimeStateResponse,
     RuntimeStateUpdateRequest,
 )
-from services.companion_policy import compile_policy
+from services.companion_policy import active_profile, compile_policy
 from services.interrupt_policy import evaluate_interrupt_policy
 from services.runtime_state import build_overlay, reset_state, resolve_state, update_state
 
@@ -71,8 +72,25 @@ async def runtime_overlay(body: RuntimeStateResolveRequest) -> RuntimeOverlayRes
         omission_reason=omission_reason,
     )
 
-@app.post("/v1/companion/policy/compile", response_model=CompanionPolicyCompileResponse)
-async def companion_policy_compile(
+@app.get("/v1/companion/profile/active", response_model=CompanionProfileActiveResponse)
+async def companion_profile_active() -> CompanionProfileActiveResponse:
+    profile = active_profile()
+    return CompanionProfileActiveResponse(
+        profile_id=profile.profile_id,
+        profile_version=profile.version,
+        name=profile.name,
+        scope=profile.scope,
+        source=profile.source,
+        status=profile.status,
+        role_label=profile.role_label,
+        core_traits_json=profile.core_traits_json,
+        behavioral_laws_json=profile.behavioral_laws_json,
+        style_constraints_json=profile.style_constraints_json,
+        surface_overrides_json=profile.surface_overrides_json,
+    )
+
+
+def _compile_companion_profile(
     body: CompanionPolicyCompileRequest,
 ) -> CompanionPolicyCompileResponse:
     state = resolve_state(
@@ -83,6 +101,20 @@ async def companion_policy_compile(
     return CompanionPolicyCompileResponse(
         **compile_policy(state=state, requested_scene=body.requested_scene)
     )
+
+
+@app.post("/v1/companion/profile/compile", response_model=CompanionPolicyCompileResponse)
+async def companion_profile_compile(
+    body: CompanionPolicyCompileRequest,
+) -> CompanionPolicyCompileResponse:
+    return _compile_companion_profile(body)
+
+
+@app.post("/v1/companion/policy/compile", response_model=CompanionPolicyCompileResponse)
+async def companion_policy_compile(
+    body: CompanionPolicyCompileRequest,
+) -> CompanionPolicyCompileResponse:
+    return _compile_companion_profile(body)
 
 
 @app.post("/v1/interrupt/evaluate", response_model=InterruptEvaluateResponse)
