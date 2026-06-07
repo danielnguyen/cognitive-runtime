@@ -27,9 +27,36 @@ For local host-run, `api/.env` is reserved as the canonical app config location.
 
 - Config key: `COMPANION_CONTRACTS_DB_PATH`
 - Local default: `./data/companion_contracts.sqlite3`
-- Docker path: `/data/companion_contracts.sqlite3`
+- Image default: `/data/companion_contracts.sqlite3`
 - The app creates the parent directory automatically if it does not exist.
-- Docker deployments should mount `/data` as a persistent volume to retain seeded/default contract data across container restarts.
+- The configured DB path must match a mounted writable path in the deployed container.
+- If the container mounts persistent storage at `/app/data`, set `COMPANION_CONTRACTS_DB_PATH=/app/data/companion_contracts.sqlite3`.
+- If you keep `COMPANION_CONTRACTS_DB_PATH=/data/companion_contracts.sqlite3`, mount the persistent volume at `/data`.
+- A common deployment failure is `sqlite3.OperationalError: unable to open database file` when the configured DB path and mounted volume path do not match.
+
+### Operator checks
+
+Normal request flow:
+
+`surface/client -> chat-orchestrator POST /v1/chat -> basic-memory-store/cognitive-runtime/LiteLLM as downstream services`
+
+Ownership summary:
+- `chat-orchestrator` owns normal chat request handling.
+- `basic-memory-store` owns durable conversation, retrieval, and trace persistence.
+- `cognitive-runtime` owns runtime overlay, companion contract compilation, interrupt evaluation, and diagnostic surfaces.
+
+Post-deploy smoke checklist:
+- `GET /healthz` returns success from `cognitive-runtime`.
+- `chat-orchestrator` `POST /v1/chat` returns a valid response for a normal request.
+- `POST /v1/companion/profile/compile` succeeds with the deployed `COMPANION_CONTRACTS_DB_PATH`.
+- `POST /v1/runtime/overlay` is reachable when runtime overlay integration is enabled.
+- The request trace is visible through `basic-memory-store` `GET /v1/traces/{request_id}`.
+
+If answers behave oddly, check:
+- whether `COMPANION_CONTRACTS_DB_PATH` points to a writable mounted path
+- whether companion compile is failing and being traced as an omitted companion layer
+- whether runtime overlay calls are unavailable
+- the corresponding request trace in `basic-memory-store`
 
 ## Health check
 
