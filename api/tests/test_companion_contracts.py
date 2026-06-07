@@ -19,8 +19,11 @@ def test_default_db_path_is_local_when_env_is_unset(monkeypatch):
 def test_repository_creates_parent_directory_and_seed_records(tmp_path):
     db_path = tmp_path / "missing" / "nested" / "companion_contracts.sqlite3"
 
+    assert not db_path.parent.exists()
+
     repository = CompanionContractsRepository(db_path=db_path)
 
+    assert db_path.parent.is_dir()
     assert db_path.exists()
     assert repository.record_counts() == {
         "companion_profiles": 1,
