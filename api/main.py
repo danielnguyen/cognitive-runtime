@@ -11,12 +11,21 @@ from models import (
     InterruptEvaluateResponse,
     RepairSimulateRequest,
     RepairSimulateResponse,
+    RuntimeIdentityResolveRequest,
+    RuntimeIdentityResolveResponse,
     RuntimeOverlayResponse,
+    RuntimeSessionDiagnosticsResponse,
+    RuntimeSessionResolveRequest,
+    RuntimeSessionResponse,
     RuntimeStateResetRequest,
     RuntimeStateResetResponse,
     RuntimeStateResolveRequest,
     RuntimeStateResponse,
     RuntimeStateUpdateRequest,
+    RuntimeTurnCompleteRequest,
+    RuntimeTurnResponse,
+    RuntimeTurnStartRequest,
+    RuntimeTurnUpdateRequest,
     ScenePolicyDetail,
     SceneResolveRequest,
     SceneResolveResponse,
@@ -34,10 +43,17 @@ from services.interaction_diagnostics import (
     validate_interaction_text,
 )
 from services.interrupt_policy import evaluate_interrupt_policy
+from services.runtime_identity import resolve_runtime_identity
 from services.runtime_state import (
     build_overlay,
+    complete_turn,
+    get_runtime_session,
+    record_runtime_event,
+    resolve_runtime_session,
     reset_state,
     resolve_state,
+    start_turn,
+    update_turn,
     update_state,
 )
 
@@ -57,6 +73,75 @@ async def resolve_runtime_state(body: RuntimeStateResolveRequest) -> RuntimeStat
         surface=body.surface,
     )
     return RuntimeStateResponse(runtime_state=state)
+
+
+@app.post("/v1/runtime/sessions/resolve", response_model=RuntimeSessionResponse)
+async def resolve_runtime_session_endpoint(
+    body: RuntimeSessionResolveRequest,
+) -> RuntimeSessionResponse:
+    session = resolve_runtime_session(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        surface_session_id=body.surface_session_id,
+        active_mode=body.active_mode,
+    )
+    return RuntimeSessionResponse(runtime_session=session)
+
+
+@app.get(
+    "/v1/runtime/sessions/{runtime_session_id}",
+    response_model=RuntimeSessionDiagnosticsResponse,
+)
+async def runtime_session_diagnostics(
+    runtime_session_id: str,
+) -> RuntimeSessionDiagnosticsResponse:
+    return get_runtime_session(runtime_session_id)
+
+
+@app.post("/v1/runtime/turns/start", response_model=RuntimeTurnResponse)
+async def runtime_turn_start(body: RuntimeTurnStartRequest) -> RuntimeTurnResponse:
+    session, turn, event = start_turn(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        surface_session_id=body.surface_session_id,
+        active_mode=body.active_mode,
+        input_message_id=body.input_message_id,
+        intent_class=body.intent_class,
+        timing_policy=body.timing_policy,
+        restraint_policy=body.restraint_policy,
+        continuation_state=body.continuation_state,
+    )
+    return RuntimeTurnResponse(runtime_session=session, runtime_turn=turn, event=event)
+
+
+@app.post("/v1/runtime/turns/update", response_model=RuntimeTurnResponse)
+async def runtime_turn_update(body: RuntimeTurnUpdateRequest) -> RuntimeTurnResponse:
+    session, turn, event = update_turn(
+        request_id=body.request_id,
+        runtime_session_id=body.runtime_session_id,
+        runtime_turn_id=body.runtime_turn_id,
+        turn_status=body.turn_status,
+        timing_policy=body.timing_policy,
+        restraint_policy=body.restraint_policy,
+        continuation_state=body.continuation_state,
+    )
+    return RuntimeTurnResponse(runtime_session=session, runtime_turn=turn, event=event)
+
+
+@app.post("/v1/runtime/turns/complete", response_model=RuntimeTurnResponse)
+async def runtime_turn_complete(body: RuntimeTurnCompleteRequest) -> RuntimeTurnResponse:
+    session, turn, event = complete_turn(
+        request_id=body.request_id,
+        runtime_session_id=body.runtime_session_id,
+        runtime_turn_id=body.runtime_turn_id,
+        turn_status=body.turn_status,
+        continuation_state=body.continuation_state,
+    )
+    return RuntimeTurnResponse(runtime_session=session, runtime_turn=turn, event=event)
 
 
 @app.post("/v1/runtime/state/update", response_model=RuntimeStateResponse)
@@ -94,6 +179,25 @@ async def runtime_overlay(body: RuntimeStateResolveRequest) -> RuntimeOverlayRes
         omitted=overlay is None,
         omission_reason=omission_reason,
     )
+
+
+@app.post("/v1/runtime/identity/resolve", response_model=RuntimeIdentityResolveResponse)
+async def runtime_identity_resolve(
+    body: RuntimeIdentityResolveRequest,
+) -> RuntimeIdentityResolveResponse:
+    resolution = resolve_runtime_identity(body)
+    record_runtime_event(
+        runtime_session_id=resolution.runtime_session.runtime_session_id,
+        runtime_turn_id=None,
+        event_type="identity_resolved",
+        event_payload_json={
+            "request_id": body.request_id,
+            "active_persona_id": resolution.trace.active_persona_id,
+            "persona_resolution_reason": resolution.trace.persona_resolution_reason,
+            "surface_id": resolution.trace.surface_id,
+        },
+    )
+    return resolution
 
 
 @app.get("/v1/companion/profile/active", response_model=CompanionProfileActiveResponse)

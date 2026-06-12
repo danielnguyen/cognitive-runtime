@@ -101,6 +101,180 @@ class RuntimeStateResetResponse(BaseModel):
     reset: bool
 
 
+RuntimeSessionStatus = Literal[
+    "opening",
+    "active",
+    "paused",
+    "idle",
+    "closing",
+    "closed",
+]
+RuntimeTurnStatus = Literal[
+    "received",
+    "retrieving",
+    "responding",
+    "completed",
+    "abandoned",
+]
+RuntimeEventType = Literal[
+    "session_resolved",
+    "turn_started",
+    "turn_updated",
+    "turn_completed",
+    "identity_resolved",
+]
+
+
+class RuntimeSession(BaseModel):
+    runtime_session_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    surface_session_id: str | None = Field(default=None, max_length=120)
+    status: RuntimeSessionStatus = "active"
+    active_mode: str | None = Field(default=None, max_length=64)
+    attention_state: str | None = Field(default=None, max_length=64)
+    started_at: str
+    last_activity_at: str
+    closed_at: str | None = None
+
+
+class RuntimeTurn(BaseModel):
+    runtime_turn_id: str = Field(max_length=120)
+    runtime_session_id: str = Field(max_length=120)
+    input_message_id: str | None = Field(default=None, max_length=120)
+    turn_status: RuntimeTurnStatus
+    intent_class: str | None = Field(default=None, max_length=64)
+    timing_policy: str | None = Field(default=None, max_length=64)
+    restraint_policy: str | None = Field(default=None, max_length=64)
+    continuation_state: str | None = Field(default=None, max_length=64)
+    created_at: str
+    updated_at: str
+    completed_at: str | None = None
+
+
+class RuntimeEvent(BaseModel):
+    event_id: str = Field(max_length=120)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    event_type: RuntimeEventType
+    event_payload_json: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class RuntimeSessionResolveRequest(RuntimeStateResolveRequest):
+    surface_session_id: str | None = Field(default=None, max_length=120)
+    active_mode: str | None = Field(default=None, max_length=64)
+
+
+class RuntimeSessionResponse(BaseModel):
+    runtime_session: RuntimeSession
+
+
+class RuntimeTurnStartRequest(RuntimeSessionResolveRequest):
+    input_message_id: str | None = Field(default=None, max_length=120)
+    intent_class: str | None = Field(default=None, max_length=64)
+    timing_policy: str | None = Field(default=None, max_length=64)
+    restraint_policy: str | None = Field(default=None, max_length=64)
+    continuation_state: str | None = Field(default=None, max_length=64)
+
+
+class RuntimeTurnUpdateRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str = Field(max_length=120)
+    turn_status: Literal["retrieving", "responding"]
+    timing_policy: str | None = Field(default=None, max_length=64)
+    restraint_policy: str | None = Field(default=None, max_length=64)
+    continuation_state: str | None = Field(default=None, max_length=64)
+
+
+class RuntimeTurnCompleteRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str = Field(max_length=120)
+    turn_status: Literal["completed", "abandoned"] = "completed"
+    continuation_state: str | None = Field(default=None, max_length=64)
+
+
+class RuntimeTurnResponse(BaseModel):
+    runtime_session: RuntimeSession
+    runtime_turn: RuntimeTurn
+    event: RuntimeEvent
+
+
+class RuntimeSessionDiagnosticsResponse(BaseModel):
+    runtime_session: RuntimeSession
+    active_turn: RuntimeTurn | None = None
+    latest_turn: RuntimeTurn | None = None
+    events: list[RuntimeEvent] = Field(default_factory=list)
+
+
+class PersonaProfile(BaseModel):
+    persona_id: str = Field(max_length=120)
+    display_name: str = Field(max_length=120)
+    capability_domain: str = Field(max_length=120)
+    description: str = Field(max_length=240)
+    communication_policy_summary: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    runtime_policy_summary: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    advisory_memory_scope_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    advisory_tool_permission_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    persona_owns_durable_memory: Literal[False] = False
+
+
+class SurfaceBinding(BaseModel):
+    surface_id: str = Field(max_length=120)
+    surface_type: str = Field(max_length=80)
+    surface_display_name: str = Field(max_length=120)
+    default_persona_id: str = Field(max_length=120)
+    allow_user_persona_override: bool = False
+    response_length: str | None = Field(default=None, max_length=64)
+    default_mode: str | None = Field(default=None, max_length=64)
+
+
+class RuntimeIdentityContext(BaseModel):
+    active_persona_id: str = Field(max_length=120)
+    surface_id: str = Field(max_length=120)
+    surface_type: str = Field(max_length=80)
+    surface_display_name: str = Field(max_length=120)
+    capability_domain: str = Field(max_length=120)
+    communication_policy_summary: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    runtime_policy_summary: list[BoundedRule] = Field(default_factory=list, max_length=8)
+    advisory_memory_scope_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    advisory_tool_permission_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    persona_owns_durable_memory: Literal[False] = False
+    content: BoundedCompanionContent
+
+
+class RuntimeIdentityTrace(BaseModel):
+    runtime_session_id: str = Field(max_length=120)
+    active_persona_id: str = Field(max_length=120)
+    persona_resolution_reason: Literal[
+        "requested_persona_id",
+        "surface_binding",
+        "default_fallback",
+    ]
+    persona_override_source: Literal["internal_test", "none"]
+    surface_id: str = Field(max_length=120)
+    surface_type: str = Field(max_length=80)
+    surface_display_name: str = Field(max_length=120)
+    persona_owns_durable_memory: Literal[False] = False
+    advisory_memory_scope_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    advisory_tool_permission_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+
+
+class RuntimeIdentityResolveRequest(RuntimeSessionResolveRequest):
+    requested_persona_id: str | None = Field(default=None, max_length=120)
+
+
+class RuntimeIdentityResolveResponse(BaseModel):
+    runtime_session: RuntimeSession
+    surface_binding: SurfaceBinding
+    persona: PersonaProfile
+    runtime_identity: RuntimeIdentityContext
+    trace: RuntimeIdentityTrace
+
+
 class InteractionContract(BaseModel):
     contract_id: str = Field(max_length=120)
     contract_version: int
