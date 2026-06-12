@@ -416,6 +416,10 @@ class RelationshipRepository:
         now = _now()
         with self._connect() as conn:
             row = self._require_edge(conn, owner_id=owner_id, relationship_id=body.relationship_id)
+            if row["status"] not in {"provisional", "inferred", "needs_confirmation"}:
+                raise RuntimeError("relationship_edge_status_not_confirmable")
+            if body.evidence is None:
+                raise RuntimeError("relationship_confirmation_evidence_required")
             conn.execute(
                 """
                 UPDATE relationship_edges
@@ -493,6 +497,7 @@ class RelationshipRepository:
         owner_id: str,
         include_restricted_details: bool = False,
     ) -> RelationshipDiagnosticsResponse:
+        _ = include_restricted_details
         with self._connect() as conn:
             entity_rows = conn.execute(
                 "SELECT * FROM relationship_entities WHERE owner_id = ? ORDER BY entity_id;",
@@ -515,11 +520,11 @@ class RelationshipRepository:
         return RelationshipDiagnosticsResponse(
             entities=[self._entity_view_from_row(row) for row in entity_rows],
             relationships=[
-                self._edge_view_from_row(row, include_restricted_details=include_restricted_details)
+                self._edge_view_from_row(row, include_restricted_details=False)
                 for row in edge_rows
             ],
             evidence=[
-                self._evidence_view_from_row(row, include_restricted_details=include_restricted_details)
+                self._evidence_view_from_row(row, include_restricted_details=False)
                 for row in evidence_rows
             ],
         )
@@ -903,7 +908,7 @@ def get_relationship_diagnostics(
 ) -> RelationshipDiagnosticsResponse:
     return relationship_repository().diagnostics(
         owner_id=body.owner_id,
-        include_restricted_details=body.include_restricted_details,
+        include_restricted_details=False,
     )
 
 

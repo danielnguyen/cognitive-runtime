@@ -157,6 +157,41 @@ def test_confirm_provisional_relationship():
     assert response.json()["relationship"]["status"] == "active"
 
 
+def test_confirm_requires_evidence_and_confirmable_status():
+    client = TestClient(app, raise_server_exceptions=False)
+    _seed_entities(client)
+    created = client.post(
+        "/v1/relationships/edges/upsert",
+        json={**_base(), "edge": _edge(status="provisional", source_type="tool_output"), "evidence": []},
+    ).json()["relationship"]
+
+    no_evidence = client.post(
+        "/v1/relationships/edges/confirm",
+        json={**_base(), "relationship_id": created["relationship_id"], "evidence": None},
+    )
+
+    active_edge = client.post(
+        "/v1/relationships/edges/upsert",
+        json={**_base(), "edge": _edge(), "evidence": []},
+    ).json()["relationship"]
+    wrong_status = client.post(
+        "/v1/relationships/edges/confirm",
+        json={
+            **_base(),
+            "relationship_id": active_edge["relationship_id"],
+            "evidence": {
+                "evidence_type": "user_confirmation",
+                "source_ref": "chat:user-confirmed",
+                "summary": "Explicit confirmation.",
+                "confidence_delta": 0.1,
+            },
+        },
+    )
+
+    assert no_evidence.status_code == 500
+    assert wrong_status.status_code == 500
+
+
 def test_revoke_relationship():
     client = TestClient(app)
     _seed_entities(client)
@@ -296,6 +331,36 @@ def test_diagnostics_redact_restricted_details_without_hidden_scores():
     payload_text = str(diagnostics)
     assert "score" not in payload_text
     assert "world_state_claim" not in payload_text
+
+
+def test_diagnostics_ignore_include_restricted_details_without_authorization():
+    client = TestClient(app)
+    _seed_entities(client)
+    client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base(),
+            "edge": _edge(sensitivity_level="restricted", source_refs_json=["secret:ref"]),
+            "evidence": [
+                {
+                    "evidence_type": "config_reference",
+                    "source_ref": "secret:ref",
+                    "summary": "Restricted supporting context.",
+                    "confidence_delta": 0.2,
+                }
+            ],
+        },
+    )
+
+    diagnostics = client.post(
+        "/v1/relationships/diagnostics",
+        json={**_base(), "include_restricted_details": True},
+    ).json()
+
+    assert diagnostics["relationships"][0]["source_refs_json"] == []
+    assert diagnostics["relationships"][0]["source_refs_redacted"] is True
+    assert diagnostics["evidence"][0]["summary"] is None
+    assert diagnostics["evidence"][0]["summary_redacted"] is True
 
 
 def test_relationship_select_enforces_scope_confidence_and_mentionability_rules():
