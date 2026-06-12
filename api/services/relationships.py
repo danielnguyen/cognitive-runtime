@@ -21,6 +21,7 @@ from models import (
     RelationshipEntityView,
     RelationshipExcludedSummary,
     RelationshipGraphDiagnosticsRequest,
+    RelationshipStatus,
     RelationshipSelectRequest,
     RelationshipSelectResponse,
     RelationshipSelectTrace,
@@ -216,65 +217,7 @@ class RelationshipRepository:
     ) -> RelationshipEntityView:
         now = _now()
         with self._connect() as conn:
-            existing = conn.execute(
-                "SELECT * FROM relationship_entities WHERE owner_id = ? AND entity_id = ? LIMIT 1;",
-                (owner_id, entity.entity_id),
-            ).fetchone()
-            if existing is None:
-                conn.execute(
-                    """
-                    INSERT INTO relationship_entities (
-                        entity_id, owner_id, entity_type, canonical_label, display_label,
-                        domain, sensitivity_level, source_type, source_ref,
-                        canonical_memory_ref, artifact_ref, status,
-                        created_at, updated_at, archived_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        entity.entity_id,
-                        owner_id,
-                        entity.entity_type,
-                        entity.canonical_label,
-                        entity.display_label,
-                        entity.domain,
-                        entity.sensitivity_level,
-                        entity.source_type,
-                        entity.source_ref,
-                        entity.canonical_memory_ref,
-                        entity.artifact_ref,
-                        entity.status,
-                        now,
-                        now,
-                        entity.archived_at,
-                    ),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE relationship_entities
-                    SET entity_type = ?, canonical_label = ?, display_label = ?, domain = ?,
-                        sensitivity_level = ?, source_type = ?, source_ref = ?,
-                        canonical_memory_ref = ?, artifact_ref = ?, status = ?,
-                        archived_at = ?, updated_at = ?
-                    WHERE owner_id = ? AND entity_id = ?;
-                    """,
-                    (
-                        entity.entity_type,
-                        entity.canonical_label,
-                        entity.display_label,
-                        entity.domain,
-                        entity.sensitivity_level,
-                        entity.source_type,
-                        entity.source_ref,
-                        entity.canonical_memory_ref,
-                        entity.artifact_ref,
-                        entity.status,
-                        entity.archived_at,
-                        now,
-                        owner_id,
-                        entity.entity_id,
-                    ),
-                )
+            self._upsert_entity_with_conn(conn, owner_id=owner_id, entity=entity, now=now)
             row = conn.execute(
                 "SELECT * FROM relationship_entities WHERE owner_id = ? AND entity_id = ? LIMIT 1;",
                 (owner_id, entity.entity_id),
@@ -310,89 +253,14 @@ class RelationshipRepository:
             ),
         )
         with self._connect() as conn:
-            self._require_entity(conn, owner_id=owner_id, entity_id=edge.subject_entity_id)
-            self._require_entity(conn, owner_id=owner_id, entity_id=edge.object_entity_id)
-            existing = conn.execute(
-                "SELECT * FROM relationship_edges WHERE owner_id = ? AND relationship_id = ? LIMIT 1;",
-                (owner_id, relationship_id),
-            ).fetchone()
-            if existing is None:
-                conn.execute(
-                    """
-                    INSERT INTO relationship_edges (
-                        relationship_id, owner_id, subject_entity_id, relationship_type,
-                        object_entity_id, relationship_scope, source_type, source_refs_json,
-                        confidence, status, sensitivity_level, mentionability,
-                        allowed_persona_scopes_json, blocked_persona_scopes_json,
-                        valid_from, valid_until, superseded_by_relationship_id,
-                        created_at, updated_at, revoked_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        relationship_id,
-                        owner_id,
-                        edge.subject_entity_id,
-                        edge.relationship_type,
-                        edge.object_entity_id,
-                        edge.relationship_scope,
-                        edge.source_type,
-                        _json(edge.source_refs_json),
-                        edge.confidence,
-                        normalized_status,
-                        edge.sensitivity_level,
-                        edge.mentionability,
-                        _json(edge.allowed_persona_scopes_json),
-                        _json(edge.blocked_persona_scopes_json),
-                        edge.valid_from,
-                        edge.valid_until,
-                        edge.superseded_by_relationship_id,
-                        now,
-                        now,
-                        edge.revoked_at,
-                    ),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE relationship_edges
-                    SET subject_entity_id = ?, relationship_type = ?, object_entity_id = ?,
-                        relationship_scope = ?, source_type = ?, source_refs_json = ?,
-                        confidence = ?, status = ?, sensitivity_level = ?, mentionability = ?,
-                        allowed_persona_scopes_json = ?, blocked_persona_scopes_json = ?,
-                        valid_from = ?, valid_until = ?, superseded_by_relationship_id = ?,
-                        revoked_at = ?, updated_at = ?
-                    WHERE owner_id = ? AND relationship_id = ?;
-                    """,
-                    (
-                        edge.subject_entity_id,
-                        edge.relationship_type,
-                        edge.object_entity_id,
-                        edge.relationship_scope,
-                        edge.source_type,
-                        _json(edge.source_refs_json),
-                        edge.confidence,
-                        normalized_status,
-                        edge.sensitivity_level,
-                        edge.mentionability,
-                        _json(edge.allowed_persona_scopes_json),
-                        _json(edge.blocked_persona_scopes_json),
-                        edge.valid_from,
-                        edge.valid_until,
-                        edge.superseded_by_relationship_id,
-                        edge.revoked_at,
-                        now,
-                        owner_id,
-                        relationship_id,
-                    ),
-                )
-            if edge.supersede_existing_relationship_id:
-                self._supersede_existing(
-                    conn,
-                    owner_id=owner_id,
-                    existing_relationship_id=edge.supersede_existing_relationship_id,
-                    new_relationship_id=relationship_id,
-                    updated_at=now,
-                )
+            self._upsert_edge_with_conn(
+                conn,
+                owner_id=owner_id,
+                relationship_id=relationship_id,
+                edge=edge,
+                normalized_status=normalized_status,
+                now=now,
+            )
             evidence_views = [
                 self._insert_evidence(conn, relationship_id=relationship_id, evidence=item)
                 for item in evidence
@@ -442,6 +310,78 @@ class RelationshipRepository:
             relationship=self._edge_view_from_row(updated, include_restricted_details=False),
             evidence=evidence_views,
         )
+
+    def bootstrap_apply(
+        self,
+        *,
+        owner_id: str,
+        entities: list[RelationshipEntityInput],
+        relationships: list[tuple[RelationshipEdgeInput, list[RelationshipEdgeEvidenceInput]]],
+        dry_run: bool = False,
+    ) -> dict[str, int]:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN;")
+            existing_entity_ids = self._entity_ids_for_owner(conn, owner_id=owner_id)
+            seed_entity_ids = {entity.entity_id for entity in entities}
+            for edge, _ in relationships:
+                if edge.subject_entity_id not in seed_entity_ids and edge.subject_entity_id not in existing_entity_ids:
+                    raise RuntimeError(
+                        f"relationship_subject_entity_missing:{edge.relationship_id}:{edge.subject_entity_id}"
+                    )
+                if edge.object_entity_id not in seed_entity_ids and edge.object_entity_id not in existing_entity_ids:
+                    raise RuntimeError(
+                        f"relationship_object_entity_missing:{edge.relationship_id}:{edge.object_entity_id}"
+                    )
+
+            entity_upserts = 0
+            relationship_upserts = 0
+            evidence_inserted = 0
+            evidence_skipped = 0
+
+            for entity in entities:
+                self._upsert_entity_with_conn(conn, owner_id=owner_id, entity=entity, now=_now())
+                entity_upserts += 1
+
+            for edge, evidence_items in relationships:
+                normalized_status = self._normalized_edge_status(edge)
+                self._upsert_edge_with_conn(
+                    conn,
+                    owner_id=owner_id,
+                    relationship_id=edge.relationship_id or "",
+                    edge=edge,
+                    normalized_status=normalized_status,
+                    now=_now(),
+                )
+                relationship_upserts += 1
+                relationship_id = edge.relationship_id or ""
+                for evidence in evidence_items:
+                    _, inserted = self._insert_evidence_deduped(
+                        conn,
+                        relationship_id=relationship_id,
+                        evidence=evidence,
+                    )
+                    if inserted:
+                        evidence_inserted += 1
+                    else:
+                        evidence_skipped += 1
+
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+            return {
+                "entities_upserted": entity_upserts,
+                "relationships_upserted": relationship_upserts,
+                "evidence_inserted": evidence_inserted,
+                "evidence_skipped": evidence_skipped,
+                "errors": 0,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def revoke_edge(
         self,
@@ -658,6 +598,169 @@ class RelationshipRepository:
             if edge.source_type == "model_inference" and edge.status != "needs_confirmation":
                 raise RuntimeError("model_inference_socialish_relationship_requires_confirmation")
 
+    def _upsert_entity_with_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        entity: RelationshipEntityInput,
+        now: str,
+    ) -> None:
+        existing = conn.execute(
+            "SELECT 1 FROM relationship_entities WHERE owner_id = ? AND entity_id = ? LIMIT 1;",
+            (owner_id, entity.entity_id),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO relationship_entities (
+                    entity_id, owner_id, entity_type, canonical_label, display_label,
+                    domain, sensitivity_level, source_type, source_ref,
+                    canonical_memory_ref, artifact_ref, status,
+                    created_at, updated_at, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    entity.entity_id,
+                    owner_id,
+                    entity.entity_type,
+                    entity.canonical_label,
+                    entity.display_label,
+                    entity.domain,
+                    entity.sensitivity_level,
+                    entity.source_type,
+                    entity.source_ref,
+                    entity.canonical_memory_ref,
+                    entity.artifact_ref,
+                    entity.status,
+                    now,
+                    now,
+                    entity.archived_at,
+                ),
+            )
+            return
+        conn.execute(
+            """
+            UPDATE relationship_entities
+            SET entity_type = ?, canonical_label = ?, display_label = ?, domain = ?,
+                sensitivity_level = ?, source_type = ?, source_ref = ?,
+                canonical_memory_ref = ?, artifact_ref = ?, status = ?,
+                archived_at = ?, updated_at = ?
+            WHERE owner_id = ? AND entity_id = ?;
+            """,
+            (
+                entity.entity_type,
+                entity.canonical_label,
+                entity.display_label,
+                entity.domain,
+                entity.sensitivity_level,
+                entity.source_type,
+                entity.source_ref,
+                entity.canonical_memory_ref,
+                entity.artifact_ref,
+                entity.status,
+                entity.archived_at,
+                now,
+                owner_id,
+                entity.entity_id,
+            ),
+        )
+
+    def _upsert_edge_with_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        relationship_id: str,
+        edge: RelationshipEdgeInput,
+        normalized_status: RelationshipStatus | str,
+        now: str,
+    ) -> None:
+        self._validate_edge_input(edge)
+        self._require_entity(conn, owner_id=owner_id, entity_id=edge.subject_entity_id)
+        self._require_entity(conn, owner_id=owner_id, entity_id=edge.object_entity_id)
+        existing = conn.execute(
+            "SELECT 1 FROM relationship_edges WHERE owner_id = ? AND relationship_id = ? LIMIT 1;",
+            (owner_id, relationship_id),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO relationship_edges (
+                    relationship_id, owner_id, subject_entity_id, relationship_type,
+                    object_entity_id, relationship_scope, source_type, source_refs_json,
+                    confidence, status, sensitivity_level, mentionability,
+                    allowed_persona_scopes_json, blocked_persona_scopes_json,
+                    valid_from, valid_until, superseded_by_relationship_id,
+                    created_at, updated_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    relationship_id,
+                    owner_id,
+                    edge.subject_entity_id,
+                    edge.relationship_type,
+                    edge.object_entity_id,
+                    edge.relationship_scope,
+                    edge.source_type,
+                    _json(edge.source_refs_json),
+                    edge.confidence,
+                    normalized_status,
+                    edge.sensitivity_level,
+                    edge.mentionability,
+                    _json(edge.allowed_persona_scopes_json),
+                    _json(edge.blocked_persona_scopes_json),
+                    edge.valid_from,
+                    edge.valid_until,
+                    edge.superseded_by_relationship_id,
+                    now,
+                    now,
+                    edge.revoked_at,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE relationship_edges
+                SET subject_entity_id = ?, relationship_type = ?, object_entity_id = ?,
+                    relationship_scope = ?, source_type = ?, source_refs_json = ?,
+                    confidence = ?, status = ?, sensitivity_level = ?, mentionability = ?,
+                    allowed_persona_scopes_json = ?, blocked_persona_scopes_json = ?,
+                    valid_from = ?, valid_until = ?, superseded_by_relationship_id = ?,
+                    revoked_at = ?, updated_at = ?
+                WHERE owner_id = ? AND relationship_id = ?;
+                """,
+                (
+                    edge.subject_entity_id,
+                    edge.relationship_type,
+                    edge.object_entity_id,
+                    edge.relationship_scope,
+                    edge.source_type,
+                    _json(edge.source_refs_json),
+                    edge.confidence,
+                    normalized_status,
+                    edge.sensitivity_level,
+                    edge.mentionability,
+                    _json(edge.allowed_persona_scopes_json),
+                    _json(edge.blocked_persona_scopes_json),
+                    edge.valid_from,
+                    edge.valid_until,
+                    edge.superseded_by_relationship_id,
+                    edge.revoked_at,
+                    now,
+                    owner_id,
+                    relationship_id,
+                ),
+            )
+        if edge.supersede_existing_relationship_id:
+            self._supersede_existing(
+                conn,
+                owner_id=owner_id,
+                existing_relationship_id=edge.supersede_existing_relationship_id,
+                new_relationship_id=relationship_id,
+                updated_at=now,
+            )
+
     def _normalized_edge_status(self, edge: RelationshipEdgeInput) -> str:
         status = edge.status
         if _is_model_inference(edge):
@@ -752,6 +855,42 @@ class RelationshipRepository:
         ).fetchone()
         assert row is not None
         return self._evidence_view_from_row(row, include_restricted_details=False)
+
+    def _insert_evidence_deduped(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        relationship_id: str,
+        evidence: RelationshipEdgeEvidenceInput,
+    ) -> tuple[RelationshipEdgeEvidenceView, bool]:
+        existing = conn.execute(
+            """
+            SELECT relationship_evidence.*, relationship_edges.sensitivity_level
+            FROM relationship_evidence
+            JOIN relationship_edges ON relationship_edges.relationship_id = relationship_evidence.relationship_id
+            WHERE relationship_evidence.relationship_id = ?
+              AND relationship_evidence.evidence_type = ?
+              AND relationship_evidence.source_ref = ?
+              AND COALESCE(relationship_evidence.summary, '') = COALESCE(?, '')
+            LIMIT 1;
+            """,
+            (
+                relationship_id,
+                evidence.evidence_type,
+                evidence.source_ref,
+                evidence.summary,
+            ),
+        ).fetchone()
+        if existing is not None:
+            return self._evidence_view_from_row(existing, include_restricted_details=False), False
+        return self._insert_evidence(conn, relationship_id=relationship_id, evidence=evidence), True
+
+    def _entity_ids_for_owner(self, conn: sqlite3.Connection, *, owner_id: str) -> set[str]:
+        rows = conn.execute(
+            "SELECT entity_id FROM relationship_entities WHERE owner_id = ?;",
+            (owner_id,),
+        ).fetchall()
+        return {row["entity_id"] for row in rows}
 
     def _entity_view_from_row(self, row: sqlite3.Row) -> RelationshipEntityView:
         return RelationshipEntityView(

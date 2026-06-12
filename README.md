@@ -74,3 +74,21 @@ make dev-check
 ```
 
 `make dev-start` serves the API on `APP_PORT`, defaulting to `4371`.
+
+## Relationship bootstrap
+
+Trusted project and system relationships can be bootstrapped from a seed file without using runtime mutation curl calls.
+
+Example command:
+
+```bash
+cd api && ./.venv/bin/python scripts/bootstrap_relationships.py ../config/relationships.seed.example.yaml --owner-id <owner>
+```
+
+Dry-run validation:
+
+```bash
+cd api && ./.venv/bin/python scripts/bootstrap_relationships.py ../config/relationships.seed.example.yaml --owner-id <owner> --dry-run
+```
+
+The bootstrap script is idempotent for seeded entities, relationships, and duplicate evidence records. It is bootstrap tooling only and does not perform runtime inference, retrieval filtering, or social-context creation.
