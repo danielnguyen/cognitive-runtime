@@ -277,6 +277,142 @@ class RuntimeIdentityResolveResponse(BaseModel):
     trace: RuntimeIdentityTrace
 
 
+WorldStateFreshnessState = Literal[
+    "fresh",
+    "aging",
+    "stale",
+    "expired",
+    "unknown",
+    "superseded",
+    "conflicted",
+]
+WorldStateAuthority = Literal[
+    "observed_user_report",
+    "verified_tool_output",
+    "trusted_integration_event",
+    "derived_from_multiple_sources",
+    "model_inferred",
+    "unverified_assumption",
+]
+WorldStateSourceType = Literal[
+    "user_report",
+    "tool_output",
+    "integration_event",
+    "sensor_update",
+    "repository_inspection",
+    "calendar_event",
+    "automation_workflow",
+    "model_inference",
+    "artifact_metadata",
+    "runtime_update",
+]
+WorldStateConfirmationPolicy = Literal[
+    "none",
+    "confirm_before_action",
+    "confirm_before_high_impact_action",
+    "reverify_before_use",
+]
+WorldStateSensitivity = Literal["low", "medium", "high", "restricted"]
+WorldStateTransitionType = Literal[
+    "created",
+    "updated",
+    "superseded",
+    "conflicted",
+    "resolved",
+]
+
+
+class WorldStateClaimInput(BaseModel):
+    entity_id: str = Field(max_length=120)
+    entity_type: str = Field(max_length=80)
+    domain: BoundedLabel
+    attribute: BoundedLabel
+    value_json: Any
+    source_type: WorldStateSourceType
+    source_ref: str = Field(max_length=240)
+    confidence: float = Field(ge=0.0, le=1.0)
+    freshness_state: WorldStateFreshnessState
+    state_authority: WorldStateAuthority
+    observed_at: str
+    last_verified_at: str | None = None
+    expires_at: str | None = None
+    ttl_seconds: int | None = Field(default=None, ge=1)
+    revalidation_interval_seconds: int | None = Field(default=None, ge=1)
+    confirmation_policy: WorldStateConfirmationPolicy
+    sensitivity: WorldStateSensitivity = "medium"
+    scope_labels: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    supersede_existing_claim_id: str | None = Field(default=None, max_length=120)
+
+
+class WorldStateClaimUpsertRequest(RuntimeStateResolveRequest):
+    claim: WorldStateClaimInput
+
+
+class WorldStateClaimView(BaseModel):
+    world_state_claim_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    entity_id: str = Field(max_length=120)
+    entity_type: str = Field(max_length=80)
+    domain: BoundedLabel
+    attribute: BoundedLabel
+    value_json: Any | None = None
+    value_redacted: bool = False
+    source_type: WorldStateSourceType
+    source_ref: str = Field(max_length=240)
+    confidence: float
+    freshness_state: WorldStateFreshnessState
+    effective_freshness_state: WorldStateFreshnessState
+    state_authority: WorldStateAuthority
+    observed_at: str
+    last_verified_at: str | None = None
+    expires_at: str | None = None
+    ttl_seconds: int | None = None
+    revalidation_interval_seconds: int | None = None
+    confirmation_policy: WorldStateConfirmationPolicy
+    sensitivity: WorldStateSensitivity
+    scope_labels: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    created_at: str
+    updated_at: str
+    superseded_by_claim_id: str | None = None
+    conflict_claim_ids: list[str] = Field(default_factory=list, max_length=16)
+
+
+class WorldStateClaimSummary(BaseModel):
+    world_state_claim_id: str = Field(max_length=120)
+    entity_id: str = Field(max_length=120)
+    attribute: BoundedLabel
+    domain: BoundedLabel
+    freshness_state: WorldStateFreshnessState
+    effective_freshness_state: WorldStateFreshnessState
+    sensitivity: WorldStateSensitivity
+    reason: BoundedLabel
+    superseded_by_claim_id: str | None = None
+    conflict_claim_ids: list[str] = Field(default_factory=list, max_length=16)
+
+
+class WorldStateTransition(BaseModel):
+    transition_id: str = Field(max_length=120)
+    world_state_claim_id: str = Field(max_length=120)
+    transition_type: WorldStateTransitionType
+    created_at: str
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorldStateClaimResponse(BaseModel):
+    claim: WorldStateClaimView
+    transitions: list[WorldStateTransition] = Field(default_factory=list)
+
+
+class WorldStateDiagnosticsRequest(RuntimeStateResolveRequest):
+    include_sensitive_values: bool = False
+
+
+class WorldStateDiagnosticsResponse(BaseModel):
+    claims: list[WorldStateClaimView] = Field(default_factory=list)
+    excluded_claims: list[WorldStateClaimSummary] = Field(default_factory=list)
+    transitions: list[WorldStateTransition] = Field(default_factory=list)
+
+
 class InteractionContract(BaseModel):
     contract_id: str = Field(max_length=120)
     contract_version: int

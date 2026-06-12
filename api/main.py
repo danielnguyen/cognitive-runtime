@@ -29,6 +29,10 @@ from models import (
     ScenePolicyDetail,
     SceneResolveRequest,
     SceneResolveResponse,
+    WorldStateClaimResponse,
+    WorldStateClaimUpsertRequest,
+    WorldStateDiagnosticsRequest,
+    WorldStateDiagnosticsResponse,
 )
 from services.companion_contracts import companion_contracts_repository
 from services.companion_policy import (
@@ -56,6 +60,7 @@ from services.runtime_state import (
     update_turn,
     update_state,
 )
+from services.world_state import get_world_state_diagnostics, upsert_world_state_claim
 
 app = FastAPI(title="Cognitive Runtime", version="0.1.0")
 
@@ -198,6 +203,27 @@ async def runtime_identity_resolve(
         },
     )
     return resolution
+
+
+@app.post("/v1/world-state/claims/upsert", response_model=WorldStateClaimResponse)
+async def world_state_claim_upsert(
+    body: WorldStateClaimUpsertRequest,
+) -> WorldStateClaimResponse:
+    claim, transitions = upsert_world_state_claim(
+        owner_id=body.owner_id,
+        claim=body.claim,
+    )
+    return WorldStateClaimResponse(claim=claim, transitions=transitions)
+
+
+@app.post("/v1/world-state/diagnostics", response_model=WorldStateDiagnosticsResponse)
+async def world_state_diagnostics(
+    body: WorldStateDiagnosticsRequest,
+) -> WorldStateDiagnosticsResponse:
+    return get_world_state_diagnostics(
+        owner_id=body.owner_id,
+        include_sensitive_values=body.include_sensitive_values,
+    )
 
 
 @app.get("/v1/companion/profile/active", response_model=CompanionProfileActiveResponse)
