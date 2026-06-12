@@ -4,7 +4,9 @@ from pathlib import Path
 
 from services.companion_contracts import (
     DEFAULT_DB_PATH,
+    PERSONA_PROFILES,
     SCENE_POLICIES,
+    SURFACE_BINDINGS,
     CompanionContractsRepository,
     companion_contracts_db_path,
 )
@@ -29,6 +31,8 @@ def test_repository_creates_parent_directory_and_seed_records(tmp_path):
         "companion_profiles": 1,
         "scene_policies": len(SCENE_POLICIES),
         "interaction_contracts": 1,
+        "persona_profiles": len(PERSONA_PROFILES),
+        "surface_bindings": len(SURFACE_BINDINGS),
         "scene_resolution_events": 0,
         "interaction_boundary_events": 0,
     }
@@ -45,6 +49,8 @@ def test_repository_initialization_is_idempotent(tmp_path):
         "companion_profiles": 1,
         "scene_policies": len(SCENE_POLICIES),
         "interaction_contracts": 1,
+        "persona_profiles": len(PERSONA_PROFILES),
+        "surface_bindings": len(SURFACE_BINDINGS),
         "scene_resolution_events": 0,
         "interaction_boundary_events": 0,
     }
@@ -61,6 +67,8 @@ def test_repository_resolves_seeded_records(tmp_path):
         profile_id=profile.profile_id,
         profile_version=profile.version,
     )
+    persona = repository.persona_profile("personal_companion")
+    surface_binding = repository.surface_binding("vscode")
 
     assert profile.profile_id == "default_companion_profile"
     assert profile.version == 1
@@ -68,3 +76,8 @@ def test_repository_resolves_seeded_records(tmp_path):
     assert scene.scene_id == "coding_build"
     assert contract.contract_id == "default_interaction_contract"
     assert contract.profile_id == profile.profile_id
+    assert persona is not None
+    assert persona.persona_id == "personal_companion"
+    assert persona.persona_owns_durable_memory is False
+    assert surface_binding is not None
+    assert surface_binding.default_persona_id == "technical_architect"

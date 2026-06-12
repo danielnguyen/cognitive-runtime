@@ -7,7 +7,9 @@ from services.runtime_state import clear_states_for_tests
 
 @pytest.fixture(autouse=True)
 def isolated_runtime_storage(tmp_path, monkeypatch):
-    db_path = tmp_path / "contracts" / "companion_contracts.sqlite3"
-    monkeypatch.setenv("COMPANION_CONTRACTS_DB_PATH", str(db_path))
-    reset_companion_contracts_for_tests(db_path=db_path)
-    clear_states_for_tests()
+    contracts_db_path = tmp_path / "contracts" / "companion_contracts.sqlite3"
+    runtime_db_path = tmp_path / "runtime" / "runtime_state.sqlite3"
+    monkeypatch.setenv("COMPANION_CONTRACTS_DB_PATH", str(contracts_db_path))
+    monkeypatch.setenv("COGNITIVE_RUNTIME_DB_PATH", str(runtime_db_path))
+    reset_companion_contracts_for_tests(db_path=contracts_db_path)
+    clear_states_for_tests(db_path=runtime_db_path)
