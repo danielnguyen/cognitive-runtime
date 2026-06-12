@@ -33,6 +33,8 @@ from models import (
     WorldStateClaimUpsertRequest,
     WorldStateDiagnosticsRequest,
     WorldStateDiagnosticsResponse,
+    WorldStateResolveRequest,
+    WorldStateResolveResponse,
 )
 from services.companion_contracts import companion_contracts_repository
 from services.companion_policy import (
@@ -60,7 +62,11 @@ from services.runtime_state import (
     update_turn,
     update_state,
 )
-from services.world_state import get_world_state_diagnostics, upsert_world_state_claim
+from services.world_state import (
+    get_world_state_diagnostics,
+    resolve_world_state,
+    upsert_world_state_claim,
+)
 
 app = FastAPI(title="Cognitive Runtime", version="0.1.0")
 
@@ -223,6 +229,21 @@ async def world_state_diagnostics(
     return get_world_state_diagnostics(
         owner_id=body.owner_id,
         include_sensitive_values=body.include_sensitive_values,
+    )
+
+
+@app.post("/v1/world-state/resolve", response_model=WorldStateResolveResponse)
+async def world_state_resolve(
+    body: WorldStateResolveRequest,
+) -> WorldStateResolveResponse:
+    return resolve_world_state(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        runtime_session_id=body.runtime_session_id,
+        active_persona_id=body.active_persona_id,
+        requested_domains=body.requested_domains,
     )
 
 
