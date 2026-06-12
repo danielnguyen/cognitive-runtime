@@ -254,7 +254,7 @@ class RuntimeIdentityTrace(BaseModel):
         "surface_binding",
         "default_fallback",
     ]
-    persona_override_source: Literal["internal_test", "none"]
+    persona_override_source: Literal["internal_test", "surface_binding", "none"]
     surface_id: str = Field(max_length=120)
     surface_type: str = Field(max_length=80)
     surface_display_name: str = Field(max_length=120)
@@ -264,7 +264,9 @@ class RuntimeIdentityTrace(BaseModel):
 
 
 class RuntimeIdentityResolveRequest(RuntimeSessionResolveRequest):
+    runtime_session_id: str | None = Field(default=None, max_length=120)
     requested_persona_id: str | None = Field(default=None, max_length=120)
+    allow_requested_persona_bypass: bool = False
 
 
 class RuntimeIdentityResolveResponse(BaseModel):

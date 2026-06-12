@@ -738,6 +738,10 @@ def get_runtime_session(runtime_session_id: str) -> RuntimeSessionDiagnosticsRes
     return runtime_state_repository().diagnostics(runtime_session_id)
 
 
+def runtime_session_by_id(runtime_session_id: str) -> RuntimeSession | None:
+    return runtime_state_repository().session_by_id(runtime_session_id)
+
+
 def resolve_state(*, owner_id: str, conversation_id: str, surface: str) -> RuntimeState:
     return runtime_state_repository().resolve_state(
         owner_id=owner_id,
