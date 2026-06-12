@@ -419,11 +419,27 @@ def test_relationship_select_excludes_conflicted_relationships_without_winner_se
     _seed_entities(client)
     first = client.post(
         "/v1/relationships/edges/upsert",
-        json={**_base(), "edge": _edge(object_entity_id="repo:alpha", source_type="trusted_config"), "evidence": []},
+        json={
+            **_base(),
+            "edge": _edge(
+                object_entity_id="repo:alpha",
+                relationship_type="defaults_to",
+                source_type="trusted_config",
+            ),
+            "evidence": [],
+        },
     ).json()["relationship"]
     second = client.post(
         "/v1/relationships/edges/upsert",
-        json={**_base(), "edge": _edge(object_entity_id="repo:beta", source_type="trusted_config"), "evidence": []},
+        json={
+            **_base(),
+            "edge": _edge(
+                object_entity_id="repo:beta",
+                relationship_type="defaults_to",
+                source_type="trusted_config",
+            ),
+            "evidence": [],
+        },
     ).json()["relationship"]
 
     response = client.post(
@@ -436,3 +452,54 @@ def test_relationship_select_excludes_conflicted_relationships_without_winner_se
     excluded_ids = {item["relationship_id"] for item in response.json()["excluded_relationship_summaries"]}
     assert {first["relationship_id"], second["relationship_id"]}.issubset(excluded_ids)
     assert response.json()["trace"]["relationship_conflicts"]
+
+
+def test_relationship_select_allows_multiple_contains_edges_without_conflict():
+    client = TestClient(app)
+    _seed_entities(client)
+    first = client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base(),
+            "edge": _edge(
+                object_entity_id="repo:alpha",
+                relationship_type="contains",
+                source_type="trusted_config",
+            ),
+            "evidence": [],
+        },
+    ).json()["relationship"]
+    second = client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base(),
+            "edge": _edge(
+                object_entity_id="repo:beta",
+                relationship_type="contains",
+                source_type="trusted_config",
+            ),
+            "evidence": [],
+        },
+    ).json()["relationship"]
+
+    response = client.post(
+        "/v1/relationships/select",
+        json={
+            **_base(),
+            "active_persona_id": "technical_architect",
+            "requested_scopes": ["project_context"],
+            "relationship_types": ["contains"],
+            "entity_ids": ["project:alpha"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    selected_ids = {item["relationship_id"] for item in body["selected_relationships"]}
+    assert selected_ids == {first["relationship_id"], second["relationship_id"]}
+    assert body["trace"]["relationship_conflicts"] == []
+    assert body["trace"]["selected_relationship_count"] == 2
+    assert {item["object_entity_id"] for item in body["selected_relationships"]} == {
+        "repo:alpha",
+        "repo:beta",
+    }
