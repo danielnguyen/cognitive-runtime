@@ -235,3 +235,125 @@ def test_world_state_payload_does_not_introduce_memory_or_relationship_contracts
     payload_text = str(response.json())
     assert "relationship_edges" not in payload_text
     assert "canonical_memory_ref" not in payload_text
+
+
+def test_world_state_resolve_includes_fresh_eligible_claims():
+    client = TestClient(app)
+    client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim()},
+    )
+
+    response = client.post(
+        "/v1/world-state/resolve",
+        json={**_base(), "active_persona_id": "technical_architect", "requested_domains": []},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["included_claims"]) == 1
+    assert body["trace"]["included_claim_count"] == 1
+    assert "active_repository/branch_status" in body["prompt_content"]
+
+
+def test_world_state_resolve_excludes_claims_outside_scope_and_requested_domains_only_narrow():
+    client = TestClient(app)
+    client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                domain="active_health_observation",
+                entity_type="health_observation",
+            ),
+        },
+    )
+
+    response = client.post(
+        "/v1/world-state/resolve",
+        json={
+            **_base(),
+            "active_persona_id": "technical_architect",
+            "requested_domains": ["active_health_observation", "active_repository"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["included_claims"] == []
+    assert response.json()["excluded_claim_summaries"][0]["reason"] == "outside_persona_or_surface_scope"
+
+
+def test_world_state_resolve_qualifies_stale_claims():
+    client = TestClient(app)
+    client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                observed_at=_iso(-900),
+                ttl_seconds=None,
+                expires_at=None,
+                revalidation_interval_seconds=600,
+                confirmation_policy="confirm_before_action",
+            ),
+        },
+    )
+
+    response = client.post(
+        "/v1/world-state/resolve",
+        json={**_base(), "active_persona_id": "technical_architect"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["included_claims"][0]["effective_freshness_state"] == "stale"
+    assert "last_known" in response.json()["prompt_content"]
+    assert response.json()["trace"]["confirmation_required"] is True
+
+
+def test_world_state_resolve_excludes_conflicted_claims_without_winner_selection():
+    client = TestClient(app)
+    client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim(value_json={"state": "open"})},
+    )
+    client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim(value_json={"state": "closed"})},
+    )
+
+    response = client.post(
+        "/v1/world-state/resolve",
+        json={**_base(), "active_persona_id": "technical_architect"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["included_claims"] == []
+    assert response.json()["trace"]["conflicted_count"] == 2
+    assert all(
+        item["effective_freshness_state"] == "conflicted"
+        for item in response.json()["excluded_claim_summaries"]
+    )
+
+
+def test_world_state_resolve_redacts_sensitive_prompt_content():
+    client = TestClient(app)
+    client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                domain="active_repository",
+                sensitivity="restricted",
+                value_json={"secret": "do-not-show"},
+            ),
+        },
+    )
+
+    response = client.post(
+        "/v1/world-state/resolve",
+        json={**_base(), "active_persona_id": "technical_architect"},
+    )
+
+    assert response.status_code == 200
+    assert "do-not-show" not in (response.json()["prompt_content"] or "")
+    assert "[REDACTED]" in (response.json()["prompt_content"] or "")

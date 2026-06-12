@@ -413,6 +413,31 @@ class WorldStateDiagnosticsResponse(BaseModel):
     transitions: list[WorldStateTransition] = Field(default_factory=list)
 
 
+class WorldStateResolveRequest(RuntimeStateResolveRequest):
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    active_persona_id: str | None = Field(default=None, max_length=120)
+    requested_domains: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+
+
+class WorldStateResolveTrace(BaseModel):
+    active_persona_id: str = Field(max_length=120)
+    allowed_domains: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    included_claim_count: int = 0
+    excluded_claim_count: int = 0
+    stale_count: int = 0
+    aging_count: int = 0
+    expired_count: int = 0
+    conflicted_count: int = 0
+    confirmation_required: bool = False
+
+
+class WorldStateResolveResponse(BaseModel):
+    included_claims: list[WorldStateClaimView] = Field(default_factory=list)
+    excluded_claim_summaries: list[WorldStateClaimSummary] = Field(default_factory=list)
+    prompt_content: str | None = None
+    trace: WorldStateResolveTrace
+
+
 class InteractionContract(BaseModel):
     contract_id: str = Field(max_length=120)
     contract_version: int

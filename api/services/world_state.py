@@ -14,6 +14,8 @@ from models import (
     WorldStateClaimView,
     WorldStateDiagnosticsResponse,
     WorldStateFreshnessState,
+    WorldStateResolveResponse,
+    WorldStateResolveTrace,
     WorldStateTransition,
 )
 from services.companion_contracts import companion_contracts_repository
@@ -673,3 +675,103 @@ def resolve_world_state_persona_scope(
     if requested_domains:
         allowed &= {domain for domain in requested_domains if domain}
     return active_persona_id, allowed
+
+
+def resolve_world_state(
+    *,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    runtime_session_id: str | None,
+    active_persona_id: str | None = None,
+    requested_domains: list[str] | None = None,
+) -> WorldStateResolveResponse:
+    diagnostics = get_world_state_diagnostics(owner_id=owner_id, include_sensitive_values=False)
+    persona_id, allowed_domains = resolve_world_state_persona_scope(
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=surface,
+        runtime_session_id=runtime_session_id,
+        active_persona_id=active_persona_id,
+        requested_domains=requested_domains,
+    )
+
+    included_claims: list[WorldStateClaimView] = []
+    excluded_claims = list(diagnostics.excluded_claims)
+    for claim in diagnostics.claims:
+        if claim.domain not in allowed_domains:
+            excluded_claims.append(
+                WorldStateClaimSummary(
+                    world_state_claim_id=claim.world_state_claim_id,
+                    entity_id=claim.entity_id,
+                    attribute=claim.attribute,
+                    domain=claim.domain,
+                    freshness_state=claim.freshness_state,
+                    effective_freshness_state=claim.effective_freshness_state,
+                    sensitivity=claim.sensitivity,
+                    reason="outside_persona_or_surface_scope",
+                    superseded_by_claim_id=claim.superseded_by_claim_id,
+                    conflict_claim_ids=claim.conflict_claim_ids,
+                )
+            )
+            continue
+        if claim.effective_freshness_state == "expired":
+            excluded_claims.append(
+                WorldStateClaimSummary(
+                    world_state_claim_id=claim.world_state_claim_id,
+                    entity_id=claim.entity_id,
+                    attribute=claim.attribute,
+                    domain=claim.domain,
+                    freshness_state=claim.freshness_state,
+                    effective_freshness_state=claim.effective_freshness_state,
+                    sensitivity=claim.sensitivity,
+                    reason="expired",
+                    superseded_by_claim_id=claim.superseded_by_claim_id,
+                    conflict_claim_ids=claim.conflict_claim_ids,
+                )
+            )
+            continue
+        included_claims.append(claim)
+
+    prompt_lines: list[str] = []
+    confirmation_required = False
+    for claim in included_claims:
+        label = claim.attribute
+        suffix = claim.effective_freshness_state
+        if claim.effective_freshness_state in {"aging", "stale"}:
+            suffix = (
+                f"{claim.effective_freshness_state}; last_known; "
+                f"confirmation_policy={claim.confirmation_policy}"
+            )
+        if claim.confirmation_policy != "none":
+            confirmation_required = True
+        if claim.value_redacted:
+            prompt_lines.append(f"- {claim.domain}/{label}: [REDACTED] ({suffix})")
+        else:
+            prompt_lines.append(
+                f"- {claim.domain}/{label}: {json.dumps(claim.value_json, sort_keys=True)} ({suffix})"
+            )
+
+    trace = WorldStateResolveTrace(
+        active_persona_id=persona_id,
+        allowed_domains=sorted(allowed_domains),
+        included_claim_count=len(included_claims),
+        excluded_claim_count=len(excluded_claims),
+        stale_count=sum(1 for claim in included_claims if claim.effective_freshness_state == "stale"),
+        aging_count=sum(1 for claim in included_claims if claim.effective_freshness_state == "aging"),
+        expired_count=sum(
+            1 for claim in excluded_claims if claim.effective_freshness_state == "expired"
+        ),
+        conflicted_count=sum(
+            1 for claim in excluded_claims if claim.effective_freshness_state == "conflicted"
+        ),
+        confirmation_required=confirmation_required,
+    )
+    return WorldStateResolveResponse(
+        included_claims=included_claims,
+        excluded_claim_summaries=excluded_claims,
+        prompt_content="World state:\n" + "\n".join(prompt_lines) if prompt_lines else None,
+        trace=trace,
+    )
