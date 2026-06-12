@@ -45,6 +45,7 @@ _MODEL_INFERENCE_ALLOWED_STATUSES = {"inferred", "needs_confirmation"}
 _SOCIALISH_RELATIONSHIP_TYPES = {"colleague_of", "collaborates_with"}
 _TERMINAL_EDGE_STATUSES = {"revoked", "superseded", "expired"}
 _RESTRICTED_SENSITIVITY_LEVELS = {"high", "restricted"}
+_CONFLICT_ELIGIBLE_RELATIONSHIP_TYPES = {"defaults_to", "bound_to"}
 _RELATIONSHIP_SCOPE_ALLOWLISTS: dict[str, set[str]] = {
     "general_assistant": {
         "professional_context",
@@ -970,6 +971,8 @@ class RelationshipRepository:
             if edge.status != "active":
                 continue
             if edge.superseded_by_relationship_id or edge.revoked_at:
+                continue
+            if edge.relationship_type not in _CONFLICT_ELIGIBLE_RELATIONSHIP_TYPES:
                 continue
             key = (edge.subject_entity_id, edge.relationship_type, edge.relationship_scope)
             buckets.setdefault(key, []).append(edge)
