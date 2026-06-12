@@ -438,6 +438,331 @@ class WorldStateResolveResponse(BaseModel):
     trace: WorldStateResolveTrace
 
 
+RelationshipStatus = Literal[
+    "active",
+    "provisional",
+    "inferred",
+    "needs_confirmation",
+    "superseded",
+    "revoked",
+    "expired",
+    "conflicted",
+]
+RelationshipMentionability = Literal[
+    "mentionable",
+    "use_for_routing_only",
+    "use_for_filtering_only",
+    "confirm_before_mentioning",
+    "suppress_by_default",
+    "restricted",
+]
+RelationshipType = Literal[
+    "owns",
+    "uses",
+    "works_on",
+    "maintains",
+    "manages",
+    "belongs_to",
+    "member_of",
+    "contains",
+    "depends_on",
+    "blocks",
+    "documents",
+    "references",
+    "authored_by",
+    "created_by",
+    "governs",
+    "responsible_for",
+    "defaults_to",
+    "bound_to",
+    "allowed_for",
+    "related_to",
+    "colleague_of",
+    "collaborates_with",
+]
+RelationshipSourceType = Literal[
+    "explicit_user_confirmation",
+    "trusted_config",
+    "trusted_integration_metadata",
+    "trusted_import_metadata",
+    "tool_output",
+    "repository_inspection",
+    "artifact_metadata",
+    "model_inference",
+    "system_default",
+]
+RelationshipEvidenceType = Literal[
+    "user_confirmation",
+    "config_reference",
+    "integration_metadata",
+    "tool_output",
+    "artifact_reference",
+    "model_rationale",
+]
+SocialContextType = Literal[
+    "communication_preference",
+    "known_boundary",
+    "recurring_topic",
+    "relationship_reference",
+    "interaction_style_signal",
+    "support_preference",
+    "sensitivity_marker",
+    "do_not_surface_marker",
+]
+SocialContextUsageType = Literal[
+    "diagnostic_review",
+    "selection_trace",
+    "suppression_trace",
+]
+
+
+class RelationshipEntityInput(BaseModel):
+    entity_id: str = Field(max_length=120)
+    entity_type: str = Field(max_length=80)
+    canonical_label: str = Field(max_length=240)
+    display_label: str | None = Field(default=None, max_length=240)
+    domain: BoundedLabel
+    sensitivity_level: WorldStateSensitivity = "medium"
+    source_type: RelationshipSourceType
+    source_ref: str = Field(max_length=240)
+    canonical_memory_ref: str | None = Field(default=None, max_length=240)
+    artifact_ref: str | None = Field(default=None, max_length=240)
+    status: Literal["active", "archived"] = "active"
+    archived_at: str | None = None
+
+
+class RelationshipEntityUpsertRequest(RuntimeStateResolveRequest):
+    entity: RelationshipEntityInput
+
+
+class RelationshipEntityView(BaseModel):
+    entity_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    entity_type: str = Field(max_length=80)
+    canonical_label: str = Field(max_length=240)
+    display_label: str | None = Field(default=None, max_length=240)
+    domain: BoundedLabel
+    sensitivity_level: WorldStateSensitivity
+    source_type: RelationshipSourceType
+    source_ref: str = Field(max_length=240)
+    canonical_memory_ref: str | None = Field(default=None, max_length=240)
+    artifact_ref: str | None = Field(default=None, max_length=240)
+    status: Literal["active", "archived"]
+    created_at: str
+    updated_at: str
+    archived_at: str | None = None
+
+
+class RelationshipEntityResponse(BaseModel):
+    entity: RelationshipEntityView
+
+
+class RelationshipEdgeEvidenceInput(BaseModel):
+    evidence_type: RelationshipEvidenceType
+    source_ref: str = Field(max_length=240)
+    summary: str | None = Field(default=None, max_length=400)
+    confidence_delta: float = Field(ge=-1.0, le=1.0)
+
+
+class RelationshipEdgeInput(BaseModel):
+    relationship_id: str | None = Field(default=None, max_length=120)
+    subject_entity_id: str = Field(max_length=120)
+    relationship_type: RelationshipType
+    object_entity_id: str = Field(max_length=120)
+    relationship_scope: BoundedLabel
+    source_type: RelationshipSourceType
+    source_refs_json: list[str] = Field(default_factory=list, max_length=16)
+    confidence: float = Field(ge=0.0, le=1.0)
+    status: RelationshipStatus
+    sensitivity_level: WorldStateSensitivity = "medium"
+    mentionability: RelationshipMentionability = "mentionable"
+    allowed_persona_scopes_json: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    blocked_persona_scopes_json: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    valid_from: str | None = None
+    valid_until: str | None = None
+    supersede_existing_relationship_id: str | None = Field(default=None, max_length=120)
+    superseded_by_relationship_id: str | None = Field(default=None, max_length=120)
+    revoked_at: str | None = None
+
+
+class RelationshipEdgeUpsertRequest(RuntimeStateResolveRequest):
+    edge: RelationshipEdgeInput
+    evidence: list[RelationshipEdgeEvidenceInput] = Field(default_factory=list, max_length=8)
+
+
+class RelationshipEdgeView(BaseModel):
+    relationship_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    subject_entity_id: str = Field(max_length=120)
+    relationship_type: RelationshipType
+    object_entity_id: str = Field(max_length=120)
+    relationship_scope: BoundedLabel
+    source_type: RelationshipSourceType
+    source_refs_json: list[str] = Field(default_factory=list, max_length=16)
+    source_refs_redacted: bool = False
+    confidence: float
+    status: RelationshipStatus
+    sensitivity_level: WorldStateSensitivity
+    mentionability: RelationshipMentionability
+    allowed_persona_scopes_json: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    blocked_persona_scopes_json: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    valid_from: str | None = None
+    valid_until: str | None = None
+    superseded_by_relationship_id: str | None = None
+    created_at: str
+    updated_at: str
+    revoked_at: str | None = None
+
+
+class RelationshipEdgeEvidenceView(BaseModel):
+    evidence_id: str = Field(max_length=120)
+    relationship_id: str = Field(max_length=120)
+    evidence_type: RelationshipEvidenceType
+    source_ref: str = Field(max_length=240)
+    summary: str | None = Field(default=None, max_length=400)
+    summary_redacted: bool = False
+    confidence_delta: float
+    created_at: str
+
+
+class RelationshipEdgeResponse(BaseModel):
+    relationship: RelationshipEdgeView
+    evidence: list[RelationshipEdgeEvidenceView] = Field(default_factory=list)
+
+
+class RelationshipEdgeConfirmRequest(RuntimeStateResolveRequest):
+    relationship_id: str = Field(max_length=120)
+    evidence: RelationshipEdgeEvidenceInput | None = None
+
+
+class RelationshipEdgeRevokeRequest(RuntimeStateResolveRequest):
+    relationship_id: str = Field(max_length=120)
+    evidence: RelationshipEdgeEvidenceInput | None = None
+
+
+class RelationshipGraphDiagnosticsRequest(RuntimeStateResolveRequest):
+    include_restricted_details: bool = False
+
+
+class RelationshipDiagnosticsResponse(BaseModel):
+    entities: list[RelationshipEntityView] = Field(default_factory=list)
+    relationships: list[RelationshipEdgeView] = Field(default_factory=list)
+    evidence: list[RelationshipEdgeEvidenceView] = Field(default_factory=list)
+
+
+class RelationshipExcludedSummary(BaseModel):
+    relationship_id: str = Field(max_length=120)
+    subject_entity_id: str = Field(max_length=120)
+    relationship_type: RelationshipType
+    object_entity_id: str = Field(max_length=120)
+    relationship_scope: BoundedLabel
+    status: RelationshipStatus
+    mentionability: RelationshipMentionability
+    sensitivity_level: WorldStateSensitivity
+    confidence: float
+    reason: BoundedLabel
+
+
+class RelationshipSelectRequest(RuntimeStateResolveRequest):
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    active_persona_id: str | None = Field(default=None, max_length=120)
+    requested_scopes: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    entity_ids: list[str] = Field(default_factory=list, max_length=16)
+    relationship_types: list[RelationshipType] = Field(default_factory=list, max_length=16)
+
+
+class RelationshipSelectTrace(BaseModel):
+    relationship_edges_used: list[str] = Field(default_factory=list, max_length=64)
+    relationship_edges_excluded: list[str] = Field(default_factory=list, max_length=64)
+    relationship_exclusion_reasons: dict[str, str] = Field(default_factory=dict)
+    relationship_context_overlay_applied: bool = False
+    relationship_conflicts: list[str] = Field(default_factory=list, max_length=64)
+    relationship_confirmation_required: bool = False
+    selected_relationship_count: int = 0
+    excluded_relationship_count: int = 0
+    active_persona_id: str = Field(max_length=120)
+    allowed_relationship_scopes: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+
+
+class RelationshipSelectResponse(BaseModel):
+    selected_entities: list[RelationshipEntityView] = Field(default_factory=list)
+    selected_relationships: list[RelationshipEdgeView] = Field(default_factory=list)
+    excluded_relationship_summaries: list[RelationshipExcludedSummary] = Field(default_factory=list)
+    prompt_content: str | None = None
+    trace: RelationshipSelectTrace
+
+
+class SocialContextItemInput(BaseModel):
+    social_context_id: str | None = Field(default=None, max_length=120)
+    context_type: SocialContextType
+    summary: str = Field(max_length=400)
+    source_refs_json: list[str] = Field(default_factory=list, max_length=16)
+    relationship_edge_refs_json: list[str] = Field(default_factory=list, max_length=16)
+    confidence: float = Field(ge=0.0, le=1.0)
+    freshness: BoundedLabel
+    mentionability: RelationshipMentionability = "mentionable"
+
+
+class SocialContextItemUpsertRequest(RuntimeStateResolveRequest):
+    item: SocialContextItemInput
+
+
+class SocialContextItemView(BaseModel):
+    social_context_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    context_type: SocialContextType
+    summary: str = Field(max_length=400)
+    source_refs_json: list[str] = Field(default_factory=list, max_length=16)
+    relationship_edge_refs_json: list[str] = Field(default_factory=list, max_length=16)
+    confidence: float
+    freshness: BoundedLabel
+    mentionability: RelationshipMentionability
+    suppressed_by_default: bool = False
+    suppression_reasons: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+    created_at: str
+    updated_at: str
+
+
+class SocialContextItemResponse(BaseModel):
+    item: SocialContextItemView
+
+
+class SocialContextUsageEventInput(BaseModel):
+    event_id: str | None = Field(default=None, max_length=120)
+    social_context_id: str = Field(max_length=120)
+    relationship_edge_refs_json: list[str] = Field(default_factory=list, max_length=16)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    usage_type: SocialContextUsageType
+    policy_decision: BoundedLabel
+
+
+class SocialContextUsageEventRecordRequest(RuntimeStateResolveRequest):
+    event: SocialContextUsageEventInput
+
+
+class SocialContextUsageEventView(BaseModel):
+    event_id: str = Field(max_length=120)
+    social_context_id: str = Field(max_length=120)
+    relationship_edge_refs_json: list[str] = Field(default_factory=list, max_length=16)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    usage_type: SocialContextUsageType
+    policy_decision: BoundedLabel
+    created_at: str
+
+
+class SocialContextUsageEventResponse(BaseModel):
+    event: SocialContextUsageEventView
+
+
+class SocialContextDiagnosticsRequest(RuntimeStateResolveRequest):
+    pass
+
+
+class SocialContextDiagnosticsResponse(BaseModel):
+    items: list[SocialContextItemView] = Field(default_factory=list)
+    usage_events: list[SocialContextUsageEventView] = Field(default_factory=list)
+
+
 class InteractionContract(BaseModel):
     contract_id: str = Field(max_length=120)
     contract_version: int

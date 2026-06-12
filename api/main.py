@@ -5,6 +5,22 @@ from models import (
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
     CompanionProfileActiveResponse,
+    RelationshipDiagnosticsResponse,
+    RelationshipEdgeConfirmRequest,
+    RelationshipEdgeResponse,
+    RelationshipEdgeUpsertRequest,
+    RelationshipEdgeRevokeRequest,
+    RelationshipEntityResponse,
+    RelationshipEntityUpsertRequest,
+    RelationshipGraphDiagnosticsRequest,
+    RelationshipSelectRequest,
+    RelationshipSelectResponse,
+    SocialContextDiagnosticsRequest,
+    SocialContextDiagnosticsResponse,
+    SocialContextItemResponse,
+    SocialContextItemUpsertRequest,
+    SocialContextUsageEventRecordRequest,
+    SocialContextUsageEventResponse,
     InteractionContractValidateRequest,
     InteractionContractValidateResponse,
     InterruptEvaluateRequest,
@@ -49,6 +65,16 @@ from services.interaction_diagnostics import (
     validate_interaction_text,
 )
 from services.interrupt_policy import evaluate_interrupt_policy
+from services.relationships import (
+    confirm_relationship_edge,
+    get_relationship_diagnostics,
+    get_relationship_edge,
+    get_relationship_entity,
+    revoke_relationship_edge,
+    select_relationships,
+    upsert_relationship_edge,
+    upsert_relationship_entity,
+)
 from services.runtime_identity import resolve_runtime_identity
 from services.runtime_state import (
     build_overlay,
@@ -61,6 +87,11 @@ from services.runtime_state import (
     start_turn,
     update_turn,
     update_state,
+)
+from services.social_context import (
+    get_social_context_diagnostics,
+    record_social_context_usage_event,
+    upsert_social_context_item,
 )
 from services.world_state import (
     get_world_state_diagnostics,
@@ -209,6 +240,86 @@ async def runtime_identity_resolve(
         },
     )
     return resolution
+
+
+@app.post("/v1/relationships/entities/upsert", response_model=RelationshipEntityResponse)
+async def relationship_entity_upsert(
+    body: RelationshipEntityUpsertRequest,
+) -> RelationshipEntityResponse:
+    entity = upsert_relationship_entity(owner_id=body.owner_id, entity=body.entity)
+    return RelationshipEntityResponse(entity=entity)
+
+
+@app.post("/v1/relationships/edges/upsert", response_model=RelationshipEdgeResponse)
+async def relationship_edge_upsert(
+    body: RelationshipEdgeUpsertRequest,
+) -> RelationshipEdgeResponse:
+    return upsert_relationship_edge(owner_id=body.owner_id, edge=body.edge, evidence=body.evidence)
+
+
+@app.post("/v1/relationships/edges/confirm", response_model=RelationshipEdgeResponse)
+async def relationship_edge_confirm(
+    body: RelationshipEdgeConfirmRequest,
+) -> RelationshipEdgeResponse:
+    return confirm_relationship_edge(owner_id=body.owner_id, body=body)
+
+
+@app.post("/v1/relationships/edges/revoke", response_model=RelationshipEdgeResponse)
+async def relationship_edge_revoke(
+    body: RelationshipEdgeRevokeRequest,
+) -> RelationshipEdgeResponse:
+    return revoke_relationship_edge(owner_id=body.owner_id, body=body)
+
+
+@app.get("/v1/relationships/entities/{entity_id}", response_model=RelationshipEntityResponse)
+async def relationship_entity_get(entity_id: str, owner_id: str) -> RelationshipEntityResponse:
+    entity = get_relationship_entity(owner_id=owner_id, entity_id=entity_id)
+    if entity is None:
+        raise HTTPException(status_code=404, detail="relationship_entity_not_found")
+    return RelationshipEntityResponse(entity=entity)
+
+
+@app.get("/v1/relationships/edges/{relationship_id}", response_model=RelationshipEdgeResponse)
+async def relationship_edge_get(relationship_id: str, owner_id: str) -> RelationshipEdgeResponse:
+    relationship = get_relationship_edge(owner_id=owner_id, relationship_id=relationship_id)
+    if relationship is None:
+        raise HTTPException(status_code=404, detail="relationship_edge_not_found")
+    return RelationshipEdgeResponse(relationship=relationship, evidence=[])
+
+
+@app.post("/v1/relationships/diagnostics", response_model=RelationshipDiagnosticsResponse)
+async def relationship_diagnostics(
+    body: RelationshipGraphDiagnosticsRequest,
+) -> RelationshipDiagnosticsResponse:
+    return get_relationship_diagnostics(body)
+
+
+@app.post("/v1/relationships/select", response_model=RelationshipSelectResponse)
+async def relationship_select(body: RelationshipSelectRequest) -> RelationshipSelectResponse:
+    return select_relationships(body)
+
+
+@app.post("/v1/social-context/items/upsert", response_model=SocialContextItemResponse)
+async def social_context_item_upsert(
+    body: SocialContextItemUpsertRequest,
+) -> SocialContextItemResponse:
+    item = upsert_social_context_item(owner_id=body.owner_id, item=body.item)
+    return SocialContextItemResponse(item=item)
+
+
+@app.post("/v1/social-context/usage-events/record", response_model=SocialContextUsageEventResponse)
+async def social_context_usage_event_record(
+    body: SocialContextUsageEventRecordRequest,
+) -> SocialContextUsageEventResponse:
+    event = record_social_context_usage_event(owner_id=body.owner_id, event=body.event)
+    return SocialContextUsageEventResponse(event=event)
+
+
+@app.post("/v1/social-context/diagnostics", response_model=SocialContextDiagnosticsResponse)
+async def social_context_diagnostics(
+    body: SocialContextDiagnosticsRequest,
+) -> SocialContextDiagnosticsResponse:
+    return get_social_context_diagnostics(body)
 
 
 @app.post("/v1/world-state/claims/upsert", response_model=WorldStateClaimResponse)
