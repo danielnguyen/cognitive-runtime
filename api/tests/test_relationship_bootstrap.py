@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from services.relationship_bootstrap import apply_bootstrap_seed
+from services.relationship_bootstrap import apply_bootstrap_seed, load_bootstrap_seed
 from services.relationships import relationship_repository
 from services.social_context import social_context_repository
 
@@ -10,6 +10,21 @@ from services.social_context import social_context_repository
 def _write_seed(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
     return path
+
+
+def test_packaged_seed_path_exists_and_loads() -> None:
+    seed_path = Path(__file__).resolve().parents[1] / "config" / "relationships.seed.example.yaml"
+
+    assert seed_path.exists()
+
+    parsed = load_bootstrap_seed(seed_path)
+
+    assert parsed.source_ref == "bootstrap:config/relationships.seed.example.yaml"
+    assert any(entity.entity_id == "project:llm-memory" for entity in parsed.entities)
+    assert any(
+        edge.relationship_id == "rel:llm-memory:contains:cognitive-runtime"
+        for edge, _ in parsed.relationships
+    )
 
 
 def test_bootstrap_seed_apply_creates_entities_and_relationships(tmp_path: Path):

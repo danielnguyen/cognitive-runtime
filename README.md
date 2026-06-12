@@ -82,13 +82,19 @@ Trusted project and system relationships can be bootstrapped from a seed file wi
 Example command:
 
 ```bash
-cd api && ./.venv/bin/python scripts/bootstrap_relationships.py ../config/relationships.seed.example.yaml --owner-id <owner>
+python scripts/bootstrap_relationships.py config/relationships.seed.example.yaml --owner-id <owner>
+```
+
+Local development:
+
+```bash
+cd api && ./.venv/bin/python scripts/bootstrap_relationships.py config/relationships.seed.example.yaml --owner-id <owner>
 ```
 
 Dry-run validation:
 
 ```bash
-cd api && ./.venv/bin/python scripts/bootstrap_relationships.py ../config/relationships.seed.example.yaml --owner-id <owner> --dry-run
+cd api && ./.venv/bin/python scripts/bootstrap_relationships.py config/relationships.seed.example.yaml --owner-id <owner> --dry-run
 ```
 
 The bootstrap script is idempotent for seeded entities, relationships, and duplicate evidence records. It is bootstrap tooling only and does not perform runtime inference, retrieval filtering, or social-context creation.
