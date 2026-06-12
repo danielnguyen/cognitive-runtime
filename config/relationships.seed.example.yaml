@@ -29,6 +29,26 @@ entities:
     source_ref: bootstrap:config/relationships.seed.example.yaml
     status: active
 
+  - entity_id: repo:basic-memory-store
+    entity_type: repository
+    canonical_label: basic-memory-store
+    display_label: basic-memory-store
+    domain: project_context
+    sensitivity_level: medium
+    source_type: trusted_config
+    source_ref: bootstrap:config/relationships.seed.example.yaml
+    status: active
+
+  - entity_id: repo:projects
+    entity_type: repository
+    canonical_label: projects
+    display_label: projects
+    domain: project_context
+    sensitivity_level: medium
+    source_type: trusted_config
+    source_ref: bootstrap:config/relationships.seed.example.yaml
+    status: active
+
   - entity_id: persona:technical_architect
     entity_type: persona
     canonical_label: technical_architect
@@ -84,6 +104,46 @@ relationships:
     subject_entity_id: project:llm-memory
     relationship_type: contains
     object_entity_id: repo:chat-orchestrator
+    relationship_scope: project_context
+    source_type: trusted_config
+    source_refs_json:
+      - bootstrap:config/relationships.seed.example.yaml
+    confidence: 1.0
+    status: active
+    sensitivity_level: medium
+    mentionability: mentionable
+    allowed_persona_scopes_json: []
+    blocked_persona_scopes_json: []
+    evidence:
+      - evidence_type: config_reference
+        source_ref: bootstrap:config/relationships.seed.example.yaml
+        summary: Trusted config bootstrap relationship.
+        confidence_delta: 0.0
+
+  - relationship_id: rel:llm-memory:contains:basic-memory-store
+    subject_entity_id: project:llm-memory
+    relationship_type: contains
+    object_entity_id: repo:basic-memory-store
+    relationship_scope: project_context
+    source_type: trusted_config
+    source_refs_json:
+      - bootstrap:config/relationships.seed.example.yaml
+    confidence: 1.0
+    status: active
+    sensitivity_level: medium
+    mentionability: mentionable
+    allowed_persona_scopes_json: []
+    blocked_persona_scopes_json: []
+    evidence:
+      - evidence_type: config_reference
+        source_ref: bootstrap:config/relationships.seed.example.yaml
+        summary: Trusted config bootstrap relationship.
+        confidence_delta: 0.0
+
+  - relationship_id: rel:llm-memory:contains:projects
+    subject_entity_id: project:llm-memory
+    relationship_type: contains
+    object_entity_id: repo:projects
     relationship_scope: project_context
     source_type: trusted_config
     source_refs_json:
