@@ -202,6 +202,28 @@ def test_diagnostics_redact_sensitive_values_by_default():
     assert diagnostics["claims"][0]["value_redacted"] is True
 
 
+def test_diagnostics_ignore_include_sensitive_values_without_authorization_policy():
+    client = TestClient(app)
+    client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                sensitivity="restricted",
+                value_json={"secret": "still-hidden"},
+            ),
+        },
+    )
+
+    diagnostics = client.post(
+        "/v1/world-state/diagnostics",
+        json={**_base(), "include_sensitive_values": True},
+    ).json()
+
+    assert diagnostics["claims"][0]["value_json"] is None
+    assert diagnostics["claims"][0]["value_redacted"] is True
+
+
 def test_world_state_payload_does_not_introduce_memory_or_relationship_contracts():
     client = TestClient(app)
     response = client.post(
