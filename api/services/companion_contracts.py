@@ -152,6 +152,124 @@ SCENE_POLICIES = {
     },
 }
 
+PERSONA_PROFILES = {
+    "general_assistant": {
+        "display_name": "General Assistant",
+        "capability_domain": "general_assistance",
+        "description": "General-purpose assistant for broad text interactions.",
+        "communication_policy_summary": [
+            "Use clear, bounded, context-appropriate communication.",
+            "Prefer concise recommendations over unnecessary elaboration.",
+        ],
+        "runtime_policy_summary": [
+            "Do not operate proactively in this runtime identity MVP.",
+            "Preserve context boundaries unless future policy explicitly expands them.",
+        ],
+        "advisory_memory_scope_summary": ["general_context", "conversation_context"],
+        "advisory_tool_permission_summary": ["search_memory", "summarize"],
+    },
+    "technical_architect": {
+        "display_name": "Technical Architect",
+        "capability_domain": "software_architecture",
+        "description": "Technical implementation and architecture assistant.",
+        "communication_policy_summary": [
+            "Prioritize contracts, implementation details, and validation.",
+            "Keep answers structured and directly actionable.",
+        ],
+        "runtime_policy_summary": [
+            "Prefer explicit assumptions over prompt-only inference.",
+            "Stay non-proactive in this runtime identity MVP.",
+        ],
+        "advisory_memory_scope_summary": [
+            "technical_context",
+            "project_context",
+            "code_context",
+        ],
+        "advisory_tool_permission_summary": [
+            "search_memory",
+            "inspect_repository",
+            "summarize",
+        ],
+    },
+    "operations_assistant": {
+        "display_name": "Operations Assistant",
+        "capability_domain": "ops",
+        "description": "Operational monitoring and coordination assistant.",
+        "communication_policy_summary": [
+            "Lead with risk, status, and next-step framing.",
+            "Keep emotional framing low and operationally useful.",
+        ],
+        "runtime_policy_summary": [
+            "Preserve operational context boundaries.",
+            "Do not take proactive action in this runtime identity MVP.",
+        ],
+        "advisory_memory_scope_summary": [
+            "ops_context",
+            "deployment_context",
+            "runbook_context",
+        ],
+        "advisory_tool_permission_summary": [
+            "search_memory",
+            "inspect_runbook",
+            "summarize",
+        ],
+    },
+    "personal_companion": {
+        "display_name": "Personal Companion",
+        "capability_domain": "personal_support",
+        "description": "Bounded personal-support persona with shared memory doctrine.",
+        "communication_policy_summary": [
+            "Use warm but bounded communication that stays task-relevant.",
+            "Avoid pseudo-attachment, pressure, and exclusivity framing.",
+        ],
+        "runtime_policy_summary": [
+            "Do not create hidden identity state or persona-owned durable memory.",
+            "Remain non-proactive in this runtime identity MVP.",
+        ],
+        "advisory_memory_scope_summary": ["personal_context", "conversation_context"],
+        "advisory_tool_permission_summary": ["search_memory", "summarize"],
+    },
+}
+
+SURFACE_BINDINGS = {
+    "dev": {
+        "surface_id": "dev",
+        "surface_type": "developer_surface",
+        "surface_display_name": "Developer Surface",
+        "default_persona_id": "technical_architect",
+        "allow_user_persona_override": False,
+        "response_length": "concise",
+        "default_mode": "actionable",
+    },
+    "vscode": {
+        "surface_id": "vscode",
+        "surface_type": "ide_extension",
+        "surface_display_name": "VS Code",
+        "default_persona_id": "technical_architect",
+        "allow_user_persona_override": False,
+        "response_length": "concise",
+        "default_mode": "actionable",
+    },
+    "web": {
+        "surface_id": "web",
+        "surface_type": "web_app",
+        "surface_display_name": "Web",
+        "default_persona_id": "general_assistant",
+        "allow_user_persona_override": False,
+        "response_length": "balanced",
+        "default_mode": "general",
+    },
+    "unknown": {
+        "surface_id": "unknown",
+        "surface_type": "unknown_surface",
+        "surface_display_name": "Unknown Surface",
+        "default_persona_id": "general_assistant",
+        "allow_user_persona_override": False,
+        "response_length": "balanced",
+        "default_mode": "general",
+    },
+}
+
 
 @dataclass(frozen=True)
 class CompanionProfileRecord:
@@ -204,6 +322,30 @@ class InteractionContractRecord:
     allowed_intervention_styles: list[str]
     disallowed_intervention_styles: list[str]
     defer_conditions: list[str]
+
+
+@dataclass(frozen=True)
+class PersonaProfileRecord:
+    persona_id: str
+    display_name: str
+    capability_domain: str
+    description: str
+    communication_policy_summary: list[str]
+    runtime_policy_summary: list[str]
+    advisory_memory_scope_summary: list[str]
+    advisory_tool_permission_summary: list[str]
+    persona_owns_durable_memory: bool
+
+
+@dataclass(frozen=True)
+class SurfaceBindingRecord:
+    surface_id: str
+    surface_type: str
+    surface_display_name: str
+    default_persona_id: str
+    allow_user_persona_override: bool
+    response_length: str | None
+    default_mode: str | None
 
 
 def _json(value: Any) -> str:
@@ -333,6 +475,34 @@ class CompanionContractsRepository:
                     reason_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS persona_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    persona_id TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL,
+                    capability_domain TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    communication_policy_summary_json TEXT NOT NULL,
+                    runtime_policy_summary_json TEXT NOT NULL,
+                    advisory_memory_scope_summary_json TEXT NOT NULL,
+                    advisory_tool_permission_summary_json TEXT NOT NULL,
+                    persona_owns_durable_memory INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS surface_bindings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    surface_id TEXT NOT NULL UNIQUE,
+                    surface_type TEXT NOT NULL,
+                    surface_display_name TEXT NOT NULL,
+                    default_persona_id TEXT NOT NULL,
+                    allow_user_persona_override INTEGER NOT NULL,
+                    response_length TEXT,
+                    default_mode TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self._seed(conn)
@@ -446,6 +616,53 @@ class CompanionContractsRepository:
             ),
         )
 
+        for persona_id, data in PERSONA_PROFILES.items():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO persona_profiles (
+                    persona_id, display_name, capability_domain, description,
+                    communication_policy_summary_json, runtime_policy_summary_json,
+                    advisory_memory_scope_summary_json, advisory_tool_permission_summary_json,
+                    persona_owns_durable_memory, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    persona_id,
+                    data["display_name"],
+                    data["capability_domain"],
+                    data["description"],
+                    _json(data["communication_policy_summary"]),
+                    _json(data["runtime_policy_summary"]),
+                    _json(data["advisory_memory_scope_summary"]),
+                    _json(data["advisory_tool_permission_summary"]),
+                    0,
+                    now,
+                    now,
+                ),
+            )
+
+        for surface_id, data in SURFACE_BINDINGS.items():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO surface_bindings (
+                    surface_id, surface_type, surface_display_name, default_persona_id,
+                    allow_user_persona_override, response_length, default_mode,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    surface_id,
+                    data["surface_type"],
+                    data["surface_display_name"],
+                    data["default_persona_id"],
+                    int(data["allow_user_persona_override"]),
+                    data["response_length"],
+                    data["default_mode"],
+                    now,
+                    now,
+                ),
+            )
+
     def active_profile(self) -> CompanionProfileRecord:
         with self._connect() as conn:
             row = conn.execute(
@@ -541,6 +758,56 @@ class CompanionContractsRepository:
             defer_conditions=_load_json(row["defer_conditions_json"], []),
         )
 
+    def persona_profile(self, persona_id: str) -> PersonaProfileRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM persona_profiles WHERE persona_id = ? LIMIT 1;",
+                (persona_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return PersonaProfileRecord(
+            persona_id=row["persona_id"],
+            display_name=row["display_name"],
+            capability_domain=row["capability_domain"],
+            description=row["description"],
+            communication_policy_summary=_load_json(
+                row["communication_policy_summary_json"], []
+            ),
+            runtime_policy_summary=_load_json(row["runtime_policy_summary_json"], []),
+            advisory_memory_scope_summary=_load_json(
+                row["advisory_memory_scope_summary_json"], []
+            ),
+            advisory_tool_permission_summary=_load_json(
+                row["advisory_tool_permission_summary_json"], []
+            ),
+            persona_owns_durable_memory=bool(row["persona_owns_durable_memory"]),
+        )
+
+    def default_persona_profile(self) -> PersonaProfileRecord:
+        persona = self.persona_profile("general_assistant")
+        if persona is None:
+            raise RuntimeError("default_persona_profile_missing")
+        return persona
+
+    def surface_binding(self, surface: str) -> SurfaceBindingRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM surface_bindings WHERE surface_id = ? LIMIT 1;",
+                (surface,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SurfaceBindingRecord(
+            surface_id=row["surface_id"],
+            surface_type=row["surface_type"],
+            surface_display_name=row["surface_display_name"],
+            default_persona_id=row["default_persona_id"],
+            allow_user_persona_override=bool(row["allow_user_persona_override"]),
+            response_length=row["response_length"],
+            default_mode=row["default_mode"],
+        )
+
     def record_counts(self) -> dict[str, int]:
         with self._connect() as conn:
             return {
@@ -552,6 +819,12 @@ class CompanionContractsRepository:
                 ),
                 "interaction_contracts": int(
                     conn.execute("SELECT COUNT(*) FROM interaction_contracts;").fetchone()[0]
+                ),
+                "persona_profiles": int(
+                    conn.execute("SELECT COUNT(*) FROM persona_profiles;").fetchone()[0]
+                ),
+                "surface_bindings": int(
+                    conn.execute("SELECT COUNT(*) FROM surface_bindings;").fetchone()[0]
                 ),
                 "scene_resolution_events": int(
                     conn.execute("SELECT COUNT(*) FROM scene_resolution_events;").fetchone()[0]

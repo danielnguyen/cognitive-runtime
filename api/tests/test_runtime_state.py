@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 from main import app
 from services.runtime_state import clear_states_for_tests
@@ -25,6 +27,93 @@ def test_resolve_creates_and_reuses_runtime_state():
     second_state = second.json()["runtime_state"]
     assert first_state["runtime_state_id"] == second_state["runtime_state_id"]
     assert first_state["temporary_constraints"] == []
+
+
+def test_runtime_session_resolution_is_stable_and_records_event():
+    client = TestClient(app)
+    payload = {
+        "request_id": "rid-session",
+        "owner_id": "owner",
+        "conversation_id": "conv-1",
+        "surface": "dev",
+        "active_mode": "actionable",
+    }
+
+    first = client.post("/v1/runtime/sessions/resolve", json=payload)
+    second = client.post("/v1/runtime/sessions/resolve", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    runtime_session_id = first.json()["runtime_session"]["runtime_session_id"]
+    assert runtime_session_id == second.json()["runtime_session"]["runtime_session_id"]
+
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}")
+    assert diagnostics.status_code == 200
+    body = diagnostics.json()
+    assert body["runtime_session"]["status"] == "active"
+    assert body["events"][0]["event_type"] == "session_resolved"
+
+
+def test_turn_lifecycle_is_durable_and_inspectable(tmp_path: Path):
+    runtime_db_path = tmp_path / "runtime" / "runtime_state.sqlite3"
+    clear_states_for_tests(db_path=runtime_db_path)
+    client = TestClient(app)
+
+    started = client.post(
+        "/v1/runtime/turns/start",
+        json={
+            "request_id": "rid-turn-1",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "input_message_id": "msg-1",
+            "intent_class": "task",
+        },
+    )
+    assert started.status_code == 200
+    started_body = started.json()
+    runtime_session_id = started_body["runtime_session"]["runtime_session_id"]
+    runtime_turn_id = started_body["runtime_turn"]["runtime_turn_id"]
+    assert started_body["event"]["event_type"] == "turn_started"
+
+    updated = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "rid-turn-2",
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+            "turn_status": "retrieving",
+            "timing_policy": "normal",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["runtime_turn"]["turn_status"] == "retrieving"
+
+    completed = client.post(
+        "/v1/runtime/turns/complete",
+        json={
+            "request_id": "rid-turn-3",
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+            "turn_status": "completed",
+            "continuation_state": "none",
+        },
+    )
+    assert completed.status_code == 200
+    assert completed.json()["runtime_turn"]["turn_status"] == "completed"
+
+    clear_states_for_tests(db_path=runtime_db_path)
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}")
+    assert diagnostics.status_code == 200
+    body = diagnostics.json()
+    assert body["latest_turn"]["runtime_turn_id"] == runtime_turn_id
+    assert body["latest_turn"]["turn_status"] == "completed"
+    assert [event["event_type"] for event in body["events"]] == [
+        "session_resolved",
+        "turn_started",
+        "turn_updated",
+        "turn_completed",
+    ]
 
 
 def test_update_and_overlay_are_bounded_and_mechanical():
