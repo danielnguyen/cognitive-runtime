@@ -43,7 +43,7 @@ _DOMAIN_ALLOWLISTS: dict[str, set[str]] = {
         "pending_action",
         "runtime_surface",
     },
-    "operations_copilot": {
+    "operations_assistant": {
         "active_external_system",
         "active_repository",
         "active_tool_session",
@@ -342,6 +342,7 @@ class WorldStateRepository:
         owner_id: str,
         include_sensitive_values: bool = False,
     ) -> WorldStateDiagnosticsResponse:
+        del include_sensitive_values
         now = datetime.now(UTC)
         with self._connect() as conn:
             rows = conn.execute(
@@ -367,7 +368,7 @@ class WorldStateRepository:
         for row in rows:
             view = self._claim_view_from_row(
                 row,
-                include_sensitive_values=include_sensitive_values,
+                include_sensitive_values=False,
                 now=now,
                 conflict_map=conflict_map,
             )

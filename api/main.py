@@ -228,7 +228,7 @@ async def world_state_diagnostics(
 ) -> WorldStateDiagnosticsResponse:
     return get_world_state_diagnostics(
         owner_id=body.owner_id,
-        include_sensitive_values=body.include_sensitive_values,
+        include_sensitive_values=False,
     )
 
 
