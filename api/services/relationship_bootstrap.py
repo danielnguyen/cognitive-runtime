@@ -132,6 +132,9 @@ def _canonical_bootstrap_source_ref(path: Path) -> str:
     resolved = path.resolve()
     try:
         relative = resolved.relative_to(REPO_ROOT)
-        return f"bootstrap:{relative.as_posix()}"
+        relative_posix = relative.as_posix()
+        if relative_posix.startswith("api/config/"):
+            relative_posix = relative_posix.removeprefix("api/")
+        return f"bootstrap:{relative_posix}"
     except ValueError:
         return f"bootstrap:{path.as_posix()}"
