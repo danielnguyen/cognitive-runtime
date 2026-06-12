@@ -5,6 +5,10 @@ from models import (
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
     CompanionProfileActiveResponse,
+    HumanCompatibilityDiagnosticsRequest,
+    HumanCompatibilityDiagnosticsResponse,
+    HumanCompatibilityReviewRequest,
+    HumanCompatibilityReviewResponse,
     RelationshipDiagnosticsResponse,
     RelationshipEdgeConfirmRequest,
     RelationshipEdgeResponse,
@@ -58,6 +62,10 @@ from services.companion_policy import (
     compile_policy,
     resolve_interaction_contract,
     resolve_scene,
+)
+from services.human_compatibility import (
+    get_human_compatibility_diagnostics,
+    submit_human_compatibility_review,
 )
 from services.interaction_diagnostics import (
     simulate_repair_text,
@@ -184,6 +192,26 @@ async def runtime_turn_complete(body: RuntimeTurnCompleteRequest) -> RuntimeTurn
         continuation_state=body.continuation_state,
     )
     return RuntimeTurnResponse(runtime_session=session, runtime_turn=turn, event=event)
+
+
+@app.post(
+    "/v1/runtime/human-compatibility/review",
+    response_model=HumanCompatibilityReviewResponse,
+)
+async def runtime_human_compatibility_review(
+    body: HumanCompatibilityReviewRequest,
+) -> HumanCompatibilityReviewResponse:
+    return submit_human_compatibility_review(body)
+
+
+@app.post(
+    "/v1/runtime/human-compatibility/diagnostics",
+    response_model=HumanCompatibilityDiagnosticsResponse,
+)
+async def runtime_human_compatibility_diagnostics(
+    body: HumanCompatibilityDiagnosticsRequest,
+) -> HumanCompatibilityDiagnosticsResponse:
+    return get_human_compatibility_diagnostics(body)
 
 
 @app.post("/v1/runtime/state/update", response_model=RuntimeStateResponse)

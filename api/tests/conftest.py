@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from services.companion_contracts import reset_companion_contracts_for_tests
+from services.human_compatibility import clear_human_compatibility_for_tests
 from services.relationships import clear_relationships_for_tests
 from services.runtime_state import clear_states_for_tests
 from services.social_context import clear_social_context_for_tests
@@ -19,3 +20,4 @@ def isolated_runtime_storage(tmp_path, monkeypatch):
     clear_world_state_for_tests(db_path=runtime_db_path)
     clear_relationships_for_tests(db_path=runtime_db_path)
     clear_social_context_for_tests(db_path=runtime_db_path)
+    clear_human_compatibility_for_tests(db_path=runtime_db_path)
