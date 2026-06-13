@@ -1026,7 +1026,7 @@ class HumanCompatibilityReviewRequest(BaseModel):
     owner_id: str = Field(max_length=120)
     review_id: str | None = Field(default=None, max_length=120)
     feature_ref: str = Field(min_length=1, max_length=240)
-    spec_ref: str = Field(default="R49", min_length=1, max_length=64)
+    spec_ref: str = Field(default="human_compatibility_v1", min_length=1, max_length=64)
     review_surfaces: list[HumanCompatibilityReviewSurface] = Field(min_length=1, max_length=8)
     proposed_behavior_summary: BoundedText
     risk_level: HumanCompatibilityRiskLevel

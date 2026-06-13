@@ -17,7 +17,7 @@ from services import human_compatibility
 
 def _base() -> dict[str, object]:
     return {
-        "request_id": "rid-human-compat",
+        "request_id": "human-compatibility-review-request",
         "owner_id": "owner",
     }
 
@@ -25,12 +25,12 @@ def _base() -> dict[str, object]:
 def _review_payload(**overrides) -> dict[str, object]:
     payload: dict[str, object] = {
         **_base(),
-        "feature_ref": "cluster17.review.surface",
-        "spec_ref": "R49",
+        "feature_ref": "human_compatibility.review.surface",
+        "spec_ref": "human_compatibility_v1",
         "review_surfaces": ["social_memory"],
         "proposed_behavior_summary": "Use social memory as a bounded review surface.",
         "risk_level": "medium",
-        "review_notes": "Operator review for R49 trace coverage.",
+        "review_notes": "Operator review for human compatibility trace coverage.",
         "mitigations_json": {"status": "not_required"},
         "runtime_turn_id": "rtturn_hc_1",
         "interaction_risk_flags": [],
@@ -39,7 +39,7 @@ def _review_payload(**overrides) -> dict[str, object]:
     return payload
 
 
-def test_creates_review_and_includes_all_r49_principles():
+def test_creates_review_and_includes_all_human_compatibility_principles():
     response = asyncio.run(
         runtime_human_compatibility_review(
             HumanCompatibilityReviewRequest.model_validate(_review_payload())
@@ -86,7 +86,7 @@ def test_records_risk_flags():
     diagnostics = asyncio.run(
         runtime_human_compatibility_diagnostics(
             HumanCompatibilityDiagnosticsRequest.model_validate(
-                {**_base(), "feature_ref": "cluster17.review.surface", "runtime_turn_id": "rtturn_hc_1"}
+                {**_base(), "feature_ref": "human_compatibility.review.surface", "runtime_turn_id": "rtturn_hc_1"}
             )
         )
     )
@@ -219,7 +219,7 @@ def test_diagnostics_returns_submitted_checklist_data_only():
     response = asyncio.run(
         runtime_human_compatibility_diagnostics(
             HumanCompatibilityDiagnosticsRequest.model_validate(
-                {**_base(), "feature_ref": "cluster17.review.surface", "runtime_turn_id": "rtturn_hc_1"}
+                {**_base(), "feature_ref": "human_compatibility.review.surface", "runtime_turn_id": "rtturn_hc_1"}
             )
         )
     )
@@ -255,7 +255,7 @@ def test_supplied_review_and_flag_ids_are_idempotent_per_owner():
     diagnostics = asyncio.run(
         runtime_human_compatibility_diagnostics(
             HumanCompatibilityDiagnosticsRequest.model_validate(
-                {**_base(), "feature_ref": "cluster17.review.surface", "runtime_turn_id": "rtturn_hc_1"}
+                {**_base(), "feature_ref": "human_compatibility.review.surface", "runtime_turn_id": "rtturn_hc_1"}
             )
         )
     )
@@ -291,7 +291,7 @@ def test_omitted_flag_ids_generate_unique_flags():
     diagnostics = asyncio.run(
         runtime_human_compatibility_diagnostics(
             HumanCompatibilityDiagnosticsRequest.model_validate(
-                {**_base(), "feature_ref": "cluster17.review.surface", "runtime_turn_id": "rtturn_hc_1"}
+                {**_base(), "feature_ref": "human_compatibility.review.surface", "runtime_turn_id": "rtturn_hc_1"}
             )
         )
     )

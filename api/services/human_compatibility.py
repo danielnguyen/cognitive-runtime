@@ -185,7 +185,7 @@ class HumanCompatibilityRepository:
                 "review_surface_count": len(body.review_surfaces),
                 "high_risk": body.risk_level == "high",
                 "stored_flag_ids": stored_flag_ids,
-                "validation_version": "r49_v1",
+                "validation_version": "human_compatibility_v1",
             },
         )
 
