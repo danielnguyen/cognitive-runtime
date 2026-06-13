@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 AttentionStatus = Literal["active", "paused", "resolved"]
 BoundedLabel = Annotated[str, Field(min_length=1, max_length=64)]
@@ -963,3 +964,174 @@ class RepairSimulateResponse(BaseModel):
     contract_id: str = Field(max_length=120)
     contract_version: int
     reason_json: dict[str, Any] = Field(default_factory=dict)
+
+
+HumanCompatibilityRiskLevel = Literal["low", "medium", "high"]
+HumanCompatibilityReviewSurface = Literal[
+    "persona_or_identity_selection",
+    "proactive_nudges",
+    "social_memory",
+    "affect_and_pacing",
+    "native_voice_presence",
+    "idle_state_behavior",
+    "emotionally_salient_responses",
+    "repeated_personalization",
+]
+InteractionRiskType = Literal[
+    "attachment_pressure",
+    "dependency_framing",
+    "reciprocity_claim",
+    "personhood_implication",
+    "hidden_influence",
+    "intensity_escalation",
+    "agency_erosion",
+    "over_personalization",
+]
+InteractionRiskSeverity = Literal["low", "medium", "high"]
+HumanCompatibilityReviewResult = Literal[
+    "approved",
+    "mitigations_required",
+    "requires_human_review",
+    "rejected",
+]
+
+_OPERATOR_RISK_NOTE_LABELS = {
+    "attachment_pressure",
+    "dependency_framing",
+    "reciprocity_claim",
+    "personhood_implication",
+}
+_OPERATOR_RISK_NOTE_PATTERN = re.compile(
+    r"\b(?:attachment_pressure|dependency_framing|reciprocity_claim|personhood_implication)\b"
+)
+
+
+class HumanCompatibilityRiskFlagInput(BaseModel):
+    flag_id: str | None = Field(default=None, max_length=120)
+    risk_type: InteractionRiskType
+    severity: InteractionRiskSeverity
+    triggering_policy: str = Field(min_length=1, max_length=240)
+
+    @field_validator("triggering_policy")
+    @classmethod
+    def _triggering_policy_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("triggering_policy_required")
+        return stripped
+
+
+class HumanCompatibilityReviewRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    review_id: str | None = Field(default=None, max_length=120)
+    feature_ref: str = Field(min_length=1, max_length=240)
+    spec_ref: str = Field(default="R49", min_length=1, max_length=64)
+    review_surfaces: list[HumanCompatibilityReviewSurface] = Field(min_length=1, max_length=8)
+    proposed_behavior_summary: BoundedText
+    risk_level: HumanCompatibilityRiskLevel
+    review_notes: str | None = Field(default=None, max_length=2000)
+    mitigations_json: Any = None
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    interaction_risk_flags: list[HumanCompatibilityRiskFlagInput] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+    @field_validator("feature_ref", "spec_ref", "proposed_behavior_summary")
+    @classmethod
+    def _non_blank_required_fields(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("field_must_not_be_blank")
+        return stripped
+
+    @field_validator("review_notes")
+    @classmethod
+    def _normalize_review_notes(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def _validate_review_shape(self) -> "HumanCompatibilityReviewRequest":
+        if self.risk_level == "high" and not _has_non_empty_value(self.mitigations_json):
+            raise ValueError("human_compatibility_mitigations_required_for_high_risk")
+        if self._requires_review_notes() and not self.review_notes:
+            raise ValueError("human_compatibility_review_notes_required")
+        return self
+
+    def _requires_review_notes(self) -> bool:
+        if any(flag.risk_type in _OPERATOR_RISK_NOTE_LABELS for flag in self.interaction_risk_flags):
+            return True
+        if self.review_notes and _OPERATOR_RISK_NOTE_PATTERN.search(self.review_notes):
+            return True
+        return False
+
+
+class HumanCompatibilityReviewView(BaseModel):
+    review_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    request_id: str = Field(max_length=120)
+    feature_ref: str = Field(max_length=240)
+    spec_ref: str = Field(max_length=64)
+    review_surfaces: list[HumanCompatibilityReviewSurface] = Field(default_factory=list, max_length=8)
+    proposed_behavior_summary: BoundedText
+    risk_level: HumanCompatibilityRiskLevel
+    review_result: HumanCompatibilityReviewResult
+    review_notes: str | None = Field(default=None, max_length=2000)
+    mitigations_json: Any = None
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    principles_checked: list[BoundedLabel] = Field(default_factory=list, min_length=6, max_length=6)
+    mitigations_required: bool = False
+    created_at: str
+
+
+class HumanCompatibilityRiskFlagView(BaseModel):
+    flag_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    risk_type: InteractionRiskType
+    severity: InteractionRiskSeverity
+    triggering_policy: str = Field(max_length=240)
+    created_at: str
+
+
+class HumanCompatibilityReviewResponse(BaseModel):
+    review_id: str = Field(max_length=120)
+    review_result: HumanCompatibilityReviewResult
+    principles_checked: list[BoundedLabel] = Field(default_factory=list, min_length=6, max_length=6)
+    mitigations_required: bool
+    flags_recorded: int
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+
+class HumanCompatibilityDiagnosticsRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    feature_ref: str | None = Field(default=None, max_length=240)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+
+    @field_validator("feature_ref")
+    @classmethod
+    def _normalize_feature_ref(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class HumanCompatibilityDiagnosticsResponse(BaseModel):
+    reviews: list[HumanCompatibilityReviewView] = Field(default_factory=list)
+    interaction_risk_flags: list[HumanCompatibilityRiskFlagView] = Field(default_factory=list)
+
+
+def _has_non_empty_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict | list | tuple | set):
+        return len(value) > 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
