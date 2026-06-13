@@ -107,7 +107,7 @@ class HumanCompatibilityRepository:
             "hcrev",
             f"{body.owner_id}:{body.feature_ref}:{body.spec_ref}:{body.request_id}:{now}",
         )
-        mitigations_required = body.risk_level == "high" and review_result == "mitigations_required"
+        mitigations_required = body.risk_level == "high"
         with self._connect() as conn:
             existing = conn.execute(
                 "SELECT created_at FROM human_compatibility_reviews WHERE owner_id = ? AND review_id = ? LIMIT 1;",

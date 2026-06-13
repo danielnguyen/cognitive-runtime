@@ -126,7 +126,7 @@ def test_high_risk_review_with_mitigations_requires_human_review():
 
     body = response.model_dump()
     assert body["review_result"] == "requires_human_review"
-    assert body["mitigations_required"] is False
+    assert body["mitigations_required"] is True
 
 
 def test_unknown_surface_rejected():
