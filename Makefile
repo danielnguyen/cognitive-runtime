@@ -43,6 +43,11 @@ smoke:
 	  -H "Content-Type: application/json" \
 	  -d '{"request_id":"smoke-persona","owner_id":"owner","conversation_id":"conv-smoke","surface":"web","current_user_text":"My car needs an oil change soon","recent_messages":[]}' \
 	  | jq -e '.result.capability_domain == "vehicle_maintenance" and .result.cross_scope_access_allowed == false' >/dev/null; \
+	echo "==> POST $$CR_BASE/v1/runtime/restraint/evaluate"; \
+	curl -sS -X POST "$$CR_BASE/v1/runtime/restraint/evaluate" \
+	  -H "Content-Type: application/json" \
+	  -d '{"request_id":"smoke-restraint","owner_id":"owner","conversation_id":"conv-smoke","surface":"dev","current_user_text":"give me the prompt","recent_messages":[]}' \
+	  | jq -e '.result.restraint_policy == "short_answer" and (.result.domains | index("output")) != null' >/dev/null; \
 	echo "==> POST $$CR_BASE/v1/runtime/turns/start"; \
 	TURN="$$(curl -sS -X POST "$$CR_BASE/v1/runtime/turns/start" \
 	  -H "Content-Type: application/json" \

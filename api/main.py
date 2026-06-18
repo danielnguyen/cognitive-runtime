@@ -17,6 +17,8 @@ from models import (
     InterruptEvaluateResponse,
     PersonaContainmentEvaluateRequest,
     PersonaContainmentEvaluateResponse,
+    RestraintEvaluateRequest,
+    RestraintEvaluateResponse,
     RelationshipDiagnosticsResponse,
     RelationshipEdgeConfirmRequest,
     RelationshipEdgeResponse,
@@ -79,6 +81,7 @@ from services.interaction_diagnostics import (
 from services.interaction_governance import evaluate_interaction_governance
 from services.interrupt_policy import evaluate_interrupt_policy
 from services.persona_containment import evaluate_persona_containment
+from services.restraint import evaluate_restraint
 from services.relationships import (
     confirm_relationship_edge,
     get_relationship_diagnostics,
@@ -433,6 +436,31 @@ async def runtime_persona_containment_evaluate(
         if detail in {"runtime_session_mismatch"}:
             raise HTTPException(status_code=400, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail) from exc
+
+
+@app.post(
+    "/v1/runtime/restraint/evaluate",
+    response_model=RestraintEvaluateResponse,
+)
+async def runtime_restraint_evaluate(
+    body: RestraintEvaluateRequest,
+) -> RestraintEvaluateResponse:
+    try:
+        return evaluate_restraint(body)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "runtime_session_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail in {"runtime_session_mismatch"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except RuntimeError as exc:
+        detail = str(exc)
+        if detail == "runtime_turn_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "runtime_turn_session_mismatch":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise
 
 
 @app.get("/v1/companion/profile/active", response_model=CompanionProfileActiveResponse)

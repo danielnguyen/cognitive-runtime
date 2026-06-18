@@ -10,6 +10,7 @@ This repo defines runtime-state and companion-policy boundaries that remain sepa
 - serve runtime overlay APIs used by downstream orchestration
 - evaluate interaction governance for the current user turn
 - evaluate persona containment for the current user turn
+- evaluate restraint for the current user turn
 - evaluate interrupt-related runtime signals exposed by the current service
 - expose health and diagnostic surfaces for operators
 
@@ -49,6 +50,7 @@ Post-deploy smoke checklist:
 - `GET /healthz` returns success from `cognitive-runtime`.
 - `POST /v1/runtime/interaction-governance/evaluate` returns a typed governance result for a normal question and a tense debugging report.
 - `POST /v1/runtime/persona-containment/evaluate` returns a typed containment result with active persona, seeded domain summaries, and summarized cross-scope diagnostics.
+- `POST /v1/runtime/restraint/evaluate` returns a typed restraint result with primary policy, affected domains, and summarized suppression signals.
 - `chat-orchestrator` `POST /v1/chat` returns a valid response for a normal request.
 - `POST /v1/companion/profile/compile` succeeds with the deployed `COMPANION_CONTRACTS_DB_PATH`.
 - `POST /v1/runtime/overlay` is reachable when runtime overlay integration is enabled.
@@ -79,6 +81,12 @@ If answers behave oddly, check:
 - `POST /v1/runtime/persona-containment/evaluate`
 - Returns a typed containment result for the current user turn, including active persona, seeded containment domain summaries, and explicit-only cross-scope allowance signals.
 - When a runtime session is available, the evaluation records a summarized persona containment event without storing raw user text.
+
+## Restraint Endpoint
+
+- `POST /v1/runtime/restraint/evaluate`
+- Returns a typed restraint result for the current user turn, including primary restraint policy, affected domains, a short operational prompt overlay, and summarized suppression signals.
+- When a runtime session is available, the evaluation records a summarized restraint event without storing raw user text.
 
 ## Local validation
 

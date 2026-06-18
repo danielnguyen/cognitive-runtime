@@ -125,6 +125,7 @@ RuntimeEventType = Literal[
     "identity_resolved",
     "interaction_governance_evaluated",
     "persona_containment_evaluated",
+    "restraint_evaluated",
 ]
 
 
@@ -315,6 +316,58 @@ class PersonaContainmentEvaluateResponse(BaseModel):
     runtime_session_id: str = Field(max_length=120)
     runtime_turn_id: str | None = Field(default=None, max_length=120)
     result: PersonaContainmentResult
+
+
+RestraintPolicy = Literal[
+    "answer_normally",
+    "short_answer",
+    "defer_expansion",
+    "ask_clarifying_question",
+    "do_not_retrieve",
+    "do_not_personalize",
+    "suppress_proactive_output",
+]
+
+
+class RestraintEvaluateRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    interaction_kind: InteractionGovernanceKind | None = None
+    response_posture: InteractionGovernanceResponsePosture | None = None
+    active_persona_id: str | None = Field(default=None, max_length=120)
+    capability_domain: str | None = Field(default=None, max_length=64)
+    current_user_text: BoundedText | None = None
+    recent_messages: list["InterruptMessage"] = Field(default_factory=list, max_length=12)
+    surface_metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class RestraintResult(BaseModel):
+    restraint_policy: RestraintPolicy
+    domains: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+    reason: BoundedLabel
+    prompt_overlay: str = Field(default="", max_length=240)
+    trace_ref: BoundedTraceRef
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason_summary: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+    retrieval_suppressed: bool = False
+    personalization_suppressed: bool = False
+    proactive_output_suppressed: bool = False
+    brevity_preferred: bool = False
+    clarification_preferred: bool = False
+
+
+class RestraintEvaluateResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    result: RestraintResult
 
 
 class PersonaProfile(BaseModel):
