@@ -30,6 +30,22 @@ def test_tense_failure_report_suppresses_humor_and_commentary_and_uses_tactical_
     assert result["response_posture"] == "tactical"
 
 
+def test_normal_question_classifies_as_question_and_stays_non_actioning():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/runtime/interaction-governance/evaluate",
+        json=_base(current_user_text="What does this function do?"),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["interaction_kind"] == "question"
+    assert result["action_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["commentary_allowed"] is False
+
+
 def test_recent_messages_latest_user_text_is_used_when_current_user_text_is_omitted():
     client = TestClient(app)
 
