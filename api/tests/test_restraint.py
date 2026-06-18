@@ -33,6 +33,27 @@ def test_direct_prompt_request_prefers_short_answer():
     assert "brief" in result["prompt_overlay"].lower()
 
 
+def test_recent_messages_latest_user_text_is_used_when_current_user_text_is_omitted():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/runtime/restraint/evaluate",
+        json=_base(
+            recent_messages=[
+                {"role": "user", "content": "Can you check this?"},
+                {"role": "assistant", "content": "What should I look at?"},
+                {"role": "user", "content": "give me the prompt"},
+            ],
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["restraint_policy"] == "short_answer"
+    assert "output" in result["domains"]
+    assert result["brevity_preferred"] is True
+
+
 def test_tense_debugging_preserves_tactical_help_with_affect_restraint():
     client = TestClient(app)
 
