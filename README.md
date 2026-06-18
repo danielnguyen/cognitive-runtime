@@ -1,6 +1,6 @@
 # cognitive-runtime
 
-`cognitive-runtime` owns runtime overlays, companion contract compilation, interrupt evaluation, and runtime diagnostic surfaces.
+`cognitive-runtime` owns runtime overlays, interaction governance evaluation, companion contract compilation, interrupt evaluation, and runtime diagnostic surfaces.
 
 This repo defines runtime-state and companion-policy boundaries that remain separate from canonical memory in `basic-memory-store` and prompt assembly in `chat-orchestrator`.
 
@@ -8,6 +8,7 @@ This repo defines runtime-state and companion-policy boundaries that remain sepa
 
 - compile companion profile and policy inputs
 - serve runtime overlay APIs used by downstream orchestration
+- evaluate interaction governance for the current user turn
 - evaluate interrupt-related runtime signals exposed by the current service
 - expose health and diagnostic surfaces for operators
 
@@ -41,10 +42,11 @@ Normal request flow:
 Ownership summary:
 - `chat-orchestrator` owns normal chat request handling.
 - `basic-memory-store` owns durable conversation, retrieval, and trace persistence.
-- `cognitive-runtime` owns runtime overlay, companion contract compilation, interrupt evaluation, and diagnostic surfaces.
+- `cognitive-runtime` owns runtime overlay, interaction governance evaluation, companion contract compilation, interrupt evaluation, and diagnostic surfaces.
 
 Post-deploy smoke checklist:
 - `GET /healthz` returns success from `cognitive-runtime`.
+- `POST /v1/runtime/interaction-governance/evaluate` returns a typed governance result for a normal question and a tense debugging report.
 - `chat-orchestrator` `POST /v1/chat` returns a valid response for a normal request.
 - `POST /v1/companion/profile/compile` succeeds with the deployed `COMPANION_CONTRACTS_DB_PATH`.
 - `POST /v1/runtime/overlay` is reachable when runtime overlay integration is enabled.
@@ -52,6 +54,7 @@ Post-deploy smoke checklist:
 
 If answers behave oddly, check:
 - whether `COMPANION_CONTRACTS_DB_PATH` points to a writable mounted path
+- whether interaction governance is classifying the current turn and recording only summarized diagnostics
 - whether companion compile is failing and being traced as an omitted companion layer
 - whether runtime overlay calls are unavailable
 - the corresponding request trace in `basic-memory-store`
@@ -62,6 +65,12 @@ If answers behave oddly, check:
 - Returns:
   - `status`
   - `service`
+
+## Interaction Governance Endpoint
+
+- `POST /v1/runtime/interaction-governance/evaluate`
+- Returns a typed governance result for the current user turn, including interaction kind, posture, non-actioning flags, and summarized reasons.
+- When a runtime session and turn already exist, the evaluation also updates runtime-turn diagnostics and records a summarized governance event.
 
 ## Local validation
 
@@ -74,6 +83,14 @@ make dev-check
 ```
 
 `make dev-start` serves the API on `APP_PORT`, defaulting to `4371`.
+
+For a lightweight operator smoke check against an already-running local service:
+
+```bash
+make smoke
+```
+
+`make smoke` uses `curl` and `jq`. It checks `/healthz`, exercises the interaction governance endpoint across representative inputs, and verifies a simple runtime turn/session integration path. Deeper diagnostics review, such as inspecting the exact summarized event payload shape, remains a manual operator check.
 
 ## Relationship bootstrap
 
