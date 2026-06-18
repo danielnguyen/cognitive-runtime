@@ -30,6 +30,31 @@ def test_tense_failure_report_suppresses_humor_and_commentary_and_uses_tactical_
     assert result["response_posture"] == "tactical"
 
 
+def test_recent_messages_latest_user_text_is_used_when_current_user_text_is_omitted():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/runtime/interaction-governance/evaluate",
+        json=_base(
+            recent_messages=[
+                {"role": "user", "content": "Can you take a look?"},
+                {"role": "assistant", "content": "What seems wrong?"},
+                {
+                    "role": "user",
+                    "content": "I think I broke the server and prod is failing",
+                },
+            ],
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["interaction_kind"] == "tense_debugging"
+    assert result["humor_allowed"] is False
+    assert result["commentary_allowed"] is False
+    assert result["response_posture"] == "tactical"
+
+
 def test_playful_low_risk_message_allows_humor_without_forcing_commentary():
     client = TestClient(app)
 
