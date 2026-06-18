@@ -112,6 +112,8 @@ _PERSONAL_MARKERS = (
     "family",
     "home",
     "private",
+    "work-life",
+    "life balance",
 )
 _HEALTH_MARKERS = (
     "health",
@@ -161,7 +163,7 @@ _BRIDGE_PATTERNS = (
     re.compile(r"\bcompare this with my ([a-z_ ]+?)(?: context)?\b"),
     re.compile(r"\buse my ([a-z_ ]+?) notes\b"),
     re.compile(r"\bbring in ([a-z_ ]+?)(?: context)?\b"),
-    re.compile(r"\bconnect this to ([a-z_ ]+?)\b"),
+    re.compile(r"\bconnect this to ([a-z_ ]+?)(?: context)?(?:[.!?]|$)"),
 )
 
 
@@ -239,7 +241,12 @@ def _normalize_domain_label(raw: str) -> str:
 
 
 def _map_domain_term(term: str) -> str | None:
-    normalized = re.sub(r"\s+", " ", term.strip().lower())
+    normalized = re.sub(r"[^a-z0-9_ ]+", "", term.strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized)
+    if normalized.startswith("my "):
+        normalized = normalized[3:]
+    if normalized.endswith(" context"):
+        normalized = normalized[: -len(" context")]
     mapped = _DOMAIN_SYNONYMS.get(normalized)
     if mapped is not None:
         return mapped
@@ -269,6 +276,27 @@ def _capability_domain(text: str, persona_id: str) -> tuple[str, list[str]]:
         return "work_professional", ["work_professional_markers"]
     reasons.append("persona_default_domain")
     return _PERSONA_DEFAULT_DOMAIN.get(persona_id, "general"), reasons
+
+
+def _matched_domains(text: str) -> set[str]:
+    matched: set[str] = set()
+    if _contains_any(text, _VEHICLE_MARKERS):
+        matched.add("vehicle_maintenance")
+    if _contains_any(text, _FINANCE_MARKERS):
+        matched.add("finance")
+    if _contains_any(text, _HEALTH_MARKERS):
+        matched.add("health")
+    if _contains_any(text, _PERSONAL_MARKERS):
+        matched.add("personal")
+    if _contains_any(text, _INFRASTRUCTURE_MARKERS):
+        matched.add("infrastructure")
+    if _contains_any(text, _TECHNICAL_MARKERS):
+        matched.add("technical")
+    if _contains_any(text, _PROJECT_MARKERS):
+        matched.add("project")
+    if _contains_any(text, _WORK_MARKERS):
+        matched.add("work_professional")
+    return matched
 
 
 def _base_allowed_domains(persona_id: str, capability_domain: str) -> set[str]:
@@ -307,6 +335,9 @@ def _apply_conservative_restrictions(
         allowed_domains.discard("infrastructure")
     if capability_domain == "vehicle_maintenance":
         allowed_domains.discard("work_professional")
+        allowed_domains.discard("technical")
+        allowed_domains.discard("project")
+        allowed_domains.discard("infrastructure")
     if persona_id != "personal_companion":
         allowed_domains.discard("personal")
     explicit_sensitive = _explicit_sensitive_domain_requests(text)
@@ -314,6 +345,22 @@ def _apply_conservative_restrictions(
         if domain not in explicit_sensitive and domain != capability_domain:
             allowed_domains.discard(domain)
     return allowed_domains
+
+
+def _requires_conservative_multi_domain_scope(
+    *,
+    matched_domains: set[str],
+    bridge_target: str | None,
+) -> bool:
+    if bridge_target is not None:
+        return False
+    if "vehicle_maintenance" in matched_domains and (
+        matched_domains & {"technical", "project", "infrastructure", "work_professional"}
+    ):
+        return True
+    if {"work_professional", "personal"}.issubset(matched_domains):
+        return True
+    return False
 
 
 def _sorted_domains(values: set[str]) -> list[str]:
@@ -347,6 +394,7 @@ def evaluate_persona_containment(
     text = _normalize_text(raw_text)
     persona_id, persona_reasons = _resolve_persona(body)
     capability_domain, capability_reasons = _capability_domain(text, persona_id)
+    matched_domains = _matched_domains(text)
     allowed_domains = _base_allowed_domains(persona_id, capability_domain)
     allowed_domains = _apply_conservative_restrictions(
         text=text,
@@ -360,6 +408,13 @@ def evaluate_persona_containment(
     cross_scope_reason = "not_requested"
     extra_blocked_domains: set[str] = set()
     reason_summary: list[str] = [*persona_reasons, *capability_reasons]
+
+    if _requires_conservative_multi_domain_scope(
+        matched_domains=matched_domains,
+        bridge_target=bridge_target,
+    ):
+        allowed_domains &= {"general", capability_domain}
+        reason_summary.append("multi_domain_signal_conservative_scope")
 
     if bridge_target:
         mapped_domain = _map_domain_term(bridge_target)

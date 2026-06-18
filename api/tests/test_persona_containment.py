@@ -57,6 +57,25 @@ def test_vehicle_request_uses_vehicle_capability_and_blocks_unrelated_domains():
     assert result["cross_scope_access_allowed"] is False
 
 
+def test_mixed_vehicle_project_wording_stays_narrow():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/runtime/persona-containment/evaluate",
+        json=_base(current_user_text="My project car needs a new engine."),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_domain"] == "vehicle_maintenance"
+    assert result["allowed_memory_domains"] == ["general", "vehicle_maintenance"]
+    assert "project" in result["blocked_memory_domains"]
+    assert "technical" in result["blocked_memory_domains"]
+    assert "infrastructure" in result["blocked_memory_domains"]
+    assert "multi_domain_signal_conservative_scope" in result["reason_summary"]
+    assert result["cross_scope_access_allowed"] is False
+
+
 def test_cross_scope_is_blocked_by_default():
     client = TestClient(app)
 
@@ -72,6 +91,28 @@ def test_cross_scope_is_blocked_by_default():
     assert "work_professional" in result["blocked_memory_domains"]
 
 
+def test_mixed_work_personal_wording_stays_conservative():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/runtime/persona-containment/evaluate",
+        json=_base(
+            surface="web",
+            current_user_text="I'm having trouble with my work-life balance.",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["cross_scope_access_allowed"] is False
+    assert result["cross_scope_reason"] == "not_requested"
+    assert not {
+        "work_professional",
+        "personal",
+    }.issubset(set(result["allowed_memory_domains"]))
+    assert "multi_domain_signal_conservative_scope" in result["reason_summary"]
+
+
 def test_explicit_cross_scope_request_allows_bridging_with_reason():
     client = TestClient(app)
 
@@ -80,6 +121,21 @@ def test_explicit_cross_scope_request_allows_bridging_with_reason():
         json=_base(
             current_user_text="Refactor this API and compare this with my work context.",
         ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["cross_scope_access_allowed"] is True
+    assert result["cross_scope_reason"] == "explicit_bridge_request_detected"
+    assert "work_professional" in result["allowed_memory_domains"]
+
+
+def test_connect_bridge_phrase_allows_explicit_cross_scope():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/runtime/persona-containment/evaluate",
+        json=_base(current_user_text="Connect this to my work context."),
     )
 
     assert response.status_code == 200
