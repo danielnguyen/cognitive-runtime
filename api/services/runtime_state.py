@@ -502,6 +502,32 @@ class RuntimeStateRepository:
                 event_payload_json=event_payload_json,
             )
 
+    def update_turn_intent_class(
+        self,
+        *,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        intent_class: str,
+    ) -> RuntimeTurn:
+        now = _now()
+        with self._connect() as conn:
+            turn = self._turn_by_id(conn, runtime_turn_id)
+            if turn is None:
+                raise RuntimeError("runtime_turn_not_found")
+            if turn.runtime_session_id != runtime_session_id:
+                raise RuntimeError("runtime_turn_session_mismatch")
+            self._update_turn_row(
+                conn,
+                runtime_turn_id,
+                {
+                    "intent_class": intent_class,
+                    "updated_at": now,
+                },
+            )
+            updated_turn = self._turn_by_id(conn, runtime_turn_id)
+        assert updated_turn is not None
+        return updated_turn
+
     def diagnostics(self, runtime_session_id: str) -> RuntimeSessionDiagnosticsResponse:
         with self._connect() as conn:
             session = self._session_by_id(conn, runtime_session_id)
@@ -852,6 +878,19 @@ def record_runtime_event(
         runtime_turn_id=runtime_turn_id,
         event_type=event_type,
         event_payload_json=event_payload_json,
+    )
+
+
+def update_runtime_turn_intent_class(
+    *,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    intent_class: str,
+) -> RuntimeTurn:
+    return runtime_state_repository().update_turn_intent_class(
+        runtime_session_id=runtime_session_id,
+        runtime_turn_id=runtime_turn_id,
+        intent_class=intent_class,
     )
 
 

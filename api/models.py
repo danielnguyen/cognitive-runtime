@@ -123,6 +123,7 @@ RuntimeEventType = Literal[
     "turn_updated",
     "turn_completed",
     "identity_resolved",
+    "interaction_governance_evaluated",
 ]
 
 
@@ -209,6 +210,70 @@ class RuntimeSessionDiagnosticsResponse(BaseModel):
     active_turn: RuntimeTurn | None = None
     latest_turn: RuntimeTurn | None = None
     events: list[RuntimeEvent] = Field(default_factory=list)
+
+
+InteractionGovernanceKind = Literal[
+    "command",
+    "question",
+    "brainstorm",
+    "joke_or_playful",
+    "vent_or_expression",
+    "mistake_or_failure_report",
+    "tense_debugging",
+    "high_impact_decision",
+    "ambiguous",
+]
+InteractionGovernanceTension = Literal["low", "medium", "high"]
+InteractionGovernancePrivacySensitivity = Literal["normal", "private", "sensitive"]
+InteractionGovernanceResponsePosture = Literal[
+    "direct",
+    "supportive",
+    "tactical",
+    "brief",
+    "reflective",
+    "playful",
+    "silent_or_minimal",
+]
+
+
+class InteractionGovernanceEvaluateRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    surface_session_id: str | None = Field(default=None, max_length=120)
+    active_mode: str | None = Field(default=None, max_length=64)
+    current_user_text: BoundedText | None = None
+    recent_messages: list["InterruptMessage"] = Field(default_factory=list, max_length=12)
+    surface_metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class InteractionGovernanceResult(BaseModel):
+    interaction_kind: InteractionGovernanceKind
+    tension_level: InteractionGovernanceTension
+    literal_command_confidence: float = Field(ge=0.0, le=1.0)
+    commentary_allowed: bool
+    humor_allowed: bool
+    clarifying_question_allowed: bool
+    action_allowed: bool
+    requires_confirmation: bool
+    persona_scope_hint: str | None = Field(default=None, max_length=64)
+    privacy_sensitivity_hint: InteractionGovernancePrivacySensitivity
+    response_posture: InteractionGovernanceResponsePosture
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason_summary: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+
+
+class InteractionGovernanceEvaluateResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    result: InteractionGovernanceResult
 
 
 class PersonaProfile(BaseModel):

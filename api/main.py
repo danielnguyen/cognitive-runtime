@@ -9,26 +9,22 @@ from models import (
     HumanCompatibilityDiagnosticsResponse,
     HumanCompatibilityReviewRequest,
     HumanCompatibilityReviewResponse,
+    InteractionContractValidateRequest,
+    InteractionContractValidateResponse,
+    InteractionGovernanceEvaluateRequest,
+    InteractionGovernanceEvaluateResponse,
+    InterruptEvaluateRequest,
+    InterruptEvaluateResponse,
     RelationshipDiagnosticsResponse,
     RelationshipEdgeConfirmRequest,
     RelationshipEdgeResponse,
-    RelationshipEdgeUpsertRequest,
     RelationshipEdgeRevokeRequest,
+    RelationshipEdgeUpsertRequest,
     RelationshipEntityResponse,
     RelationshipEntityUpsertRequest,
     RelationshipGraphDiagnosticsRequest,
     RelationshipSelectRequest,
     RelationshipSelectResponse,
-    SocialContextDiagnosticsRequest,
-    SocialContextDiagnosticsResponse,
-    SocialContextItemResponse,
-    SocialContextItemUpsertRequest,
-    SocialContextUsageEventRecordRequest,
-    SocialContextUsageEventResponse,
-    InteractionContractValidateRequest,
-    InteractionContractValidateResponse,
-    InterruptEvaluateRequest,
-    InterruptEvaluateResponse,
     RepairSimulateRequest,
     RepairSimulateResponse,
     RuntimeIdentityResolveRequest,
@@ -49,6 +45,12 @@ from models import (
     ScenePolicyDetail,
     SceneResolveRequest,
     SceneResolveResponse,
+    SocialContextDiagnosticsRequest,
+    SocialContextDiagnosticsResponse,
+    SocialContextItemResponse,
+    SocialContextItemUpsertRequest,
+    SocialContextUsageEventRecordRequest,
+    SocialContextUsageEventResponse,
     WorldStateClaimResponse,
     WorldStateClaimUpsertRequest,
     WorldStateDiagnosticsRequest,
@@ -72,6 +74,7 @@ from services.interaction_diagnostics import (
     summarize_text,
     validate_interaction_text,
 )
+from services.interaction_governance import evaluate_interaction_governance
 from services.interrupt_policy import evaluate_interrupt_policy
 from services.relationships import (
     confirm_relationship_edge,
@@ -89,12 +92,12 @@ from services.runtime_state import (
     complete_turn,
     get_runtime_session,
     record_runtime_event,
-    resolve_runtime_session,
     reset_state,
+    resolve_runtime_session,
     resolve_state,
     start_turn,
-    update_turn,
     update_state,
+    update_turn,
 )
 from services.social_context import (
     get_social_context_diagnostics,
@@ -384,6 +387,31 @@ async def world_state_resolve(
         active_persona_id=body.active_persona_id,
         requested_domains=body.requested_domains,
     )
+
+
+@app.post(
+    "/v1/runtime/interaction-governance/evaluate",
+    response_model=InteractionGovernanceEvaluateResponse,
+)
+async def runtime_interaction_governance_evaluate(
+    body: InteractionGovernanceEvaluateRequest,
+) -> InteractionGovernanceEvaluateResponse:
+    try:
+        return evaluate_interaction_governance(body)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "runtime_session_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail in {"runtime_session_mismatch"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except RuntimeError as exc:
+        detail = str(exc)
+        if detail == "runtime_turn_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "runtime_turn_session_mismatch":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise
 
 
 @app.get("/v1/companion/profile/active", response_model=CompanionProfileActiveResponse)
