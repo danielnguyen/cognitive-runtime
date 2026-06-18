@@ -124,6 +124,7 @@ RuntimeEventType = Literal[
     "turn_completed",
     "identity_resolved",
     "interaction_governance_evaluated",
+    "persona_containment_evaluated",
 ]
 
 
@@ -274,6 +275,46 @@ class InteractionGovernanceEvaluateResponse(BaseModel):
     runtime_session_id: str = Field(max_length=120)
     runtime_turn_id: str | None = Field(default=None, max_length=120)
     result: InteractionGovernanceResult
+
+
+class PersonaContainmentEvaluateRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    active_persona_id: str | None = Field(default=None, max_length=120)
+    requested_persona_id: str | None = Field(default=None, max_length=120)
+    persona_scope_hint: str | None = Field(default=None, max_length=64)
+    interaction_kind: InteractionGovernanceKind | None = None
+    current_user_text: BoundedText | None = None
+    recent_messages: list["InterruptMessage"] = Field(default_factory=list, max_length=12)
+    surface_metadata_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class PersonaContainmentResult(BaseModel):
+    active_persona_id: str = Field(max_length=120)
+    capability_domain: BoundedLabel
+    allowed_memory_domains: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    blocked_memory_domains: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    allowed_world_state_domains: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    allowed_relationship_domains: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    allowed_tool_domains: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    cross_scope_access_allowed: bool = False
+    cross_scope_reason: BoundedLabel
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason_summary: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+
+
+class PersonaContainmentEvaluateResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    result: PersonaContainmentResult
 
 
 class PersonaProfile(BaseModel):

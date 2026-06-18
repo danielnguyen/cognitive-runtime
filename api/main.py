@@ -15,6 +15,8 @@ from models import (
     InteractionGovernanceEvaluateResponse,
     InterruptEvaluateRequest,
     InterruptEvaluateResponse,
+    PersonaContainmentEvaluateRequest,
+    PersonaContainmentEvaluateResponse,
     RelationshipDiagnosticsResponse,
     RelationshipEdgeConfirmRequest,
     RelationshipEdgeResponse,
@@ -76,6 +78,7 @@ from services.interaction_diagnostics import (
 )
 from services.interaction_governance import evaluate_interaction_governance
 from services.interrupt_policy import evaluate_interrupt_policy
+from services.persona_containment import evaluate_persona_containment
 from services.relationships import (
     confirm_relationship_edge,
     get_relationship_diagnostics,
@@ -412,6 +415,24 @@ async def runtime_interaction_governance_evaluate(
         if detail == "runtime_turn_session_mismatch":
             raise HTTPException(status_code=400, detail=detail) from exc
         raise
+
+
+@app.post(
+    "/v1/runtime/persona-containment/evaluate",
+    response_model=PersonaContainmentEvaluateResponse,
+)
+async def runtime_persona_containment_evaluate(
+    body: PersonaContainmentEvaluateRequest,
+) -> PersonaContainmentEvaluateResponse:
+    try:
+        return evaluate_persona_containment(body)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "runtime_session_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail in {"runtime_session_mismatch"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
 
 
 @app.get("/v1/companion/profile/active", response_model=CompanionProfileActiveResponse)

@@ -38,6 +38,11 @@ smoke:
 	  -H "Content-Type: application/json" \
 	  -d '{"request_id":"smoke-ambiguous","owner_id":"owner","conversation_id":"conv-smoke","surface":"dev","current_user_text":"nuke this","recent_messages":[]}' \
 	  | jq -e '.result.interaction_kind == "ambiguous" and .result.action_allowed == false and .result.requires_confirmation == true' >/dev/null; \
+	echo "==> POST $$CR_BASE/v1/runtime/persona-containment/evaluate"; \
+	curl -sS -X POST "$$CR_BASE/v1/runtime/persona-containment/evaluate" \
+	  -H "Content-Type: application/json" \
+	  -d '{"request_id":"smoke-persona","owner_id":"owner","conversation_id":"conv-smoke","surface":"web","current_user_text":"My car needs an oil change soon","recent_messages":[]}' \
+	  | jq -e '.result.capability_domain == "vehicle_maintenance" and .result.cross_scope_access_allowed == false' >/dev/null; \
 	echo "==> POST $$CR_BASE/v1/runtime/turns/start"; \
 	TURN="$$(curl -sS -X POST "$$CR_BASE/v1/runtime/turns/start" \
 	  -H "Content-Type: application/json" \
