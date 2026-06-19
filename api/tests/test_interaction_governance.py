@@ -261,9 +261,9 @@ async def test_clarification_request_projection_uses_question_form_clarification
 
 
 @pytest.mark.asyncio
-async def test_confirmation_response_projection_requires_assistant_question_context():
+async def test_confirmation_response_projection_requires_immediately_preceding_assistant_question():
     result, diagnostics = await _governance_turn_diagnostics(
-        request_id="rid-confirmation",
+        request_id="rid-confirmation-adjacent",
         current_user_text="Yes.",
         recent_messages=[
             {"role": "assistant", "content": "Do you want me to proceed?"},
@@ -275,9 +275,24 @@ async def test_confirmation_response_projection_requires_assistant_question_cont
 
 
 @pytest.mark.asyncio
-async def test_continuation_projection_requires_live_conversation_context():
+async def test_older_assistant_question_separated_by_user_message_does_not_enable_confirmation_response():
     result, diagnostics = await _governance_turn_diagnostics(
-        request_id="rid-continuation",
+        request_id="rid-confirmation-stale",
+        current_user_text="Yes.",
+        recent_messages=[
+            {"role": "assistant", "content": "Do you want me to proceed?"},
+            {"role": "user", "content": "Let's park that for now."},
+        ],
+    )
+
+    assert result["interaction_kind"] == "ambiguous"
+    assert diagnostics["latest_turn"]["intent_class"] == "low_confidence_unclear"
+
+
+@pytest.mark.asyncio
+async def test_continuation_projection_requires_immediately_preceding_assistant_message():
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="rid-continuation-adjacent",
         current_user_text="Go on.",
         recent_messages=[
             {"role": "assistant", "content": "The first issue is in the retry path."},
@@ -286,6 +301,21 @@ async def test_continuation_projection_requires_live_conversation_context():
 
     assert result["interaction_kind"] == "ambiguous"
     assert diagnostics["latest_turn"]["intent_class"] == "continuation"
+
+
+@pytest.mark.asyncio
+async def test_older_assistant_message_separated_by_user_message_does_not_enable_continuation():
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="rid-continuation-stale",
+        current_user_text="Continue.",
+        recent_messages=[
+            {"role": "assistant", "content": "The first issue is in the retry path."},
+            {"role": "user", "content": "Okay, noted."},
+        ],
+    )
+
+    assert result["interaction_kind"] == "ambiguous"
+    assert diagnostics["latest_turn"]["intent_class"] == "low_confidence_unclear"
 
 
 @pytest.mark.asyncio
