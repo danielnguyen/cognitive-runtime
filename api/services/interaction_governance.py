@@ -156,10 +156,30 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _latest_assistant_text(body: InteractionGovernanceEvaluateRequest) -> str:
-    for message in reversed(body.recent_messages):
-        if message.role == "assistant" and message.content.strip():
-            return message.content.strip()
+def _immediately_preceding_assistant_text(
+    body: InteractionGovernanceEvaluateRequest,
+) -> str:
+    if body.current_user_text:
+        if not body.recent_messages:
+            return ""
+        previous_message = body.recent_messages[-1]
+        if previous_message.role == "assistant" and previous_message.content.strip():
+            return previous_message.content.strip()
+        return ""
+
+    last_user_index = None
+    for index in range(len(body.recent_messages) - 1, -1, -1):
+        message = body.recent_messages[index]
+        if message.role == "user" and message.content.strip():
+            last_user_index = index
+            break
+
+    if last_user_index in (None, 0):
+        return ""
+
+    previous_message = body.recent_messages[last_user_index - 1]
+    if previous_message.role == "assistant" and previous_message.content.strip():
+        return previous_message.content.strip()
     return ""
 
 
@@ -283,13 +303,13 @@ def _is_clarification_request(text: str) -> bool:
 def _is_confirmation_response(
     text: str, body: InteractionGovernanceEvaluateRequest
 ) -> bool:
-    if not _latest_assistant_text(body).strip().endswith("?"):
+    if not _immediately_preceding_assistant_text(body).endswith("?"):
         return False
     return _canonical_turn_text(text) in _CONFIRMATION_RESPONSE_MARKERS
 
 
 def _is_continuation(text: str, body: InteractionGovernanceEvaluateRequest) -> bool:
-    if not _latest_assistant_text(body):
+    if not _immediately_preceding_assistant_text(body):
         return False
     canonical = _canonical_turn_text(text)
     return canonical in _CONTINUATION_MARKERS
