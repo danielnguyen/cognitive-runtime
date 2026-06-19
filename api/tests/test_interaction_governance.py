@@ -1,4 +1,6 @@
-from fastapi.testclient import TestClient
+import httpx
+import pytest
+
 from main import app
 
 
@@ -14,12 +16,29 @@ def _base(**overrides):
     return payload
 
 
-def test_tense_failure_report_suppresses_humor_and_commentary_and_uses_tactical_posture():
-    client = TestClient(app)
+async def _post(path: str, payload: dict[str, object]):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        return await client.post(path, json=payload)
 
-    response = client.post(
+
+async def _get(path: str):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        return await client.get(path)
+
+
+@pytest.mark.asyncio
+async def test_tense_failure_report_suppresses_humor_and_commentary_and_uses_tactical_posture():
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(current_user_text="I think I broke the server and prod is failing"),
+        _base(current_user_text="I think I broke the server and prod is failing"),
     )
 
     assert response.status_code == 200
@@ -30,12 +49,11 @@ def test_tense_failure_report_suppresses_humor_and_commentary_and_uses_tactical_
     assert result["response_posture"] == "tactical"
 
 
-def test_normal_question_classifies_as_question_and_stays_non_actioning():
-    client = TestClient(app)
-
-    response = client.post(
+@pytest.mark.asyncio
+async def test_normal_question_classifies_as_question_and_stays_non_actioning():
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(current_user_text="What does this function do?"),
+        _base(current_user_text="What does this function do?"),
     )
 
     assert response.status_code == 200
@@ -46,12 +64,11 @@ def test_normal_question_classifies_as_question_and_stays_non_actioning():
     assert result["commentary_allowed"] is False
 
 
-def test_recent_messages_latest_user_text_is_used_when_current_user_text_is_omitted():
-    client = TestClient(app)
-
-    response = client.post(
+@pytest.mark.asyncio
+async def test_recent_messages_latest_user_text_is_used_when_current_user_text_is_omitted():
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(
+        _base(
             recent_messages=[
                 {"role": "user", "content": "Can you take a look?"},
                 {"role": "assistant", "content": "What seems wrong?"},
@@ -71,12 +88,11 @@ def test_recent_messages_latest_user_text_is_used_when_current_user_text_is_omit
     assert result["response_posture"] == "tactical"
 
 
-def test_playful_low_risk_message_allows_humor_without_forcing_commentary():
-    client = TestClient(app)
-
-    response = client.post(
+@pytest.mark.asyncio
+async def test_playful_low_risk_message_allows_humor_without_forcing_commentary():
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(current_user_text="lol roast my tiny todo list"),
+        _base(current_user_text="lol roast my tiny todo list"),
     )
 
     assert response.status_code == 200
@@ -86,12 +102,11 @@ def test_playful_low_risk_message_allows_humor_without_forcing_commentary():
     assert result["commentary_allowed"] is False
 
 
-def test_destructive_frustrated_phrase_requires_confirmation_and_stays_non_actioning():
-    client = TestClient(app)
-
-    response = client.post(
+@pytest.mark.asyncio
+async def test_destructive_frustrated_phrase_requires_confirmation_and_stays_non_actioning():
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(current_user_text="nuke this"),
+        _base(current_user_text="nuke this"),
     )
 
     assert response.status_code == 200
@@ -101,12 +116,11 @@ def test_destructive_frustrated_phrase_requires_confirmation_and_stays_non_actio
     assert result["requires_confirmation"] is True
 
 
-def test_direct_low_risk_command_classifies_as_command_but_is_not_actionable():
-    client = TestClient(app)
-
-    response = client.post(
+@pytest.mark.asyncio
+async def test_direct_low_risk_command_classifies_as_command_but_is_not_actionable():
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(current_user_text="rename this variable to count"),
+        _base(current_user_text="rename this variable to count"),
     )
 
     assert response.status_code == 200
@@ -116,18 +130,17 @@ def test_direct_low_risk_command_classifies_as_command_but_is_not_actionable():
     assert result["action_allowed"] is False
 
 
-def test_runtime_event_payload_is_summarized_only():
-    client = TestClient(app)
-
-    response = client.post(
+@pytest.mark.asyncio
+async def test_runtime_event_payload_is_summarized_only():
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(current_user_text="I think I broke the server and prod is failing badly"),
+        _base(current_user_text="I think I broke the server and prod is failing badly"),
     )
 
     assert response.status_code == 200
     runtime_session_id = response.json()["runtime_session_id"]
 
-    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}")
+    diagnostics = await _get(f"/v1/runtime/sessions/{runtime_session_id}")
     assert diagnostics.status_code == 200
     events = diagnostics.json()["events"]
     governance_event = next(
@@ -148,12 +161,11 @@ def test_runtime_event_payload_is_summarized_only():
     assert "broke the server" not in str(payload)
 
 
-def test_ambiguous_fallback_is_conservative_and_non_actioning():
-    client = TestClient(app)
-
-    response = client.post(
+@pytest.mark.asyncio
+async def test_ambiguous_fallback_is_conservative_and_non_actioning():
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(),
+        _base(),
     )
 
     assert response.status_code == 200
@@ -164,12 +176,11 @@ def test_ambiguous_fallback_is_conservative_and_non_actioning():
     assert result["commentary_allowed"] is False
 
 
-def test_runtime_turn_integration_updates_intent_class_and_records_event():
-    client = TestClient(app)
-
-    started = client.post(
+@pytest.mark.asyncio
+async def test_runtime_turn_integration_updates_intent_class_and_records_event():
+    started = await _post(
         "/v1/runtime/turns/start",
-        json={
+        {
             "request_id": "rid-turn-start",
             "owner_id": "owner",
             "conversation_id": "conv-1",
@@ -181,9 +192,9 @@ def test_runtime_turn_integration_updates_intent_class_and_records_event():
     runtime_session_id = started.json()["runtime_session"]["runtime_session_id"]
     runtime_turn_id = started.json()["runtime_turn"]["runtime_turn_id"]
 
-    response = client.post(
+    response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
-        json=_base(
+        _base(
             request_id="rid-turn-governance",
             runtime_session_id=runtime_session_id,
             runtime_turn_id=runtime_turn_id,
@@ -192,10 +203,168 @@ def test_runtime_turn_integration_updates_intent_class_and_records_event():
     )
 
     assert response.status_code == 200
-    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}")
+    diagnostics = await _get(f"/v1/runtime/sessions/{runtime_session_id}")
     assert diagnostics.status_code == 200
     body = diagnostics.json()
     assert body["latest_turn"]["intent_class"] == "action_command"
     assert any(
         event["event_type"] == "interaction_governance_evaluated" for event in body["events"]
     )
+
+
+async def _governance_turn_diagnostics(
+    *,
+    request_id: str,
+    current_user_text: str,
+    recent_messages: list[dict[str, str]] | None = None,
+):
+    started = await _post(
+        "/v1/runtime/turns/start",
+        {
+            "request_id": f"{request_id}-start",
+            "owner_id": "owner",
+            "conversation_id": "conv-1",
+            "surface": "dev",
+            "input_message_id": "msg-1",
+        },
+    )
+    assert started.status_code == 200
+    runtime_session_id = started.json()["runtime_session"]["runtime_session_id"]
+    runtime_turn_id = started.json()["runtime_turn"]["runtime_turn_id"]
+
+    response = await _post(
+        "/v1/runtime/interaction-governance/evaluate",
+        _base(
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            current_user_text=current_user_text,
+            recent_messages=recent_messages or [],
+        ),
+    )
+
+    assert response.status_code == 200
+    diagnostics = await _get(f"/v1/runtime/sessions/{runtime_session_id}")
+    assert diagnostics.status_code == 200
+    return response.json()["result"], diagnostics.json()
+
+
+@pytest.mark.asyncio
+async def test_clarification_request_projection_uses_question_form_clarification_markers():
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="rid-clarification",
+        current_user_text="What do you mean by policy hints?",
+    )
+
+    assert result["interaction_kind"] == "question"
+    assert diagnostics["latest_turn"]["intent_class"] == "clarification_request"
+
+
+@pytest.mark.asyncio
+async def test_confirmation_response_projection_requires_immediately_preceding_assistant_question():
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="rid-confirmation-adjacent",
+        current_user_text="Yes.",
+        recent_messages=[
+            {"role": "assistant", "content": "Do you want me to proceed?"},
+        ],
+    )
+
+    assert result["interaction_kind"] == "ambiguous"
+    assert diagnostics["latest_turn"]["intent_class"] == "confirmation_response"
+
+
+@pytest.mark.asyncio
+async def test_older_assistant_question_separated_by_user_message_does_not_enable_confirmation_response():
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="rid-confirmation-stale",
+        current_user_text="Yes.",
+        recent_messages=[
+            {"role": "assistant", "content": "Do you want me to proceed?"},
+            {"role": "user", "content": "Let's park that for now."},
+        ],
+    )
+
+    assert result["interaction_kind"] == "ambiguous"
+    assert diagnostics["latest_turn"]["intent_class"] == "low_confidence_unclear"
+
+
+@pytest.mark.asyncio
+async def test_continuation_projection_requires_immediately_preceding_assistant_message():
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="rid-continuation-adjacent",
+        current_user_text="Go on.",
+        recent_messages=[
+            {"role": "assistant", "content": "The first issue is in the retry path."},
+        ],
+    )
+
+    assert result["interaction_kind"] == "ambiguous"
+    assert diagnostics["latest_turn"]["intent_class"] == "continuation"
+
+
+@pytest.mark.asyncio
+async def test_older_assistant_message_separated_by_user_message_does_not_enable_continuation():
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="rid-continuation-stale",
+        current_user_text="Continue.",
+        recent_messages=[
+            {"role": "assistant", "content": "The first issue is in the retry path."},
+            {"role": "user", "content": "Okay, noted."},
+        ],
+    )
+
+    assert result["interaction_kind"] == "ambiguous"
+    assert diagnostics["latest_turn"]["intent_class"] == "low_confidence_unclear"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_ambiguous_reply_still_falls_back_to_low_confidence_unclear():
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="rid-ambiguous-fallback",
+        current_user_text="Okay.",
+        recent_messages=[
+            {"role": "assistant", "content": "Do you want me to proceed?"},
+        ],
+    )
+
+    assert result["interaction_kind"] == "ambiguous"
+    assert diagnostics["latest_turn"]["intent_class"] == "low_confidence_unclear"
+
+
+@pytest.mark.asyncio
+async def test_existing_supported_intent_class_mappings_remain_unchanged():
+    cases = [
+        (
+            "rid-information-request",
+            "What does this function do?",
+            [],
+            "information_request",
+        ),
+        (
+            "rid-action-command",
+            "rename this variable to count",
+            [],
+            "action_command",
+        ),
+        (
+            "rid-correction",
+            "Actually, the wrong service failed; I meant the worker queue.",
+            [],
+            "correction",
+        ),
+        (
+            "rid-venting",
+            "Ugh, this sucks and I'm upset.",
+            [],
+            "venting_signal",
+        ),
+    ]
+
+    for request_id, current_user_text, recent_messages, expected_intent_class in cases:
+        _, diagnostics = await _governance_turn_diagnostics(
+            request_id=request_id,
+            current_user_text=current_user_text,
+            recent_messages=recent_messages,
+        )
+        assert diagnostics["latest_turn"]["intent_class"] == expected_intent_class
