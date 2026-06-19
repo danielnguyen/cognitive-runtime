@@ -79,6 +79,35 @@ _CORRECTION_MARKERS = (
     "that was wrong",
     "to clarify",
 )
+_CLARIFICATION_REQUEST_PREFIXES = (
+    "what do you mean",
+    "did you mean",
+    "which one",
+    "which part",
+    "can you clarify",
+    "could you clarify",
+)
+_CONFIRMATION_RESPONSE_MARKERS = (
+    "yes",
+    "yes please",
+    "yeah",
+    "yep",
+    "no",
+    "no thanks",
+    "nope",
+    "correct",
+    "that's right",
+    "thats right",
+    "exactly",
+)
+_CONTINUATION_MARKERS = (
+    "continue",
+    "go on",
+    "keep going",
+    "tell me more",
+    "more detail",
+    "more details",
+)
 _VENT_MARKERS = (
     "frustrated",
     "annoyed",
@@ -125,6 +154,17 @@ def _latest_user_text(body: InteractionGovernanceEvaluateRequest) -> str:
 
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
+
+
+def _latest_assistant_text(body: InteractionGovernanceEvaluateRequest) -> str:
+    for message in reversed(body.recent_messages):
+        if message.role == "assistant" and message.content.strip():
+            return message.content.strip()
+    return ""
+
+
+def _canonical_turn_text(text: str) -> str:
+    return text.rstrip(" .!?")
 
 
 def _literal_command_confidence(raw_text: str, text: str) -> float:
@@ -233,7 +273,39 @@ def _persona_scope_hint(kind: InteractionGovernanceKind) -> str | None:
     return None
 
 
-def _map_intent_class(kind: InteractionGovernanceKind, text: str) -> str:
+def _is_clarification_request(text: str) -> bool:
+    canonical = _canonical_turn_text(text)
+    return any(
+        canonical.startswith(prefix) for prefix in _CLARIFICATION_REQUEST_PREFIXES
+    )
+
+
+def _is_confirmation_response(
+    text: str, body: InteractionGovernanceEvaluateRequest
+) -> bool:
+    if not _latest_assistant_text(body).strip().endswith("?"):
+        return False
+    return _canonical_turn_text(text) in _CONFIRMATION_RESPONSE_MARKERS
+
+
+def _is_continuation(text: str, body: InteractionGovernanceEvaluateRequest) -> bool:
+    if not _latest_assistant_text(body):
+        return False
+    canonical = _canonical_turn_text(text)
+    return canonical in _CONTINUATION_MARKERS
+
+
+def _map_intent_class(
+    kind: InteractionGovernanceKind,
+    text: str,
+    body: InteractionGovernanceEvaluateRequest,
+) -> str:
+    if _is_clarification_request(text):
+        return "clarification_request"
+    if _is_confirmation_response(text, body):
+        return "confirmation_response"
+    if _is_continuation(text, body):
+        return "continuation"
     if kind == "question":
         return "information_request"
     if kind == "command":
@@ -389,7 +461,7 @@ def evaluate_interaction_governance(
         update_runtime_turn_intent_class(
             runtime_session_id=runtime_session_id,
             runtime_turn_id=body.runtime_turn_id,
-            intent_class=_map_intent_class(result.interaction_kind, normalized_text),
+            intent_class=_map_intent_class(result.interaction_kind, normalized_text, body),
         )
 
     record_runtime_event(
