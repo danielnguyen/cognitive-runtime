@@ -106,7 +106,11 @@ For a lightweight operator smoke check against an already-running local service:
 make smoke
 ```
 
-`make smoke` uses `curl` and `jq`. It checks `/healthz`, exercises the interaction governance endpoint across representative inputs, and verifies a simple runtime turn/session integration path. Deeper diagnostics review, such as inspecting the exact summarized event payload shape, remains a manual operator check.
+`make smoke` uses `curl` and `jq`. It checks `/healthz`, exercises the interaction governance, persona containment, and restraint endpoints across representative inputs, and verifies a simple runtime turn/session integration path. Deeper diagnostics review remains a manual operator check.
+
+Manual operator validation for persona containment and restraint diagnostics:
+- runtime event payloads for persona containment and restraint must contain only allowed summary fields
+- no raw user text, raw private memory, hidden reasoning, raw exception text, or implementation-planning identifiers inside those payloads
 
 ## Relationship bootstrap
 
