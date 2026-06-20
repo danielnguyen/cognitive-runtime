@@ -15,6 +15,8 @@ from models import (
     InteractionGovernanceEvaluateResponse,
     InterruptEvaluateRequest,
     InterruptEvaluateResponse,
+    MemoryHygieneEvaluateRequest,
+    MemoryHygieneEvaluateResponse,
     PersonaContainmentEvaluateRequest,
     PersonaContainmentEvaluateResponse,
     RestraintEvaluateRequest,
@@ -80,6 +82,7 @@ from services.interaction_diagnostics import (
 )
 from services.interaction_governance import evaluate_interaction_governance
 from services.interrupt_policy import evaluate_interrupt_policy
+from services.memory_hygiene import evaluate_memory_hygiene
 from services.persona_containment import evaluate_persona_containment
 from services.restraint import evaluate_restraint
 from services.relationships import (
@@ -258,6 +261,21 @@ async def runtime_overlay(body: RuntimeStateResolveRequest) -> RuntimeOverlayRes
         omitted=overlay is None,
         omission_reason=omission_reason,
     )
+
+
+@app.post(
+    "/v1/runtime/memory-hygiene/evaluate",
+    response_model=MemoryHygieneEvaluateResponse,
+)
+async def runtime_memory_hygiene(
+    body: MemoryHygieneEvaluateRequest,
+) -> MemoryHygieneEvaluateResponse:
+    try:
+        return evaluate_memory_hygiene(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/v1/runtime/identity/resolve", response_model=RuntimeIdentityResolveResponse)

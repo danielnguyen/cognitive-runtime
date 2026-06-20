@@ -230,6 +230,10 @@ class RuntimeStateRepository:
             return None
         return self._session_from_row(row)
 
+    def turn_by_id(self, runtime_turn_id: str) -> RuntimeTurn | None:
+        with self._connect() as conn:
+            return self._turn_by_id(conn, runtime_turn_id)
+
     def resolve_state(self, *, owner_id: str, conversation_id: str, surface: str) -> RuntimeState:
         with self._connect() as conn:
             row = conn.execute(
@@ -931,6 +935,19 @@ def update_runtime_turn_restraint_policy(
         runtime_turn_id=runtime_turn_id,
         restraint_policy=restraint_policy,
     )
+
+
+def validate_runtime_turn_session(
+    *,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+) -> RuntimeTurn:
+    turn = runtime_state_repository().turn_by_id(runtime_turn_id)
+    if turn is None:
+        raise RuntimeError("runtime_turn_not_found")
+    if turn.runtime_session_id != runtime_session_id:
+        raise RuntimeError("runtime_turn_session_mismatch")
+    return turn
 
 
 def build_overlay(state: RuntimeState) -> tuple[RuntimeOverlay | None, str | None]:
