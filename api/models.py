@@ -264,6 +264,7 @@ class MemoryHygieneItemRef(BaseModel):
 
 class MemoryHygieneItemInput(BaseModel):
     item_ref: MemoryHygieneItemRef
+    memory_id: str | None = Field(default=None, max_length=120)
     freshness_state: MemoryHygieneFreshnessState = "unknown_freshness"
     last_verified_at: str | None = Field(default=None, max_length=64)
     source_kind: BoundedLabel | None = None

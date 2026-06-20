@@ -38,7 +38,7 @@ _BASE_DECISIONS: dict[
 
 def _evaluate_item(
     item: MemoryHygieneItemInput,
-    known_ref_ids: set[str],
+    known_memory_ids: set[str],
     superseded_target_ids: set[str],
 ) -> MemoryHygieneDecision:
     use_allowed, mention_as_current_allowed, framing, reason_codes = _BASE_DECISIONS[
@@ -46,13 +46,13 @@ def _evaluate_item(
     ]
     reasons = list(reason_codes)
 
-    if item.superseded_by and item.superseded_by in known_ref_ids:
+    if item.superseded_by and item.superseded_by in known_memory_ids:
         use_allowed = False
         mention_as_current_allowed = False
         framing = "omit"
         reasons.append("superseded_by_submitted_replacement")
 
-    if item.item_ref.ref_id in superseded_target_ids:
+    if item.memory_id and item.memory_id in superseded_target_ids:
         use_allowed = False
         mention_as_current_allowed = False
         framing = "omit"
@@ -141,14 +141,16 @@ def evaluate_memory_hygiene(
             runtime_turn_id=body.runtime_turn_id,
         )
 
-    known_ref_ids = {item.item_ref.ref_id for item in body.items}
+    known_memory_ids = {item.memory_id for item in body.items if item.memory_id}
     superseded_target_ids = {
-        item.supersedes for item in body.items if item.supersedes and item.supersedes in known_ref_ids
+        item.supersedes
+        for item in body.items
+        if item.supersedes and item.supersedes in known_memory_ids
     }
     decisions = [
         _evaluate_item(
             item,
-            known_ref_ids=known_ref_ids,
+            known_memory_ids=known_memory_ids,
             superseded_target_ids=superseded_target_ids,
         )
         for item in body.items

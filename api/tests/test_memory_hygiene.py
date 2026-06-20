@@ -94,7 +94,7 @@ async def test_stale_is_usable_only_with_stale_framing():
 async def test_corrected_is_usable_as_replacement():
     response = await _post(
         "/v1/runtime/memory-hygiene/evaluate",
-        _base(items=[_item("msg-2", "corrected", supersedes="msg-1")]),
+        _base(items=[_item("msg-2", "corrected", memory_id="memory-2", supersedes="memory-1")]),
     )
 
     assert response.status_code == 200
@@ -166,13 +166,95 @@ async def test_missing_or_invalid_freshness_never_becomes_current():
 
 
 @pytest.mark.asyncio
-async def test_replacement_suppresses_the_submitted_item_it_supersedes():
+async def test_replacement_suppresses_using_memory_id_when_source_ids_differ():
+    response = await _post(
+        "/v1/runtime/memory-hygiene/evaluate",
+        _base(
+            items=[
+                _item("older-source-message", "active", memory_id="older-memory-item-id"),
+                _item(
+                    "replacement-source-message",
+                    "corrected",
+                    memory_id="memory-item-id",
+                    supersedes="older-memory-item-id",
+                ),
+            ]
+        ),
+    )
+
+    assert response.status_code == 200
+    decisions = {
+        item["item_ref"]["ref_id"]: item for item in response.json()["result"]["decisions"]
+    }
+    assert decisions["older-source-message"]["use_allowed"] is False
+    assert decisions["older-source-message"]["framing"] == "omit"
+    assert decisions["replacement-source-message"]["use_allowed"] is True
+    assert decisions["replacement-source-message"]["mention_as_current_allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_superseded_by_suppresses_using_memory_id_when_source_ids_differ():
+    response = await _post(
+        "/v1/runtime/memory-hygiene/evaluate",
+        _base(
+            items=[
+                _item(
+                    "older-source-message",
+                    "corrected",
+                    memory_id="older-memory-item-id",
+                    superseded_by="newer-memory-item-id",
+                ),
+                _item(
+                    "newer-source-message",
+                    "active",
+                    memory_id="newer-memory-item-id",
+                ),
+            ]
+        ),
+    )
+
+    assert response.status_code == 200
+    decisions = {
+        item["item_ref"]["ref_id"]: item for item in response.json()["result"]["decisions"]
+    }
+    assert decisions["older-source-message"]["use_allowed"] is False
+    assert decisions["older-source-message"]["mention_as_current_allowed"] is False
+    assert decisions["newer-source-message"]["mention_as_current_allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_same_ref_id_in_different_namespaces_does_not_cross_suppress():
+    response = await _post(
+        "/v1/runtime/memory-hygiene/evaluate",
+        _base(
+            items=[
+                _item("shared-ref", "active", memory_id="message-memory-id"),
+                _item(
+                    "shared-ref",
+                    "corrected",
+                    memory_id="derived-memory-id",
+                    supersedes="different-unsubmitted-memory-id",
+                    item_ref={"ref_type": "derived_text", "ref_id": "shared-ref"},
+                ),
+            ]
+        ),
+    )
+
+    assert response.status_code == 200
+    decisions = response.json()["result"]["decisions"]
+    by_type = {item["item_ref"]["ref_type"]: item for item in decisions}
+    assert by_type["message"]["use_allowed"] is True
+    assert by_type["derived_text"]["use_allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_missing_memory_id_does_not_crash():
     response = await _post(
         "/v1/runtime/memory-hygiene/evaluate",
         _base(
             items=[
                 _item("msg-1", "active"),
-                _item("msg-2", "corrected", supersedes="msg-1"),
+                _item("msg-2", "corrected", supersedes="older-memory-item-id"),
             ]
         ),
     )
@@ -181,41 +263,23 @@ async def test_replacement_suppresses_the_submitted_item_it_supersedes():
     decisions = {
         item["item_ref"]["ref_id"]: item for item in response.json()["result"]["decisions"]
     }
-    assert decisions["msg-1"]["use_allowed"] is False
-    assert decisions["msg-1"]["framing"] == "omit"
+    assert decisions["msg-1"]["use_allowed"] is True
     assert decisions["msg-2"]["use_allowed"] is True
-    assert decisions["msg-2"]["mention_as_current_allowed"] is True
 
 
 @pytest.mark.asyncio
-async def test_superseded_by_suppresses_otherwise_current_item():
+async def test_dangling_memory_relationship_ids_do_not_suppress_unrelated_items():
     response = await _post(
         "/v1/runtime/memory-hygiene/evaluate",
         _base(
             items=[
-                _item("msg-1", "corrected", superseded_by="msg-2"),
-                _item("msg-2", "active"),
-            ]
-        ),
-    )
-
-    assert response.status_code == 200
-    decisions = {
-        item["item_ref"]["ref_id"]: item for item in response.json()["result"]["decisions"]
-    }
-    assert decisions["msg-1"]["use_allowed"] is False
-    assert decisions["msg-1"]["mention_as_current_allowed"] is False
-    assert decisions["msg-2"]["mention_as_current_allowed"] is True
-
-
-@pytest.mark.asyncio
-async def test_dangling_relationship_ids_do_not_crash_or_suppress_unrelated_items():
-    response = await _post(
-        "/v1/runtime/memory-hygiene/evaluate",
-        _base(
-            items=[
-                _item("msg-1", "active", superseded_by="missing-msg"),
-                _item("msg-2", "corrected", supersedes="other-missing-msg"),
+                _item("msg-1", "active", memory_id="active-memory-id", superseded_by="missing-memory-id"),
+                _item(
+                    "msg-2",
+                    "corrected",
+                    memory_id="corrected-memory-id",
+                    supersedes="other-missing-memory-id",
+                ),
             ]
         ),
     )
@@ -231,13 +295,13 @@ async def test_dangling_relationship_ids_do_not_crash_or_suppress_unrelated_item
 
 
 @pytest.mark.asyncio
-async def test_runtime_event_payload_is_aggregate_only_without_raw_memory():
+async def test_runtime_event_payload_is_aggregate_only_without_item_identities_or_content():
     response = await _post(
         "/v1/runtime/memory-hygiene/evaluate",
         _base(
             items=[
-                _item("msg-1", "active"),
-                _item("msg-2", "stale", source_kind="message", confidence=0.8),
+                _item("msg-1", "active", memory_id="memory-1"),
+                _item("msg-2", "stale", memory_id="memory-2", source_kind="message", confidence=0.8),
             ]
         ),
     )
@@ -263,6 +327,10 @@ async def test_runtime_event_payload_is_aggregate_only_without_raw_memory():
         "reason_codes",
         "supersession_handling_applied",
     }
+    assert "memory-1" not in str(payload)
+    assert "memory-2" not in str(payload)
+    assert "msg-1" not in str(payload)
+    assert "msg-2" not in str(payload)
     assert "source_kind" not in str(payload)
     assert "content" not in str(payload)
 
