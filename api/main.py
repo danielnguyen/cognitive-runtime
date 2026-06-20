@@ -17,6 +17,8 @@ from models import (
     InterruptEvaluateResponse,
     MemoryHygieneEvaluateRequest,
     MemoryHygieneEvaluateResponse,
+    PrivacyContextEvaluateRequest,
+    PrivacyContextEvaluateResponse,
     PersonaContainmentEvaluateRequest,
     PersonaContainmentEvaluateResponse,
     RestraintEvaluateRequest,
@@ -83,6 +85,7 @@ from services.interaction_diagnostics import (
 from services.interaction_governance import evaluate_interaction_governance
 from services.interrupt_policy import evaluate_interrupt_policy
 from services.memory_hygiene import evaluate_memory_hygiene
+from services.privacy_context import evaluate_privacy_context
 from services.persona_containment import evaluate_persona_containment
 from services.restraint import evaluate_restraint
 from services.relationships import (
@@ -276,6 +279,31 @@ async def runtime_memory_hygiene(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/v1/runtime/privacy-context/evaluate",
+    response_model=PrivacyContextEvaluateResponse,
+)
+async def runtime_privacy_context_evaluate(
+    body: PrivacyContextEvaluateRequest,
+) -> PrivacyContextEvaluateResponse:
+    try:
+        return evaluate_privacy_context(body)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "runtime_session_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail in {"runtime_session_mismatch", "surface_context_mismatch"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except RuntimeError as exc:
+        detail = str(exc)
+        if detail == "runtime_turn_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "runtime_turn_session_mismatch":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise
 
 
 @app.post("/v1/runtime/identity/resolve", response_model=RuntimeIdentityResolveResponse)

@@ -127,6 +127,7 @@ RuntimeEventType = Literal[
     "persona_containment_evaluated",
     "restraint_evaluated",
     "memory_hygiene_evaluated",
+    "privacy_context_evaluated",
 ]
 
 
@@ -332,6 +333,101 @@ class MemoryHygieneEvaluateResponse(BaseModel):
     runtime_session_id: str = Field(max_length=120)
     runtime_turn_id: str | None = Field(default=None, max_length=120)
     result: MemoryHygieneResult
+
+
+PrivacySurfaceCategory = Literal[
+    "desktop_private",
+    "mobile_private",
+    "telegram_private",
+    "voice_private",
+    "car_voice_possible_passenger",
+    "glasses_public_or_semi_public",
+    "notification_preview",
+    "unknown_surface",
+]
+PrivacyZone = Literal[
+    "private",
+    "shared_or_uncertain",
+    "public_or_semi_public",
+    "preview_limited",
+    "unknown",
+]
+PrivacySensitivityLevel = Literal[
+    "normal",
+    "sensitive",
+    "highly_sensitive",
+    "unknown",
+]
+PrivacySensitivityDomain = Literal["personal", "health", "financial", "work"]
+
+
+class PrivacyContextEvaluateRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    surface_category: PrivacySurfaceCategory | None = None
+    sensitivity_level: PrivacySensitivityLevel = "unknown"
+    sensitivity_domains: list[PrivacySensitivityDomain] = Field(default_factory=list, max_length=4)
+
+    @field_validator("surface_category", mode="before")
+    @classmethod
+    def normalize_surface_category(cls, value: Any) -> str | None:
+        allowed = {
+            "desktop_private",
+            "mobile_private",
+            "telegram_private",
+            "voice_private",
+            "car_voice_possible_passenger",
+            "glasses_public_or_semi_public",
+            "notification_preview",
+            "unknown_surface",
+        }
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return "unknown_surface"
+        normalized = value.strip().lower()
+        return normalized if normalized in allowed else "unknown_surface"
+
+    @field_validator("sensitivity_level", mode="before")
+    @classmethod
+    def normalize_sensitivity_level(cls, value: Any) -> str:
+        allowed = {
+            "normal",
+            "sensitive",
+            "highly_sensitive",
+            "unknown",
+        }
+        if not isinstance(value, str):
+            return "unknown"
+        normalized = value.strip().lower()
+        return normalized if normalized in allowed else "unknown"
+
+
+class PrivacyContextResult(BaseModel):
+    privacy_zone: PrivacyZone
+    surface_type: PrivacySurfaceCategory
+    sensitivity_level: PrivacySensitivityLevel
+    sensitive_detail_allowed: bool
+    notification_detail_allowed: bool
+    voice_detail_allowed: bool
+    screen_detail_allowed: bool
+    redaction_required: bool
+    safe_summary_required: bool
+    reason_codes: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+
+
+class PrivacyContextEvaluateResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    result: PrivacyContextResult
 
 
 class InteractionGovernanceEvaluateRequest(BaseModel):
