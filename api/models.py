@@ -126,6 +126,7 @@ RuntimeEventType = Literal[
     "interaction_governance_evaluated",
     "persona_containment_evaluated",
     "restraint_evaluated",
+    "memory_hygiene_evaluated",
 ]
 
 
@@ -236,6 +237,101 @@ InteractionGovernanceResponsePosture = Literal[
     "playful",
     "silent_or_minimal",
 ]
+MemoryHygieneFreshnessState = Literal[
+    "active",
+    "parked",
+    "stale",
+    "superseded",
+    "corrected",
+    "forgotten_or_demoted",
+    "unknown_freshness",
+]
+MemoryHygieneItemRefType = Literal["message", "derived_text"]
+MemoryHygieneFraming = Literal[
+    "current",
+    "parked_or_historical",
+    "stale_or_unverified",
+    "corrected_replacement",
+    "omit",
+    "unknown_or_unverified",
+]
+
+
+class MemoryHygieneItemRef(BaseModel):
+    ref_type: MemoryHygieneItemRefType
+    ref_id: str = Field(max_length=120)
+
+
+class MemoryHygieneItemInput(BaseModel):
+    item_ref: MemoryHygieneItemRef
+    memory_id: str | None = Field(default=None, max_length=120)
+    freshness_state: MemoryHygieneFreshnessState = "unknown_freshness"
+    last_verified_at: str | None = Field(default=None, max_length=64)
+    source_kind: BoundedLabel | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    supersedes: str | None = Field(default=None, max_length=120)
+    superseded_by: str | None = Field(default=None, max_length=120)
+
+    @field_validator("freshness_state", mode="before")
+    @classmethod
+    def normalize_freshness_state(cls, value: Any) -> str:
+        allowed = {
+            "active",
+            "parked",
+            "stale",
+            "superseded",
+            "corrected",
+            "forgotten_or_demoted",
+            "unknown_freshness",
+        }
+        if not isinstance(value, str):
+            return "unknown_freshness"
+        normalized = value.strip().lower()
+        return normalized if normalized in allowed else "unknown_freshness"
+
+
+class MemoryHygieneDecision(BaseModel):
+    item_ref: MemoryHygieneItemRef
+    freshness_state: MemoryHygieneFreshnessState
+    use_allowed: bool
+    mention_as_current_allowed: bool
+    framing: MemoryHygieneFraming
+    reason_codes: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+
+
+class MemoryHygieneAggregate(BaseModel):
+    evaluated_item_count: int = Field(ge=0)
+    usable_item_count: int = Field(ge=0)
+    current_mention_allowed_count: int = Field(ge=0)
+    restricted_or_omitted_count: int = Field(ge=0)
+    counts_by_freshness_state: dict[MemoryHygieneFreshnessState, int] = Field(default_factory=dict)
+    reason_codes: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    supersession_handling_applied: bool = False
+
+
+class MemoryHygieneResult(BaseModel):
+    decisions: list[MemoryHygieneDecision] = Field(default_factory=list, max_length=64)
+    aggregate: MemoryHygieneAggregate
+
+
+class MemoryHygieneEvaluateRequest(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    items: list[MemoryHygieneItemInput] = Field(default_factory=list, max_length=64)
+
+
+class MemoryHygieneEvaluateResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    result: MemoryHygieneResult
 
 
 class InteractionGovernanceEvaluateRequest(BaseModel):
