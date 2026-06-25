@@ -1,0 +1,71 @@
+{
+  "schema_version": "runtime-replay-v1",
+  "scenario": "overlay-omission-with-attention-only",
+  "category": "overlay_omission",
+  "request_ids": [
+    "replay-omission-update",
+    "replay-omission-overlay"
+  ],
+  "steps": [
+    {
+      "operation": "update_state",
+      "request": {
+        "request_id": "replay-omission-update",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-omission",
+        "surface": "chat",
+        "updates": {
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "bounded-task",
+            "status": "active"
+          }
+        }
+      }
+    },
+    {
+      "operation": "overlay",
+      "capture": "overlay",
+      "request": {
+        "request_id": "replay-omission-overlay",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-omission",
+        "surface": "chat"
+      }
+    }
+  ],
+  "expected": {
+    "schema_version": "runtime-replay-v1",
+    "scenario": "overlay-omission-with-attention-only",
+    "category": "overlay_omission",
+    "request_ids": [
+      "replay-omission-update",
+      "replay-omission-overlay"
+    ],
+    "captures": {
+      "overlay": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-omission",
+          "surface": "chat",
+          "active_scene": null,
+          "interaction_mode": null,
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "bounded-task",
+            "status": "active"
+          },
+          "temporary_constraints": [],
+          "reset_after_turn": false,
+          "trace_refs": [],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        },
+        "overlay": null,
+        "omitted": true,
+        "omission_reason": "empty_runtime_state"
+      }
+    }
+  }
+}

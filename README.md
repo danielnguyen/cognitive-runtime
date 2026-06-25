@@ -96,7 +96,15 @@ From repo root:
 make dev-lint
 make dev-test
 make dev-check
+make replay-test
 ```
+
+`make replay-test` runs the versioned runtime replay corpus in
+`api/replay/runtime/v1`. Each scenario uses a clean disposable SQLite database,
+executes the real runtime service boundary, normalizes generated identifiers and
+timestamps, and compares the structural result with its persisted expected
+snapshot. It requires no deployed stack, external provider, network service, or
+credentials.
 
 `make dev-start` serves the API on `APP_PORT`, defaulting to `4371`.
 

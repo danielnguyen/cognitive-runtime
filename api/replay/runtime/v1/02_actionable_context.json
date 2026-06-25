@@ -1,0 +1,121 @@
+{
+  "schema_version": "runtime-replay-v1",
+  "scenario": "actionable-runtime-context",
+  "category": "actionable_context",
+  "request_ids": [
+    "replay-actionable-update",
+    "replay-actionable-overlay"
+  ],
+  "steps": [
+    {
+      "operation": "update_state",
+      "capture": "updated",
+      "request": {
+        "request_id": "replay-actionable-update",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-actionable",
+        "surface": "dev",
+        "updates": {
+          "active_scene": "planning",
+          "interaction_mode": "actionable",
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "bounded-task",
+            "status": "active"
+          },
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "reset_after_turn": true,
+          "trace_refs": [
+            "trace-actionable"
+          ]
+        }
+      }
+    },
+    {
+      "operation": "overlay",
+      "capture": "overlay",
+      "request": {
+        "request_id": "replay-actionable-overlay",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-actionable",
+        "surface": "dev"
+      }
+    }
+  ],
+  "expected": {
+    "schema_version": "runtime-replay-v1",
+    "scenario": "actionable-runtime-context",
+    "category": "actionable_context",
+    "request_ids": [
+      "replay-actionable-update",
+      "replay-actionable-overlay"
+    ],
+    "captures": {
+      "updated": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-actionable",
+          "surface": "dev",
+          "active_scene": "planning",
+          "interaction_mode": "actionable",
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "bounded-task",
+            "status": "active"
+          },
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "reset_after_turn": true,
+          "trace_refs": [
+            "trace-actionable"
+          ],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        }
+      },
+      "overlay": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-actionable",
+          "surface": "dev",
+          "active_scene": "planning",
+          "interaction_mode": "actionable",
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "bounded-task",
+            "status": "active"
+          },
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "reset_after_turn": true,
+          "trace_refs": [
+            "trace-actionable"
+          ],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        },
+        "overlay": {
+          "overlay_id": "rtoverlay_1",
+          "runtime_state_id": "rtstate_1",
+          "overlay_type": "runtime_state",
+          "priority": "after_profile_before_retrieval",
+          "role": "system",
+          "content": "Runtime context: scene=planning; interaction_mode=actionable; constraints=preserve_flow.",
+          "source_fields": [
+            "active_scene",
+            "interaction_mode",
+            "temporary_constraints"
+          ]
+        },
+        "omitted": false,
+        "omission_reason": null
+      }
+    }
+  }
+}

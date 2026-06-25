@@ -1,0 +1,115 @@
+{
+  "schema_version": "runtime-replay-v1",
+  "scenario": "rejected-runtime-state-input",
+  "category": "rejected_input",
+  "request_ids": [
+    "replay-valid-update",
+    "replay-rejected-update"
+  ],
+  "steps": [
+    {
+      "operation": "update_state",
+      "capture": "valid_state",
+      "request": {
+        "request_id": "replay-valid-update",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-rejected",
+        "surface": "dev",
+        "updates": {
+          "active_scene": "planning",
+          "interaction_mode": "actionable",
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "trace_refs": [
+            "trace-valid"
+          ]
+        }
+      }
+    },
+    {
+      "operation": "rejected_update",
+      "capture": "rejected",
+      "request": {
+        "request_id": "replay-rejected-update",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-rejected",
+        "surface": "dev"
+      },
+      "rejected_request": {
+        "request_id": "replay-rejected-update",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-rejected",
+        "surface": "dev",
+        "updates": {
+          "temporary_constraints": [
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          ]
+        }
+      }
+    }
+  ],
+  "expected": {
+    "schema_version": "runtime-replay-v1",
+    "scenario": "rejected-runtime-state-input",
+    "category": "rejected_input",
+    "request_ids": [
+      "replay-valid-update",
+      "replay-rejected-update"
+    ],
+    "captures": {
+      "valid_state": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-rejected",
+          "surface": "dev",
+          "active_scene": "planning",
+          "interaction_mode": "actionable",
+          "attention_focus": null,
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "reset_after_turn": false,
+          "trace_refs": [
+            "trace-valid"
+          ],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        }
+      },
+      "rejected": {
+        "rejection": {
+          "accepted": false,
+          "error_type": "validation_error",
+          "error_locations": [
+            [
+              "updates",
+              "temporary_constraints",
+              0
+            ]
+          ]
+        },
+        "state_unchanged": true,
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-rejected",
+          "surface": "dev",
+          "active_scene": "planning",
+          "interaction_mode": "actionable",
+          "attention_focus": null,
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "reset_after_turn": false,
+          "trace_refs": [
+            "trace-valid"
+          ],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        }
+      }
+    }
+  }
+}

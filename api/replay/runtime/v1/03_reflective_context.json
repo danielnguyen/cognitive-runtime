@@ -1,0 +1,120 @@
+{
+  "schema_version": "runtime-replay-v1",
+  "scenario": "reflective-runtime-context",
+  "category": "reflective_context",
+  "request_ids": [
+    "replay-reflective-update",
+    "replay-reflective-overlay"
+  ],
+  "steps": [
+    {
+      "operation": "update_state",
+      "capture": "updated",
+      "request": {
+        "request_id": "replay-reflective-update",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-reflective",
+        "surface": "chat",
+        "updates": {
+          "active_scene": "reflective",
+          "interaction_mode": "human",
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "consider-options",
+            "status": "paused"
+          },
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "trace_refs": [
+            "trace-reflective"
+          ]
+        }
+      }
+    },
+    {
+      "operation": "overlay",
+      "capture": "overlay",
+      "request": {
+        "request_id": "replay-reflective-overlay",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-reflective",
+        "surface": "chat"
+      }
+    }
+  ],
+  "expected": {
+    "schema_version": "runtime-replay-v1",
+    "scenario": "reflective-runtime-context",
+    "category": "reflective_context",
+    "request_ids": [
+      "replay-reflective-update",
+      "replay-reflective-overlay"
+    ],
+    "captures": {
+      "updated": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-reflective",
+          "surface": "chat",
+          "active_scene": "reflective",
+          "interaction_mode": "human",
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "consider-options",
+            "status": "paused"
+          },
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "reset_after_turn": false,
+          "trace_refs": [
+            "trace-reflective"
+          ],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        }
+      },
+      "overlay": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-reflective",
+          "surface": "chat",
+          "active_scene": "reflective",
+          "interaction_mode": "human",
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "consider-options",
+            "status": "paused"
+          },
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "reset_after_turn": false,
+          "trace_refs": [
+            "trace-reflective"
+          ],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        },
+        "overlay": {
+          "overlay_id": "rtoverlay_1",
+          "runtime_state_id": "rtstate_1",
+          "overlay_type": "runtime_state",
+          "priority": "after_profile_before_retrieval",
+          "role": "system",
+          "content": "Runtime context: scene=reflective; interaction_mode=human; constraints=preserve_flow.",
+          "source_fields": [
+            "active_scene",
+            "interaction_mode",
+            "temporary_constraints"
+          ]
+        },
+        "omitted": false,
+        "omission_reason": null
+      }
+    }
+  }
+}
