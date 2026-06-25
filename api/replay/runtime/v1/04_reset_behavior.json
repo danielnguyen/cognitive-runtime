@@ -1,0 +1,106 @@
+{
+  "schema_version": "runtime-replay-v1",
+  "scenario": "runtime-state-reset",
+  "category": "reset_behavior",
+  "request_ids": [
+    "replay-reset-update",
+    "replay-reset",
+    "replay-reset-overlay"
+  ],
+  "steps": [
+    {
+      "operation": "update_state",
+      "request": {
+        "request_id": "replay-reset-update",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-reset",
+        "surface": "dev",
+        "updates": {
+          "active_scene": "planning",
+          "interaction_mode": "actionable",
+          "attention_focus": {
+            "topic": "bounded-topic",
+            "task": "bounded-task",
+            "status": "active"
+          },
+          "temporary_constraints": [
+            "preserve_flow"
+          ],
+          "reset_after_turn": true,
+          "trace_refs": [
+            "trace-reset"
+          ]
+        }
+      }
+    },
+    {
+      "operation": "reset_state",
+      "capture": "reset",
+      "request": {
+        "request_id": "replay-reset",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-reset",
+        "surface": "dev",
+        "reason": "scenario-reset"
+      }
+    },
+    {
+      "operation": "overlay",
+      "capture": "overlay_after_reset",
+      "request": {
+        "request_id": "replay-reset-overlay",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-reset",
+        "surface": "dev"
+      }
+    }
+  ],
+  "expected": {
+    "schema_version": "runtime-replay-v1",
+    "scenario": "runtime-state-reset",
+    "category": "reset_behavior",
+    "request_ids": [
+      "replay-reset-update",
+      "replay-reset",
+      "replay-reset-overlay"
+    ],
+    "captures": {
+      "reset": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-reset",
+          "surface": "dev",
+          "active_scene": null,
+          "interaction_mode": null,
+          "attention_focus": null,
+          "temporary_constraints": [],
+          "reset_after_turn": false,
+          "trace_refs": [],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        },
+        "reset": true
+      },
+      "overlay_after_reset": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-reset",
+          "surface": "dev",
+          "active_scene": null,
+          "interaction_mode": null,
+          "attention_focus": null,
+          "temporary_constraints": [],
+          "reset_after_turn": false,
+          "trace_refs": [],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        },
+        "overlay": null,
+        "omitted": true,
+        "omission_reason": "empty_runtime_state"
+      }
+    }
+  }
+}

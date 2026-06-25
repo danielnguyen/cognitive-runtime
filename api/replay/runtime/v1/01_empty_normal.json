@@ -1,0 +1,77 @@
+{
+  "schema_version": "runtime-replay-v1",
+  "scenario": "empty-normal-runtime-state",
+  "category": "empty_normal",
+  "request_ids": [
+    "replay-empty-resolve",
+    "replay-empty-overlay"
+  ],
+  "steps": [
+    {
+      "operation": "resolve_state",
+      "capture": "resolved",
+      "request": {
+        "request_id": "replay-empty-resolve",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-empty",
+        "surface": "chat"
+      }
+    },
+    {
+      "operation": "overlay",
+      "capture": "overlay",
+      "request": {
+        "request_id": "replay-empty-overlay",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-empty",
+        "surface": "chat"
+      }
+    }
+  ],
+  "expected": {
+    "schema_version": "runtime-replay-v1",
+    "scenario": "empty-normal-runtime-state",
+    "category": "empty_normal",
+    "request_ids": [
+      "replay-empty-resolve",
+      "replay-empty-overlay"
+    ],
+    "captures": {
+      "resolved": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-empty",
+          "surface": "chat",
+          "active_scene": null,
+          "interaction_mode": null,
+          "attention_focus": null,
+          "temporary_constraints": [],
+          "reset_after_turn": false,
+          "trace_refs": [],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        }
+      },
+      "overlay": {
+        "runtime_state": {
+          "runtime_state_id": "rtstate_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-empty",
+          "surface": "chat",
+          "active_scene": null,
+          "interaction_mode": null,
+          "attention_focus": null,
+          "temporary_constraints": [],
+          "reset_after_turn": false,
+          "trace_refs": [],
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>"
+        },
+        "overlay": null,
+        "omitted": true,
+        "omission_reason": "empty_runtime_state"
+      }
+    }
+  }
+}

@@ -1,0 +1,273 @@
+{
+  "schema_version": "runtime-replay-v1",
+  "scenario": "durable-turn-lifecycle",
+  "category": "durable_turn_lifecycle",
+  "request_ids": [
+    "replay-turn-start",
+    "replay-turn-update",
+    "replay-turn-complete"
+  ],
+  "steps": [
+    {
+      "operation": "start_turn",
+      "capture": "started",
+      "request": {
+        "request_id": "replay-turn-start",
+        "owner_id": "owner-replay",
+        "conversation_id": "conversation-turn",
+        "surface": "dev",
+        "surface_session_id": "surface-session-replay",
+        "active_mode": "actionable",
+        "input_message_id": "input-replay",
+        "intent_class": "task",
+        "timing_policy": "normal",
+        "restraint_policy": "bounded",
+        "continuation_state": "none"
+      }
+    },
+    {
+      "operation": "update_turn",
+      "capture": "updated",
+      "from_context": {
+        "runtime_session_id": "runtime_session_id",
+        "runtime_turn_id": "runtime_turn_id"
+      },
+      "request": {
+        "request_id": "replay-turn-update",
+        "turn_status": "retrieving",
+        "timing_policy": "normal",
+        "restraint_policy": "bounded",
+        "continuation_state": "pending"
+      }
+    },
+    {
+      "operation": "complete_turn",
+      "capture": "completed",
+      "from_context": {
+        "runtime_session_id": "runtime_session_id",
+        "runtime_turn_id": "runtime_turn_id"
+      },
+      "request": {
+        "request_id": "replay-turn-complete",
+        "turn_status": "completed",
+        "continuation_state": "none"
+      }
+    },
+    {
+      "operation": "reopen_repository"
+    },
+    {
+      "operation": "diagnostics",
+      "capture": "diagnostics_after_reopen"
+    }
+  ],
+  "expected": {
+    "schema_version": "runtime-replay-v1",
+    "scenario": "durable-turn-lifecycle",
+    "category": "durable_turn_lifecycle",
+    "request_ids": [
+      "replay-turn-start",
+      "replay-turn-update",
+      "replay-turn-complete"
+    ],
+    "captures": {
+      "started": {
+        "runtime_session": {
+          "runtime_session_id": "rtsession_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-turn",
+          "surface": "dev",
+          "surface_session_id": "surface-session-replay",
+          "status": "active",
+          "active_mode": "actionable",
+          "attention_state": null,
+          "started_at": "<timestamp>",
+          "last_activity_at": "<timestamp>",
+          "closed_at": null
+        },
+        "runtime_turn": {
+          "runtime_turn_id": "rtturn_1",
+          "runtime_session_id": "rtsession_1",
+          "input_message_id": "input-replay",
+          "turn_status": "received",
+          "intent_class": "task",
+          "timing_policy": "normal",
+          "restraint_policy": "bounded",
+          "continuation_state": "none",
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>",
+          "completed_at": null
+        },
+        "event": {
+          "event_id": "rtevent_1",
+          "runtime_session_id": "rtsession_1",
+          "runtime_turn_id": "rtturn_1",
+          "event_type": "turn_started",
+          "event_payload_json": {
+            "input_message_id": "input-replay",
+            "request_id": "replay-turn-start",
+            "turn_status": "received"
+          },
+          "created_at": "<timestamp>"
+        }
+      },
+      "updated": {
+        "runtime_session": {
+          "runtime_session_id": "rtsession_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-turn",
+          "surface": "dev",
+          "surface_session_id": "surface-session-replay",
+          "status": "active",
+          "active_mode": "actionable",
+          "attention_state": null,
+          "started_at": "<timestamp>",
+          "last_activity_at": "<timestamp>",
+          "closed_at": null
+        },
+        "runtime_turn": {
+          "runtime_turn_id": "rtturn_1",
+          "runtime_session_id": "rtsession_1",
+          "input_message_id": "input-replay",
+          "turn_status": "retrieving",
+          "intent_class": "task",
+          "timing_policy": "normal",
+          "restraint_policy": "bounded",
+          "continuation_state": "pending",
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>",
+          "completed_at": null
+        },
+        "event": {
+          "event_id": "rtevent_2",
+          "runtime_session_id": "rtsession_1",
+          "runtime_turn_id": "rtturn_1",
+          "event_type": "turn_updated",
+          "event_payload_json": {
+            "request_id": "replay-turn-update",
+            "turn_status": "retrieving"
+          },
+          "created_at": "<timestamp>"
+        }
+      },
+      "completed": {
+        "runtime_session": {
+          "runtime_session_id": "rtsession_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-turn",
+          "surface": "dev",
+          "surface_session_id": "surface-session-replay",
+          "status": "active",
+          "active_mode": "actionable",
+          "attention_state": null,
+          "started_at": "<timestamp>",
+          "last_activity_at": "<timestamp>",
+          "closed_at": null
+        },
+        "runtime_turn": {
+          "runtime_turn_id": "rtturn_1",
+          "runtime_session_id": "rtsession_1",
+          "input_message_id": "input-replay",
+          "turn_status": "completed",
+          "intent_class": "task",
+          "timing_policy": "normal",
+          "restraint_policy": "bounded",
+          "continuation_state": "none",
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>",
+          "completed_at": "<timestamp>"
+        },
+        "event": {
+          "event_id": "rtevent_3",
+          "runtime_session_id": "rtsession_1",
+          "runtime_turn_id": "rtturn_1",
+          "event_type": "turn_completed",
+          "event_payload_json": {
+            "continuation_state": "none",
+            "request_id": "replay-turn-complete",
+            "turn_status": "completed"
+          },
+          "created_at": "<timestamp>"
+        }
+      },
+      "diagnostics_after_reopen": {
+        "runtime_session": {
+          "runtime_session_id": "rtsession_1",
+          "owner_id": "owner-replay",
+          "conversation_id": "conversation-turn",
+          "surface": "dev",
+          "surface_session_id": "surface-session-replay",
+          "status": "active",
+          "active_mode": "actionable",
+          "attention_state": null,
+          "started_at": "<timestamp>",
+          "last_activity_at": "<timestamp>",
+          "closed_at": null
+        },
+        "active_turn": null,
+        "latest_turn": {
+          "runtime_turn_id": "rtturn_1",
+          "runtime_session_id": "rtsession_1",
+          "input_message_id": "input-replay",
+          "turn_status": "completed",
+          "intent_class": "task",
+          "timing_policy": "normal",
+          "restraint_policy": "bounded",
+          "continuation_state": "none",
+          "created_at": "<timestamp>",
+          "updated_at": "<timestamp>",
+          "completed_at": "<timestamp>"
+        },
+        "events": [
+          {
+            "event_id": "rtevent_4",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": null,
+            "event_type": "session_resolved",
+            "event_payload_json": {
+              "conversation_id": "conversation-turn",
+              "request_id": "replay-turn-start",
+              "surface": "dev"
+            },
+            "created_at": "<timestamp>"
+          },
+          {
+            "event_id": "rtevent_1",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "event_type": "turn_started",
+            "event_payload_json": {
+              "input_message_id": "input-replay",
+              "request_id": "replay-turn-start",
+              "turn_status": "received"
+            },
+            "created_at": "<timestamp>"
+          },
+          {
+            "event_id": "rtevent_2",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "event_type": "turn_updated",
+            "event_payload_json": {
+              "request_id": "replay-turn-update",
+              "turn_status": "retrieving"
+            },
+            "created_at": "<timestamp>"
+          },
+          {
+            "event_id": "rtevent_3",
+            "runtime_session_id": "rtsession_1",
+            "runtime_turn_id": "rtturn_1",
+            "event_type": "turn_completed",
+            "event_payload_json": {
+              "continuation_state": "none",
+              "request_id": "replay-turn-complete",
+              "turn_status": "completed"
+            },
+            "created_at": "<timestamp>"
+          }
+        ]
+      }
+    }
+  }
+}
