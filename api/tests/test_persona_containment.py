@@ -33,6 +33,19 @@ def test_technical_request_uses_technical_persona_and_keeps_domains_narrow():
     assert "technical" in result["allowed_tool_domains"]
     assert "finance" in result["blocked_memory_domains"]
     assert result["cross_scope_access_allowed"] is False
+    assert result["artifact_access_policy"] == {
+        "enforcement_mode": "mandatory",
+        "allowed_content_classes": ["document", "code"],
+        "allowed_domains": result["allowed_memory_domains"],
+        "maximum_sensitivity": "high",
+        "surface_content_capabilities": ["document", "code"],
+        "reason_codes": [
+            "artifact_policy_applied",
+            "restricted_artifact_access_blocked",
+            "persona_content_class_limited",
+            "surface_content_class_limited",
+        ],
+    }
 
 
 def test_vehicle_request_uses_vehicle_capability_and_blocks_unrelated_domains():
@@ -128,6 +141,11 @@ def test_explicit_cross_scope_request_allows_bridging_with_reason():
     assert result["cross_scope_access_allowed"] is True
     assert result["cross_scope_reason"] == "explicit_bridge_request_detected"
     assert "work_professional" in result["allowed_memory_domains"]
+    assert result["artifact_access_policy"]["allowed_domains"] == result["allowed_memory_domains"]
+    assert "work_professional" in result["artifact_access_policy"]["allowed_domains"]
+    assert "cross_scope_domain_authorized" in result["artifact_access_policy"]["reason_codes"]
+    assert result["artifact_access_policy"]["allowed_content_classes"] == ["document", "code"]
+    assert result["artifact_access_policy"]["maximum_sensitivity"] == "high"
 
 
 def test_connect_bridge_phrase_allows_explicit_cross_scope():
@@ -161,6 +179,12 @@ def test_display_identity_is_not_accepted_as_canonical_persona_id():
     result = response.json()["result"]
     assert result["active_persona_id"] == "general_assistant"
     assert "requested_persona_not_canonical" in result["reason_summary"]
+    assert result["artifact_access_policy"]["allowed_content_classes"] == [
+        "document",
+        "image",
+        "screenshot",
+    ]
+    assert "Technical Architect" not in str(result["artifact_access_policy"])
 
 
 def test_conservative_fallback_does_not_broaden_scope_silently():
@@ -178,6 +202,12 @@ def test_conservative_fallback_does_not_broaden_scope_silently():
     assert result["allowed_memory_domains"] == ["general"]
     assert "technical" in result["blocked_memory_domains"]
     assert result["cross_scope_access_allowed"] is False
+    assert result["artifact_access_policy"]["allowed_content_classes"] == []
+    assert result["artifact_access_policy"]["surface_content_capabilities"] == []
+    assert result["artifact_access_policy"]["allowed_domains"] == ["general"]
+    assert result["artifact_access_policy"]["maximum_sensitivity"] == "low"
+    assert "unknown_surface_no_artifact_access" in result["artifact_access_policy"]["reason_codes"]
+    assert "not_registered" not in str(result["artifact_access_policy"])
 
 
 def test_runtime_event_summary_excludes_raw_private_context():
@@ -185,7 +215,12 @@ def test_runtime_event_summary_excludes_raw_private_context():
 
     response = client.post(
         "/v1/runtime/persona-containment/evaluate",
-        json=_base(current_user_text="Bring in health context for this question."),
+        json=_base(
+            current_user_text=(
+                "Bring in health context for this question with secret.png, "
+                "image/png, artifact bytes, and /tmp/runtime.sqlite."
+            ),
+        ),
     )
 
     assert response.status_code == 200
@@ -206,12 +241,31 @@ def test_runtime_event_summary_excludes_raw_private_context():
         "allowed_memory_domains",
         "blocked_memory_domains",
         "allowed_tool_domains",
+        "artifact_access_policy",
         "cross_scope_access_allowed",
         "cross_scope_reason",
         "reason_summary",
     }
+    policy = payload["artifact_access_policy"]
+    assert policy["enforcement_mode"] == "mandatory"
+    assert policy["allowed_content_classes"] == ["document", "code"]
+    assert policy["allowed_domains"] == payload["allowed_memory_domains"]
+    assert policy["maximum_sensitivity"] == "high"
+    assert policy["maximum_sensitivity"] != "restricted"
+    assert policy["surface_content_capabilities"] == ["document", "code"]
+    assert policy["reason_codes"] == [
+        "artifact_policy_applied",
+        "restricted_artifact_access_blocked",
+        "persona_content_class_limited",
+        "surface_content_class_limited",
+        "cross_scope_domain_authorized",
+    ]
     assert "current_user_text" not in str(payload)
     assert "Bring in health context" not in str(payload)
+    assert "secret.png" not in str(payload)
+    assert "image/png" not in str(payload)
+    assert "artifact bytes" not in str(payload)
+    assert "/tmp/runtime.sqlite" not in str(payload)
 
 
 def test_unmapped_domain_does_not_broaden_scope():
@@ -229,6 +283,29 @@ def test_unmapped_domain_does_not_broaden_scope():
     assert "domain_not_policy_mapped" in result["reason_summary"]
     assert "astrology" in result["blocked_memory_domains"]
     assert result["allowed_memory_domains"] == ["general"]
+    assert result["artifact_access_policy"]["allowed_domains"] == ["general"]
+    assert "astrology" not in result["artifact_access_policy"]["allowed_domains"]
+
+
+def test_web_general_artifact_policy_allows_only_current_image_classes():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/runtime/persona-containment/evaluate",
+        json=_base(surface="web", current_user_text="Summarize this screenshot and document."),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    policy = result["artifact_access_policy"]
+    assert result["active_persona_id"] == "general_assistant"
+    assert policy["allowed_content_classes"] == ["document", "image", "screenshot"]
+    assert "audio" not in policy["allowed_content_classes"]
+    assert "video" not in policy["allowed_content_classes"]
+    assert "other" not in policy["allowed_content_classes"]
+    assert policy["maximum_sensitivity"] == "high"
+    assert policy["maximum_sensitivity"] != "restricted"
+    assert policy["allowed_domains"] == result["allowed_memory_domains"]
 
 
 def test_runtime_turn_integration_records_persona_containment_event():

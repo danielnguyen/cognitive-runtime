@@ -639,6 +639,22 @@ def test_relationship_select_enforces_scope_confidence_and_mentionability_rules(
     assert routing_only["relationship_id"] in ids
     assert restricted["relationship_id"] not in ids
     assert "use_for_routing_only" not in (body["prompt_content"] or "")
+    projection = body["retrieval_scope_projection"]
+    assert projection == {
+        "applied": True,
+        "relationship_ids": [
+            active["relationship_id"],
+            trusted_low["relationship_id"],
+            routing_only["relationship_id"],
+        ],
+        "entity_ids": ["project:alpha", "repo:alpha"],
+        "relationship_scopes": ["project_context"],
+        "reason_codes": ["eligible_relationship_scope_selected"],
+    }
+    assert "works_on" not in str(projection)
+    assert "depends_on" not in str(projection)
+    assert "config:project-alpha" not in str(projection)
+    assert "Project Alpha" not in str(projection)
     assert low_conf["relationship_id"] in body["trace"]["relationship_edges_excluded"]
     assert (
         body["trace"]["relationship_exclusion_reasons"][low_conf["relationship_id"]]
@@ -661,6 +677,8 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
         ("repo:low-confidence", "low confidence repo marker"),
         ("repo:blocked-persona", "blocked persona repo marker"),
         ("repo:outside-scope", "outside scope repo marker"),
+        ("repo:needs-confirmation", "needs confirmation repo marker"),
+        ("repo:restricted-sensitivity", "restricted sensitivity repo marker"),
     ):
         client.post(
             "/v1/relationships/entities/upsert",
@@ -765,6 +783,31 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
             "evidence": [],
         },
     ).json()["relationship"]
+    needs_confirmation = client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base(),
+            "edge": _edge(
+                object_entity_id="repo:needs-confirmation",
+                relationship_type="manages",
+                status="needs_confirmation",
+                source_type="model_inference",
+            ),
+            "evidence": [],
+        },
+    ).json()["relationship"]
+    restricted_sensitivity = client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base(),
+            "edge": _edge(
+                object_entity_id="repo:restricted-sensitivity",
+                relationship_type="references",
+                sensitivity_level="restricted",
+            ),
+            "evidence": [],
+        },
+    ).json()["relationship"]
 
     response = client.post(
         "/v1/relationships/select",
@@ -785,9 +828,31 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
     assert reasons[low_confidence["relationship_id"]] == "below_confidence_threshold"
     assert reasons[blocked_persona["relationship_id"]] == "blocked_persona_scope"
     assert reasons[outside_scope["relationship_id"]] == "outside_persona_or_surface_scope"
+    assert reasons[needs_confirmation["relationship_id"]] == "status_needs_confirmation"
+    assert reasons[restricted_sensitivity["relationship_id"]] == "authorization_required"
     assert body["trace"]["relationship_confirmation_required"] is True
     selected_ids = {item["relationship_id"] for item in body["selected_relationships"]}
     assert selected_ids == {superseding["relationship_id"]}
+    projection = body["retrieval_scope_projection"]
+    assert projection == {
+        "applied": True,
+        "relationship_ids": [superseding["relationship_id"]],
+        "entity_ids": ["project:alpha", "repo:beta"],
+        "relationship_scopes": ["project_context"],
+        "reason_codes": ["eligible_relationship_scope_selected"],
+    }
+    excluded_object_ids = {
+        "repo:revoked",
+        "repo:superseded",
+        "repo:expired",
+        "repo:restricted",
+        "repo:low-confidence",
+        "repo:blocked-persona",
+        "repo:outside-scope",
+        "repo:needs-confirmation",
+        "repo:restricted-sensitivity",
+    }
+    assert excluded_object_ids.isdisjoint(projection["entity_ids"])
     prompt = body["prompt_content"] or ""
     assert "Project Alpha contains Repo Beta" in prompt
     assert "scope=project_context" in prompt
@@ -800,6 +865,8 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
         "Low Confidence Repo Marker",
         "Blocked Persona Repo Marker",
         "Outside Scope Repo Marker",
+        "Needs Confirmation Repo Marker",
+        "Restricted Sensitivity Repo Marker",
         "works_on",
         "documents",
         "references",
@@ -862,6 +929,13 @@ def test_relationship_select_excludes_conflicted_relationships_without_winner_se
     assert body["trace"]["relationship_conflicts"]
     assert body["trace"]["relationship_confirmation_required"] is True
     assert body["prompt_content"] is None
+    assert body["retrieval_scope_projection"] == {
+        "applied": False,
+        "relationship_ids": [],
+        "entity_ids": [],
+        "relationship_scopes": [],
+        "reason_codes": ["no_eligible_relationship_scope"],
+    }
 
 
 def test_relationship_select_allows_multiple_contains_edges_without_conflict():
@@ -913,6 +987,134 @@ def test_relationship_select_allows_multiple_contains_edges_without_conflict():
         "repo:alpha",
         "repo:beta",
     }
+    assert body["retrieval_scope_projection"] == {
+        "applied": True,
+        "relationship_ids": [first["relationship_id"], second["relationship_id"]],
+        "entity_ids": ["project:alpha", "repo:alpha", "repo:beta"],
+        "relationship_scopes": ["project_context"],
+        "reason_codes": ["eligible_relationship_scope_selected"],
+    }
+
+
+def test_filtering_only_relationship_projects_to_retrieval_without_prompt_mention():
+    client = TestClient(app)
+    _seed_entities(client)
+    filtering_only = client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base(),
+            "edge": _edge(
+                relationship_id="rel_filtering_only",
+                mentionability="use_for_filtering_only",
+                relationship_type="documents",
+            ),
+            "evidence": [_evidence("Filtering-only relationship evidence.")],
+        },
+    ).json()["relationship"]
+
+    response = client.post(
+        "/v1/relationships/select",
+        json={
+            **_base(),
+            "active_persona_id": "technical_architect",
+            "requested_scopes": ["project_context"],
+            "relationship_types": ["documents"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_relationships"][0]["relationship_id"] == filtering_only["relationship_id"]
+    assert body["prompt_content"] is None
+    assert body["trace"]["relationship_edges_used"] == [filtering_only["relationship_id"]]
+    assert (
+        body["trace"]["relationship_exclusion_reasons"][filtering_only["relationship_id"]]
+        == "use_for_filtering_only"
+    )
+    projection = body["retrieval_scope_projection"]
+    assert projection == {
+        "applied": True,
+        "relationship_ids": [filtering_only["relationship_id"]],
+        "entity_ids": ["project:alpha", "repo:alpha"],
+        "relationship_scopes": ["project_context"],
+        "reason_codes": ["eligible_relationship_scope_selected"],
+    }
+    for forbidden in (
+        "documents",
+        "active",
+        "0.8",
+        "medium",
+        "use_for_filtering_only",
+        "config:project-alpha",
+        "Filtering-only relationship evidence",
+        "Project Alpha",
+        "Repo Alpha",
+    ):
+        assert forbidden not in str(projection)
+
+
+def test_relationship_retrieval_projection_is_owner_isolated():
+    client = TestClient(app)
+    _seed_entities(client, owner_id="real-owner")
+    client.post(
+        "/v1/relationships/entities/upsert",
+        json={
+            **_base("other-owner"),
+            "entity": _entity(
+                "other:project:alpha",
+                label="other project alpha",
+                entity_type="project",
+            ),
+        },
+    )
+    client.post(
+        "/v1/relationships/entities/upsert",
+        json={
+            **_base("other-owner"),
+            "entity": _entity(
+                "other:repo:beta",
+                label="other repo beta",
+                entity_type="repository",
+            ),
+        },
+    )
+    real = client.post(
+        "/v1/relationships/edges/upsert",
+        json={**_base("real-owner"), "edge": _edge(), "evidence": []},
+    ).json()["relationship"]
+    other = client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base("other-owner"),
+            "edge": _edge(
+                relationship_id="rel_other_owner",
+                subject_entity_id="other:project:alpha",
+                object_entity_id="other:repo:beta",
+            ),
+            "evidence": [],
+        },
+    ).json()["relationship"]
+
+    response = client.post(
+        "/v1/relationships/select",
+        json={
+            **_base("real-owner"),
+            "active_persona_id": "technical_architect",
+            "requested_scopes": ["project_context"],
+        },
+    )
+
+    assert response.status_code == 200
+    projection = response.json()["retrieval_scope_projection"]
+    assert projection == {
+        "applied": True,
+        "relationship_ids": [real["relationship_id"]],
+        "entity_ids": ["project:alpha", "repo:alpha"],
+        "relationship_scopes": ["project_context"],
+        "reason_codes": ["eligible_relationship_scope_selected"],
+    }
+    assert other["relationship_id"] not in projection["relationship_ids"]
+    assert "other:repo:beta" not in projection["entity_ids"]
 
 
 def test_cross_owner_confirmation_and_revocation_return_owner_scoped_404_without_mutation():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from models import (
+    ArtifactAccessPolicy,
     PersonaContainmentEvaluateRequest,
     PersonaContainmentEvaluateResponse,
     PersonaContainmentResult,
@@ -49,6 +50,26 @@ _PERSONA_BASE_ALLOWED_DOMAINS = {
     "operations_assistant": {"general", "work_professional", "infrastructure"},
     "personal_companion": {"general", "personal"},
 }
+_PERSONA_ARTIFACT_CONTENT_CLASSES = {
+    "general_assistant": {"document", "image", "screenshot"},
+    "technical_architect": {"document", "code", "image", "screenshot"},
+    "operations_assistant": {"document", "code", "image", "screenshot"},
+    "personal_companion": {"document", "image", "screenshot"},
+}
+_SURFACE_ARTIFACT_CONTENT_CLASSES = {
+    "dev": {"document", "code"},
+    "vscode": {"document", "code"},
+    "web": {"document", "code", "image", "screenshot"},
+}
+_ARTIFACT_CONTENT_CLASS_ORDER = (
+    "document",
+    "code",
+    "image",
+    "screenshot",
+    "audio",
+    "video",
+    "other",
+)
 _TECHNICAL_MARKERS = (
     "code",
     "repo",
@@ -367,6 +388,41 @@ def _sorted_domains(values: set[str]) -> list[str]:
     return sorted(value for value in values if value)
 
 
+def _ordered_artifact_classes(values: set[str]) -> list[str]:
+    return [value for value in _ARTIFACT_CONTENT_CLASS_ORDER if value in values]
+
+
+def _artifact_access_policy(
+    *,
+    persona_id: str,
+    surface: str,
+    allowed_memory_domains: list[str],
+    cross_scope_access_allowed: bool,
+) -> ArtifactAccessPolicy:
+    persona_classes = set(_PERSONA_ARTIFACT_CONTENT_CLASSES.get(persona_id, set()))
+    surface_classes = set(_SURFACE_ARTIFACT_CONTENT_CLASSES.get(surface, set()))
+    allowed_classes = persona_classes & surface_classes
+    reason_codes = ["artifact_policy_applied", "restricted_artifact_access_blocked"]
+
+    if persona_classes != set(_ARTIFACT_CONTENT_CLASS_ORDER):
+        reason_codes.append("persona_content_class_limited")
+    if surface not in _SURFACE_ARTIFACT_CONTENT_CLASSES:
+        reason_codes.append("unknown_surface_no_artifact_access")
+    elif surface_classes != set(_ARTIFACT_CONTENT_CLASS_ORDER):
+        reason_codes.append("surface_content_class_limited")
+    if cross_scope_access_allowed:
+        reason_codes.append("cross_scope_domain_authorized")
+
+    return ArtifactAccessPolicy(
+        enforcement_mode="mandatory",
+        allowed_content_classes=_ordered_artifact_classes(allowed_classes),
+        allowed_domains=allowed_memory_domains,
+        maximum_sensitivity="high" if surface in _SURFACE_ARTIFACT_CONTENT_CLASSES else "low",
+        surface_content_capabilities=_ordered_artifact_classes(surface_classes),
+        reason_codes=reason_codes[:8],
+    )
+
+
 def evaluate_persona_containment(
     body: PersonaContainmentEvaluateRequest,
 ) -> PersonaContainmentEvaluateResponse:
@@ -435,19 +491,27 @@ def evaluate_persona_containment(
         reason_summary.append("domain_not_policy_mapped")
 
     blocked_domains = (set(_SEEDED_DOMAINS) - allowed_domains) | extra_blocked_domains
+    sorted_allowed_domains = _sorted_domains(set(allowed_domains))
+    artifact_access_policy = _artifact_access_policy(
+        persona_id=persona_id,
+        surface=body.surface,
+        allowed_memory_domains=sorted_allowed_domains,
+        cross_scope_access_allowed=cross_scope_access_allowed,
+    )
 
     result = PersonaContainmentResult(
         active_persona_id=persona_id,
         capability_domain=capability_domain,
-        allowed_memory_domains=_sorted_domains(set(allowed_domains)),
+        allowed_memory_domains=sorted_allowed_domains,
         blocked_memory_domains=_sorted_domains(blocked_domains),
-        allowed_world_state_domains=_sorted_domains(set(allowed_domains)),
-        allowed_relationship_domains=_sorted_domains(set(allowed_domains)),
-        allowed_tool_domains=_sorted_domains(set(allowed_domains)),
+        allowed_world_state_domains=sorted_allowed_domains,
+        allowed_relationship_domains=sorted_allowed_domains,
+        allowed_tool_domains=sorted_allowed_domains,
         cross_scope_access_allowed=cross_scope_access_allowed,
         cross_scope_reason=cross_scope_reason,
         confidence=0.82 if raw_text else 0.46,
         reason_summary=reason_summary[:8] or ["default_fallback"],
+        artifact_access_policy=artifact_access_policy,
     )
 
     record_runtime_event(
@@ -461,6 +525,7 @@ def evaluate_persona_containment(
             "allowed_memory_domains": result.allowed_memory_domains,
             "blocked_memory_domains": result.blocked_memory_domains,
             "allowed_tool_domains": result.allowed_tool_domains,
+            "artifact_access_policy": result.artifact_access_policy.model_dump(),
             "cross_scope_access_allowed": result.cross_scope_access_allowed,
             "cross_scope_reason": result.cross_scope_reason,
             "reason_summary": result.reason_summary,
