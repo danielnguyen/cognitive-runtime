@@ -17,12 +17,10 @@ from models import (
     InterruptEvaluateResponse,
     MemoryHygieneEvaluateRequest,
     MemoryHygieneEvaluateResponse,
-    PrivacyContextEvaluateRequest,
-    PrivacyContextEvaluateResponse,
     PersonaContainmentEvaluateRequest,
     PersonaContainmentEvaluateResponse,
-    RestraintEvaluateRequest,
-    RestraintEvaluateResponse,
+    PrivacyContextEvaluateRequest,
+    PrivacyContextEvaluateResponse,
     RelationshipDiagnosticsResponse,
     RelationshipEdgeConfirmRequest,
     RelationshipEdgeResponse,
@@ -35,6 +33,8 @@ from models import (
     RelationshipSelectResponse,
     RepairSimulateRequest,
     RepairSimulateResponse,
+    RestraintEvaluateRequest,
+    RestraintEvaluateResponse,
     RuntimeIdentityResolveRequest,
     RuntimeIdentityResolveResponse,
     RuntimeOverlayResponse,
@@ -85,9 +85,8 @@ from services.interaction_diagnostics import (
 from services.interaction_governance import evaluate_interaction_governance
 from services.interrupt_policy import evaluate_interrupt_policy
 from services.memory_hygiene import evaluate_memory_hygiene
-from services.privacy_context import evaluate_privacy_context
 from services.persona_containment import evaluate_persona_containment
-from services.restraint import evaluate_restraint
+from services.privacy_context import evaluate_privacy_context
 from services.relationships import (
     confirm_relationship_edge,
     get_relationship_diagnostics,
@@ -98,6 +97,7 @@ from services.relationships import (
     upsert_relationship_edge,
     upsert_relationship_entity,
 )
+from services.restraint import evaluate_restraint
 from services.runtime_identity import resolve_runtime_identity
 from services.runtime_state import (
     build_overlay,
@@ -123,6 +123,29 @@ from services.world_state import (
 )
 
 app = FastAPI(title="Cognitive Runtime", version="0.1.0")
+
+
+_RELATIONSHIP_DOMAIN_ERROR_STATUS = {
+    "relationship_source_refs_required": 400,
+    "model_inference_cannot_create_active_relationship": 400,
+    "model_inference_socialish_relationship_requires_confirmation": 400,
+    "relationship_confirmation_evidence_required": 400,
+    "social_context_source_refs_required": 400,
+    "trusted_provenance_required_for_active_socialish_relationship": 403,
+    "relationship_entity_not_found": 404,
+    "relationship_edge_not_found": 404,
+    "social_context_item_not_found": 404,
+    "relationship_edge_status_not_confirmable": 409,
+    "social_context_requires_approved_relationship_edge": 409,
+}
+
+
+def _relationship_domain_http_error(exc: RuntimeError) -> HTTPException | None:
+    detail = str(exc)
+    status_code = _RELATIONSHIP_DOMAIN_ERROR_STATUS.get(detail)
+    if status_code is None:
+        return None
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 @app.get("/healthz")
@@ -337,21 +360,43 @@ async def relationship_entity_upsert(
 async def relationship_edge_upsert(
     body: RelationshipEdgeUpsertRequest,
 ) -> RelationshipEdgeResponse:
-    return upsert_relationship_edge(owner_id=body.owner_id, edge=body.edge, evidence=body.evidence)
+    try:
+        return upsert_relationship_edge(
+            owner_id=body.owner_id,
+            edge=body.edge,
+            evidence=body.evidence,
+        )
+    except RuntimeError as exc:
+        http_error = _relationship_domain_http_error(exc)
+        if http_error is None:
+            raise
+        raise http_error from exc
 
 
 @app.post("/v1/relationships/edges/confirm", response_model=RelationshipEdgeResponse)
 async def relationship_edge_confirm(
     body: RelationshipEdgeConfirmRequest,
 ) -> RelationshipEdgeResponse:
-    return confirm_relationship_edge(owner_id=body.owner_id, body=body)
+    try:
+        return confirm_relationship_edge(owner_id=body.owner_id, body=body)
+    except RuntimeError as exc:
+        http_error = _relationship_domain_http_error(exc)
+        if http_error is None:
+            raise
+        raise http_error from exc
 
 
 @app.post("/v1/relationships/edges/revoke", response_model=RelationshipEdgeResponse)
 async def relationship_edge_revoke(
     body: RelationshipEdgeRevokeRequest,
 ) -> RelationshipEdgeResponse:
-    return revoke_relationship_edge(owner_id=body.owner_id, body=body)
+    try:
+        return revoke_relationship_edge(owner_id=body.owner_id, body=body)
+    except RuntimeError as exc:
+        http_error = _relationship_domain_http_error(exc)
+        if http_error is None:
+            raise
+        raise http_error from exc
 
 
 @app.get("/v1/relationships/entities/{entity_id}", response_model=RelationshipEntityResponse)
@@ -386,7 +431,13 @@ async def relationship_select(body: RelationshipSelectRequest) -> RelationshipSe
 async def social_context_item_upsert(
     body: SocialContextItemUpsertRequest,
 ) -> SocialContextItemResponse:
-    item = upsert_social_context_item(owner_id=body.owner_id, item=body.item)
+    try:
+        item = upsert_social_context_item(owner_id=body.owner_id, item=body.item)
+    except RuntimeError as exc:
+        http_error = _relationship_domain_http_error(exc)
+        if http_error is None:
+            raise
+        raise http_error from exc
     return SocialContextItemResponse(item=item)
 
 
@@ -394,7 +445,13 @@ async def social_context_item_upsert(
 async def social_context_usage_event_record(
     body: SocialContextUsageEventRecordRequest,
 ) -> SocialContextUsageEventResponse:
-    event = record_social_context_usage_event(owner_id=body.owner_id, event=body.event)
+    try:
+        event = record_social_context_usage_event(owner_id=body.owner_id, event=body.event)
+    except RuntimeError as exc:
+        http_error = _relationship_domain_http_error(exc)
+        if http_error is None:
+            raise
+        raise http_error from exc
     return SocialContextUsageEventResponse(event=event)
 
 
