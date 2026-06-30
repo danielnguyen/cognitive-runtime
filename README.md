@@ -143,3 +143,14 @@ cd api && ./.venv/bin/python scripts/bootstrap_relationships.py config/relations
 ```
 
 The bootstrap script is idempotent for seeded entities, relationships, and duplicate evidence records. It is bootstrap tooling only and does not perform runtime inference, retrieval filtering, or social-context creation.
+
+## Relationship and social-context mutation errors
+
+The relationship and social-context mutation endpoints return bounded error bodies for expected policy failures:
+
+- `400`: `relationship_source_refs_required`, `model_inference_cannot_create_active_relationship`, `model_inference_socialish_relationship_requires_confirmation`, `relationship_confirmation_evidence_required`, `social_context_source_refs_required`
+- `403`: `trusted_provenance_required_for_active_socialish_relationship`
+- `404`: `relationship_entity_not_found`, `relationship_edge_not_found`, `social_context_item_not_found`
+- `409`: `relationship_edge_status_not_confirmable`, `social_context_requires_approved_relationship_edge`
+
+Error responses use `{"detail": "<reason_code>"}` and do not include entity labels, evidence summaries, source refs, storage details, stack traces, or unrelated record IDs. Unknown runtime failures are not converted into these public reason codes.
