@@ -653,17 +653,44 @@ def test_relationship_select_enforces_scope_confidence_and_mentionability_rules(
 def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry_cases():
     client = TestClient(app)
     _seed_entities(client)
+    for entity_id, label in (
+        ("repo:revoked", "revoked repo marker"),
+        ("repo:superseded", "superseded repo marker"),
+        ("repo:expired", "expired repo marker"),
+        ("repo:restricted", "restricted repo marker"),
+        ("repo:low-confidence", "low confidence repo marker"),
+        ("repo:blocked-persona", "blocked persona repo marker"),
+        ("repo:outside-scope", "outside scope repo marker"),
+    ):
+        client.post(
+            "/v1/relationships/entities/upsert",
+            json={
+                **_base(),
+                "entity": _entity(entity_id, label=label, entity_type="repository"),
+            },
+        )
     revoked = client.post(
         "/v1/relationships/edges/upsert",
         json={
             **_base(),
-            "edge": _edge(status="revoked", relationship_type="works_on"),
+            "edge": _edge(
+                object_entity_id="repo:revoked",
+                status="revoked",
+                relationship_type="works_on",
+            ),
             "evidence": [],
         },
     ).json()["relationship"]
     active_then_superseded = client.post(
         "/v1/relationships/edges/upsert",
-        json={**_base(), "edge": _edge(relationship_type="contains"), "evidence": []},
+        json={
+            **_base(),
+            "edge": _edge(
+                object_entity_id="repo:superseded",
+                relationship_type="contains",
+            ),
+            "evidence": [],
+        },
     ).json()["relationship"]
     superseding = client.post(
         "/v1/relationships/edges/upsert",
@@ -681,7 +708,11 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
         "/v1/relationships/edges/upsert",
         json={
             **_base(),
-            "edge": _edge(relationship_type="documents", valid_until=_iso(-60)),
+            "edge": _edge(
+                object_entity_id="repo:expired",
+                relationship_type="documents",
+                valid_until=_iso(-60),
+            ),
             "evidence": [],
         },
     ).json()["relationship"]
@@ -689,7 +720,11 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
         "/v1/relationships/edges/upsert",
         json={
             **_base(),
-            "edge": _edge(relationship_type="references", mentionability="restricted"),
+            "edge": _edge(
+                object_entity_id="repo:restricted",
+                relationship_type="references",
+                mentionability="restricted",
+            ),
             "evidence": [],
         },
     ).json()["relationship"]
@@ -698,6 +733,7 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
         json={
             **_base(),
             "edge": _edge(
+                object_entity_id="repo:low-confidence",
                 relationship_type="depends_on",
                 confidence=0.4,
                 source_type="tool_output",
@@ -710,6 +746,7 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
         json={
             **_base(),
             "edge": _edge(
+                object_entity_id="repo:blocked-persona",
                 relationship_type="responsible_for",
                 blocked_persona_scopes_json=["technical_architect"],
             ),
@@ -721,6 +758,7 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
         json={
             **_base(),
             "edge": _edge(
+                object_entity_id="repo:outside-scope",
                 relationship_type="related_to",
                 relationship_scope="personal_context",
             ),
@@ -747,19 +785,29 @@ def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry
     assert reasons[low_confidence["relationship_id"]] == "below_confidence_threshold"
     assert reasons[blocked_persona["relationship_id"]] == "blocked_persona_scope"
     assert reasons[outside_scope["relationship_id"]] == "outside_persona_or_surface_scope"
+    assert body["trace"]["relationship_confirmation_required"] is True
     selected_ids = {item["relationship_id"] for item in body["selected_relationships"]}
     assert selected_ids == {superseding["relationship_id"]}
     prompt = body["prompt_content"] or ""
-    for relationship in (
-        revoked,
-        active_then_superseded,
-        expired,
-        restricted,
-        low_confidence,
-        blocked_persona,
-        outside_scope,
+    assert "Project Alpha contains Repo Beta" in prompt
+    assert "scope=project_context" in prompt
+    assert "confidence=0.80" in prompt
+    for excluded_prompt_value in (
+        "Revoked Repo Marker",
+        "Superseded Repo Marker",
+        "Expired Repo Marker",
+        "Restricted Repo Marker",
+        "Low Confidence Repo Marker",
+        "Blocked Persona Repo Marker",
+        "Outside Scope Repo Marker",
+        "works_on",
+        "documents",
+        "references",
+        "depends_on",
+        "responsible_for",
+        "related_to",
     ):
-        assert relationship["relationship_id"] not in prompt
+        assert excluded_prompt_value not in prompt
 
 
 def test_relationship_select_excludes_conflicted_relationships_without_winner_selection():
@@ -812,6 +860,7 @@ def test_relationship_select_excludes_conflicted_relationships_without_winner_se
         == "conflicted"
     )
     assert body["trace"]["relationship_conflicts"]
+    assert body["trace"]["relationship_confirmation_required"] is True
     assert body["prompt_content"] is None
 
 
