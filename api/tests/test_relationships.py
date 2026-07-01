@@ -588,6 +588,22 @@ def test_diagnostics_ignore_include_restricted_details_without_authorization():
 def test_relationship_select_enforces_scope_confidence_and_mentionability_rules():
     client = TestClient(app)
     _seed_entities(client)
+    for entity_id, label, entity_type in (
+        ("project:suppressed", "suppressed project marker", "project"),
+        ("repo:suppressed", "suppressed repo marker", "repository"),
+    ):
+        client.post(
+            "/v1/relationships/entities/upsert",
+            json={
+                **_base(),
+                "entity": _entity(
+                    entity_id,
+                    label=label,
+                    entity_type=entity_type,
+                    domain="operations_context",
+                ),
+            },
+        )
     active = client.post(
         "/v1/relationships/edges/upsert",
         json={**_base(), "edge": _edge(), "evidence": []},
@@ -620,13 +636,28 @@ def test_relationship_select_enforces_scope_confidence_and_mentionability_rules(
             "evidence": [],
         },
     ).json()["relationship"]
+    suppressed = client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base(),
+            "edge": _edge(
+                relationship_id="rel_suppressed_mixed",
+                subject_entity_id="project:suppressed",
+                object_entity_id="repo:suppressed",
+                relationship_type="maintains",
+                relationship_scope="operations_context",
+                mentionability="suppress_by_default",
+            ),
+            "evidence": [],
+        },
+    ).json()["relationship"]
 
     response = client.post(
         "/v1/relationships/select",
         json={
             **_base(),
             "active_persona_id": "technical_architect",
-            "requested_scopes": ["project_context"],
+            "requested_scopes": ["project_context", "operations_context"],
         },
     )
 
@@ -638,6 +669,7 @@ def test_relationship_select_enforces_scope_confidence_and_mentionability_rules(
     assert low_conf["relationship_id"] not in ids
     assert routing_only["relationship_id"] in ids
     assert restricted["relationship_id"] not in ids
+    assert suppressed["relationship_id"] not in ids
     assert "use_for_routing_only" not in (body["prompt_content"] or "")
     projection = body["retrieval_scope_projection"]
     assert projection == {
@@ -655,6 +687,10 @@ def test_relationship_select_enforces_scope_confidence_and_mentionability_rules(
     assert "depends_on" not in str(projection)
     assert "config:project-alpha" not in str(projection)
     assert "Project Alpha" not in str(projection)
+    assert suppressed["relationship_id"] not in projection["relationship_ids"]
+    assert "project:suppressed" not in projection["entity_ids"]
+    assert "repo:suppressed" not in projection["entity_ids"]
+    assert "operations_context" not in projection["relationship_scopes"]
     assert low_conf["relationship_id"] in body["trace"]["relationship_edges_excluded"]
     assert (
         body["trace"]["relationship_exclusion_reasons"][low_conf["relationship_id"]]
@@ -664,6 +700,12 @@ def test_relationship_select_enforces_scope_confidence_and_mentionability_rules(
         body["trace"]["relationship_exclusion_reasons"][restricted["relationship_id"]]
         == "authorization_required"
     )
+    assert suppressed["relationship_id"] in body["trace"]["relationship_edges_excluded"]
+    assert (
+        body["trace"]["relationship_exclusion_reasons"][suppressed["relationship_id"]]
+        == "suppressed_by_default"
+    )
+    assert suppressed["relationship_id"] not in body["trace"]["relationship_edges_used"]
 
 
 def test_relationship_select_excludes_status_scope_confidence_persona_and_expiry_cases():
@@ -936,6 +978,74 @@ def test_relationship_select_excludes_conflicted_relationships_without_winner_se
         "relationship_scopes": [],
         "reason_codes": ["no_eligible_relationship_scope"],
     }
+
+
+def test_suppress_by_default_relationship_is_excluded_from_retrieval_projection():
+    client = TestClient(app)
+    for entity_id, label, entity_type in (
+        ("project:suppress-only", "suppress only project marker", "project"),
+        ("repo:suppress-only", "suppress only repo marker", "repository"),
+    ):
+        client.post(
+            "/v1/relationships/entities/upsert",
+            json={
+                **_base(),
+                "entity": _entity(
+                    entity_id,
+                    label=label,
+                    entity_type=entity_type,
+                    domain="operations_context",
+                ),
+            },
+        )
+    suppressed = client.post(
+        "/v1/relationships/edges/upsert",
+        json={
+            **_base(),
+            "edge": _edge(
+                relationship_id="rel_suppress_only",
+                subject_entity_id="project:suppress-only",
+                object_entity_id="repo:suppress-only",
+                relationship_type="maintains",
+                relationship_scope="operations_context",
+                mentionability="suppress_by_default",
+            ),
+            "evidence": [],
+        },
+    ).json()["relationship"]
+
+    response = client.post(
+        "/v1/relationships/select",
+        json={
+            **_base(),
+            "active_persona_id": "technical_architect",
+            "requested_scopes": ["operations_context"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    relationship_id = suppressed["relationship_id"]
+    assert body["selected_relationships"] == []
+    assert body["prompt_content"] is None
+    assert body["retrieval_scope_projection"] == {
+        "applied": False,
+        "relationship_ids": [],
+        "entity_ids": [],
+        "relationship_scopes": [],
+        "reason_codes": ["no_eligible_relationship_scope"],
+    }
+    excluded_ids = {
+        item["relationship_id"]
+        for item in body["excluded_relationship_summaries"]
+    }
+    assert relationship_id in excluded_ids
+    assert relationship_id in body["trace"]["relationship_edges_excluded"]
+    assert (
+        body["trace"]["relationship_exclusion_reasons"][relationship_id]
+        == "suppressed_by_default"
+    )
+    assert relationship_id not in body["trace"]["relationship_edges_used"]
 
 
 def test_relationship_select_allows_multiple_contains_edges_without_conflict():

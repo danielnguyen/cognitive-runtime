@@ -46,6 +46,11 @@ _SOCIALISH_RELATIONSHIP_TYPES = {"colleague_of", "collaborates_with"}
 _TERMINAL_EDGE_STATUSES = {"revoked", "superseded", "expired"}
 _RESTRICTED_SENSITIVITY_LEVELS = {"high", "restricted"}
 _CONFLICT_ELIGIBLE_RELATIONSHIP_TYPES = {"defaults_to", "bound_to"}
+_RETRIEVAL_ELIGIBLE_MENTIONABILITY = {
+    "mentionable",
+    "use_for_routing_only",
+    "use_for_filtering_only",
+}
 _RELATIONSHIP_SCOPE_ALLOWLISTS: dict[str, set[str]] = {
     "general_assistant": {
         "professional_context",
@@ -138,7 +143,12 @@ def _is_model_inference(edge: RelationshipEdgeInput) -> bool:
 def _retrieval_scope_projection(
     selected: list[RelationshipEdgeView],
 ) -> RelationshipRetrievalScopeProjection:
-    if not selected:
+    eligible = [
+        edge
+        for edge in selected
+        if edge.mentionability in _RETRIEVAL_ELIGIBLE_MENTIONABILITY
+    ]
+    if not eligible:
         return RelationshipRetrievalScopeProjection(
             applied=False,
             relationship_ids=[],
@@ -148,13 +158,13 @@ def _retrieval_scope_projection(
         )
     entity_ids: set[str] = set()
     relationship_scopes: set[str] = set()
-    for edge in selected:
+    for edge in eligible:
         entity_ids.add(edge.subject_entity_id)
         entity_ids.add(edge.object_entity_id)
         relationship_scopes.add(edge.relationship_scope)
     return RelationshipRetrievalScopeProjection(
         applied=True,
-        relationship_ids=[edge.relationship_id for edge in selected],
+        relationship_ids=[edge.relationship_id for edge in eligible],
         entity_ids=sorted(entity_ids),
         relationship_scopes=sorted(relationship_scopes),
         reason_codes=["eligible_relationship_scope_selected"],
@@ -574,6 +584,8 @@ class RelationshipRepository:
             elif edge.sensitivity_level in _RESTRICTED_SENSITIVITY_LEVELS:
                 confirmation_required = True
                 reason = "authorization_required"
+            elif edge.mentionability == "suppress_by_default":
+                reason = "suppressed_by_default"
             elif edge.mentionability in {"confirm_before_mentioning", "restricted"}:
                 confirmation_required = True
                 reason = "authorization_required"
