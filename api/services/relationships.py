@@ -17,14 +17,14 @@ from models import (
     RelationshipEdgeRevokeRequest,
     RelationshipEdgeView,
     RelationshipEntityInput,
-    RelationshipEntityResponse,
     RelationshipEntityView,
     RelationshipExcludedSummary,
     RelationshipGraphDiagnosticsRequest,
-    RelationshipStatus,
+    RelationshipRetrievalScopeProjection,
     RelationshipSelectRequest,
     RelationshipSelectResponse,
     RelationshipSelectTrace,
+    RelationshipStatus,
     RuntimeIdentityResolveRequest,
 )
 from services.companion_contracts import companion_contracts_repository
@@ -46,6 +46,11 @@ _SOCIALISH_RELATIONSHIP_TYPES = {"colleague_of", "collaborates_with"}
 _TERMINAL_EDGE_STATUSES = {"revoked", "superseded", "expired"}
 _RESTRICTED_SENSITIVITY_LEVELS = {"high", "restricted"}
 _CONFLICT_ELIGIBLE_RELATIONSHIP_TYPES = {"defaults_to", "bound_to"}
+_RETRIEVAL_ELIGIBLE_MENTIONABILITY = {
+    "mentionable",
+    "use_for_routing_only",
+    "use_for_filtering_only",
+}
 _RELATIONSHIP_SCOPE_ALLOWLISTS: dict[str, set[str]] = {
     "general_assistant": {
         "professional_context",
@@ -133,6 +138,37 @@ def _is_expired(valid_until: str | None, *, now: datetime) -> bool:
 
 def _is_model_inference(edge: RelationshipEdgeInput) -> bool:
     return edge.source_type == "model_inference"
+
+
+def _retrieval_scope_projection(
+    selected: list[RelationshipEdgeView],
+) -> RelationshipRetrievalScopeProjection:
+    eligible = [
+        edge
+        for edge in selected
+        if edge.mentionability in _RETRIEVAL_ELIGIBLE_MENTIONABILITY
+    ]
+    if not eligible:
+        return RelationshipRetrievalScopeProjection(
+            applied=False,
+            relationship_ids=[],
+            entity_ids=[],
+            relationship_scopes=[],
+            reason_codes=["no_eligible_relationship_scope"],
+        )
+    entity_ids: set[str] = set()
+    relationship_scopes: set[str] = set()
+    for edge in eligible:
+        entity_ids.add(edge.subject_entity_id)
+        entity_ids.add(edge.object_entity_id)
+        relationship_scopes.add(edge.relationship_scope)
+    return RelationshipRetrievalScopeProjection(
+        applied=True,
+        relationship_ids=[edge.relationship_id for edge in eligible],
+        entity_ids=sorted(entity_ids),
+        relationship_scopes=sorted(relationship_scopes),
+        reason_codes=["eligible_relationship_scope_selected"],
+    )
 
 
 class RelationshipRepository:
@@ -267,7 +303,10 @@ class RelationshipRepository:
                 for item in evidence
             ]
             row = conn.execute(
-                "SELECT * FROM relationship_edges WHERE owner_id = ? AND relationship_id = ? LIMIT 1;",
+                """
+                SELECT * FROM relationship_edges
+                WHERE owner_id = ? AND relationship_id = ? LIMIT 1;
+                """,
                 (owner_id, relationship_id),
             ).fetchone()
         assert row is not None
@@ -300,10 +339,17 @@ class RelationshipRepository:
             evidence_views: list[RelationshipEdgeEvidenceView] = []
             if body.evidence is not None:
                 evidence_views.append(
-                    self._insert_evidence(conn, relationship_id=body.relationship_id, evidence=body.evidence)
+                    self._insert_evidence(
+                        conn,
+                        relationship_id=body.relationship_id,
+                        evidence=body.evidence,
+                    )
                 )
             updated = conn.execute(
-                "SELECT * FROM relationship_edges WHERE owner_id = ? AND relationship_id = ? LIMIT 1;",
+                """
+                SELECT * FROM relationship_edges
+                WHERE owner_id = ? AND relationship_id = ? LIMIT 1;
+                """,
                 (owner_id, body.relationship_id),
             ).fetchone()
         assert updated is not None
@@ -326,11 +372,17 @@ class RelationshipRepository:
             existing_entity_ids = self._entity_ids_for_owner(conn, owner_id=owner_id)
             seed_entity_ids = {entity.entity_id for entity in entities}
             for edge, _ in relationships:
-                if edge.subject_entity_id not in seed_entity_ids and edge.subject_entity_id not in existing_entity_ids:
+                if (
+                    edge.subject_entity_id not in seed_entity_ids
+                    and edge.subject_entity_id not in existing_entity_ids
+                ):
                     raise RuntimeError(
                         f"relationship_subject_entity_missing:{edge.relationship_id}:{edge.subject_entity_id}"
                     )
-                if edge.object_entity_id not in seed_entity_ids and edge.object_entity_id not in existing_entity_ids:
+                if (
+                    edge.object_entity_id not in seed_entity_ids
+                    and edge.object_entity_id not in existing_entity_ids
+                ):
                     raise RuntimeError(
                         f"relationship_object_entity_missing:{edge.relationship_id}:{edge.object_entity_id}"
                     )
@@ -404,10 +456,17 @@ class RelationshipRepository:
             evidence_views: list[RelationshipEdgeEvidenceView] = []
             if body.evidence is not None:
                 evidence_views.append(
-                    self._insert_evidence(conn, relationship_id=body.relationship_id, evidence=body.evidence)
+                    self._insert_evidence(
+                        conn,
+                        relationship_id=body.relationship_id,
+                        evidence=body.evidence,
+                    )
                 )
             updated = conn.execute(
-                "SELECT * FROM relationship_edges WHERE owner_id = ? AND relationship_id = ? LIMIT 1;",
+                """
+                SELECT * FROM relationship_edges
+                WHERE owner_id = ? AND relationship_id = ? LIMIT 1;
+                """,
                 (owner_id, body.relationship_id),
             ).fetchone()
         assert updated is not None
@@ -425,7 +484,10 @@ class RelationshipRepository:
     ) -> RelationshipEdgeView | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM relationship_edges WHERE owner_id = ? AND relationship_id = ? LIMIT 1;",
+                """
+                SELECT * FROM relationship_edges
+                WHERE owner_id = ? AND relationship_id = ? LIMIT 1;
+                """,
                 (owner_id, relationship_id),
             ).fetchone()
         if row is None:
@@ -445,14 +507,18 @@ class RelationshipRepository:
                 (owner_id,),
             ).fetchall()
             edge_rows = conn.execute(
-                "SELECT * FROM relationship_edges WHERE owner_id = ? ORDER BY created_at, relationship_id;",
+                """
+                SELECT * FROM relationship_edges
+                WHERE owner_id = ? ORDER BY created_at, relationship_id;
+                """,
                 (owner_id,),
             ).fetchall()
             evidence_rows = conn.execute(
                 """
                 SELECT relationship_evidence.*, relationship_edges.sensitivity_level
                 FROM relationship_evidence
-                JOIN relationship_edges ON relationship_edges.relationship_id = relationship_evidence.relationship_id
+                JOIN relationship_edges
+                  ON relationship_edges.relationship_id = relationship_evidence.relationship_id
                 WHERE relationship_edges.owner_id = ?
                 ORDER BY relationship_evidence.created_at, relationship_evidence.evidence_id;
                 """,
@@ -495,7 +561,11 @@ class RelationshipRepository:
 
         for edge in relationships:
             reason: str | None = None
-            if body.entity_ids and edge.subject_entity_id not in body.entity_ids and edge.object_entity_id not in body.entity_ids:
+            if (
+                body.entity_ids
+                and edge.subject_entity_id not in body.entity_ids
+                and edge.object_entity_id not in body.entity_ids
+            ):
                 reason = "filtered_entity_id"
             elif body.relationship_types and edge.relationship_type not in body.relationship_types:
                 reason = "filtered_relationship_type"
@@ -514,12 +584,17 @@ class RelationshipRepository:
             elif edge.sensitivity_level in _RESTRICTED_SENSITIVITY_LEVELS:
                 confirmation_required = True
                 reason = "authorization_required"
+            elif edge.mentionability == "suppress_by_default":
+                reason = "suppressed_by_default"
             elif edge.mentionability in {"confirm_before_mentioning", "restricted"}:
                 confirmation_required = True
                 reason = "authorization_required"
             elif edge.confidence < 0.75 and edge.source_type not in _THRESHOLD_EXEMPT_SOURCES:
                 reason = "below_confidence_threshold"
-            elif edge.allowed_persona_scopes_json and persona_id not in edge.allowed_persona_scopes_json:
+            elif (
+                edge.allowed_persona_scopes_json
+                and persona_id not in edge.allowed_persona_scopes_json
+            ):
                 reason = "outside_persona_scope"
             elif persona_id in edge.blocked_persona_scopes_json:
                 reason = "blocked_persona_scope"
@@ -544,8 +619,14 @@ class RelationshipRepository:
 
             selected.append(edge)
             if edge.mentionability == "mentionable":
-                subject_label = self._entity_label(entity_map.get(edge.subject_entity_id), edge.subject_entity_id)
-                object_label = self._entity_label(entity_map.get(edge.object_entity_id), edge.object_entity_id)
+                subject_label = self._entity_label(
+                    entity_map.get(edge.subject_entity_id),
+                    edge.subject_entity_id,
+                )
+                object_label = self._entity_label(
+                    entity_map.get(edge.object_entity_id),
+                    edge.object_entity_id,
+                )
                 prompt_lines.append(
                     (
                         f"- {subject_label} {edge.relationship_type} {object_label} "
@@ -580,8 +661,13 @@ class RelationshipRepository:
             selected_entities=selected_entities,
             selected_relationships=selected,
             excluded_relationship_summaries=excluded,
-            prompt_content="Relationship context:\n" + "\n".join(prompt_lines) if prompt_lines else None,
+            prompt_content=(
+                "Relationship context:\n" + "\n".join(prompt_lines)
+                if prompt_lines
+                else None
+            ),
             trace=trace,
+            retrieval_scope_projection=_retrieval_scope_projection(selected),
         )
 
     def _validate_edge_input(self, edge: RelationshipEdgeInput) -> None:
@@ -773,7 +859,13 @@ class RelationshipRepository:
                 return "needs_confirmation"
         return status
 
-    def _require_entity(self, conn: sqlite3.Connection, *, owner_id: str, entity_id: str) -> sqlite3.Row:
+    def _require_entity(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        entity_id: str,
+    ) -> sqlite3.Row:
         row = conn.execute(
             "SELECT * FROM relationship_entities WHERE owner_id = ? AND entity_id = ? LIMIT 1;",
             (owner_id, entity_id),
@@ -849,7 +941,8 @@ class RelationshipRepository:
             """
             SELECT relationship_evidence.*, relationship_edges.sensitivity_level
             FROM relationship_evidence
-            JOIN relationship_edges ON relationship_edges.relationship_id = relationship_evidence.relationship_id
+            JOIN relationship_edges
+              ON relationship_edges.relationship_id = relationship_evidence.relationship_id
             WHERE evidence_id = ? LIMIT 1;
             """,
             (evidence_id,),
@@ -868,7 +961,8 @@ class RelationshipRepository:
             """
             SELECT relationship_evidence.*, relationship_edges.sensitivity_level
             FROM relationship_evidence
-            JOIN relationship_edges ON relationship_edges.relationship_id = relationship_evidence.relationship_id
+            JOIN relationship_edges
+              ON relationship_edges.relationship_id = relationship_evidence.relationship_id
             WHERE relationship_evidence.relationship_id = ?
               AND relationship_evidence.evidence_type = ?
               AND relationship_evidence.source_ref = ?
@@ -918,7 +1012,10 @@ class RelationshipRepository:
         *,
         include_restricted_details: bool,
     ) -> RelationshipEdgeView:
-        restricted = row["sensitivity_level"] in _RESTRICTED_SENSITIVITY_LEVELS and not include_restricted_details
+        restricted = (
+            row["sensitivity_level"] in _RESTRICTED_SENSITIVITY_LEVELS
+            and not include_restricted_details
+        )
         source_refs = _load_json(row["source_refs_json"], [])
         return RelationshipEdgeView(
             relationship_id=row["relationship_id"],
@@ -950,7 +1047,10 @@ class RelationshipRepository:
         *,
         include_restricted_details: bool,
     ) -> RelationshipEdgeEvidenceView:
-        restricted = row["sensitivity_level"] in _RESTRICTED_SENSITIVITY_LEVELS and not include_restricted_details
+        restricted = (
+            row["sensitivity_level"] in _RESTRICTED_SENSITIVITY_LEVELS
+            and not include_restricted_details
+        )
         return RelationshipEdgeEvidenceView(
             evidence_id=row["evidence_id"],
             relationship_id=row["relationship_id"],

@@ -486,6 +486,29 @@ class PersonaContainmentEvaluateRequest(BaseModel):
     surface_metadata_json: dict[str, Any] = Field(default_factory=dict)
 
 
+ArtifactContentClass = Literal[
+    "document",
+    "code",
+    "image",
+    "screenshot",
+    "audio",
+    "video",
+    "other",
+]
+
+
+class ArtifactAccessPolicy(BaseModel):
+    enforcement_mode: Literal["mandatory"] = "mandatory"
+    allowed_content_classes: list[ArtifactContentClass] = Field(default_factory=list, max_length=8)
+    allowed_domains: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    maximum_sensitivity: WorldStateSensitivity
+    surface_content_capabilities: list[ArtifactContentClass] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+    reason_codes: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+
+
 class PersonaContainmentResult(BaseModel):
     active_persona_id: str = Field(max_length=120)
     capability_domain: BoundedLabel
@@ -498,6 +521,7 @@ class PersonaContainmentResult(BaseModel):
     cross_scope_reason: BoundedLabel
     confidence: float = Field(ge=0.0, le=1.0)
     reason_summary: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+    artifact_access_policy: ArtifactAccessPolicy
 
 
 class PersonaContainmentEvaluateResponse(BaseModel):
@@ -570,7 +594,10 @@ class PersonaProfile(BaseModel):
     communication_policy_summary: list[BoundedRule] = Field(default_factory=list, max_length=8)
     runtime_policy_summary: list[BoundedRule] = Field(default_factory=list, max_length=8)
     advisory_memory_scope_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
-    advisory_tool_permission_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    advisory_tool_permission_summary: list[BoundedLabel] = Field(
+        default_factory=list,
+        max_length=12,
+    )
     persona_owns_durable_memory: Literal[False] = False
 
 
@@ -593,7 +620,10 @@ class RuntimeIdentityContext(BaseModel):
     communication_policy_summary: list[BoundedRule] = Field(default_factory=list, max_length=8)
     runtime_policy_summary: list[BoundedRule] = Field(default_factory=list, max_length=8)
     advisory_memory_scope_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
-    advisory_tool_permission_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    advisory_tool_permission_summary: list[BoundedLabel] = Field(
+        default_factory=list,
+        max_length=12,
+    )
     persona_owns_durable_memory: Literal[False] = False
     content: BoundedCompanionContent
 
@@ -612,7 +642,10 @@ class RuntimeIdentityTrace(BaseModel):
     surface_display_name: str = Field(max_length=120)
     persona_owns_durable_memory: Literal[False] = False
     advisory_memory_scope_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
-    advisory_tool_permission_summary: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    advisory_tool_permission_summary: list[BoundedLabel] = Field(
+        default_factory=list,
+        max_length=12,
+    )
 
 
 class RuntimeIdentityResolveRequest(RuntimeSessionResolveRequest):
@@ -1036,12 +1069,21 @@ class RelationshipSelectTrace(BaseModel):
     allowed_relationship_scopes: list[BoundedLabel] = Field(default_factory=list, max_length=16)
 
 
+class RelationshipRetrievalScopeProjection(BaseModel):
+    applied: bool = False
+    relationship_ids: list[str] = Field(default_factory=list, max_length=64)
+    entity_ids: list[str] = Field(default_factory=list, max_length=64)
+    relationship_scopes: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    reason_codes: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+
+
 class RelationshipSelectResponse(BaseModel):
     selected_entities: list[RelationshipEntityView] = Field(default_factory=list)
     selected_relationships: list[RelationshipEdgeView] = Field(default_factory=list)
     excluded_relationship_summaries: list[RelationshipExcludedSummary] = Field(default_factory=list)
     prompt_content: str | None = None
     trace: RelationshipSelectTrace
+    retrieval_scope_projection: RelationshipRetrievalScopeProjection
 
 
 class SocialContextItemInput(BaseModel):
@@ -1414,7 +1456,10 @@ class HumanCompatibilityReviewRequest(BaseModel):
         return self
 
     def _requires_review_notes(self) -> bool:
-        if any(flag.risk_type in _OPERATOR_RISK_NOTE_LABELS for flag in self.interaction_risk_flags):
+        if any(
+            flag.risk_type in _OPERATOR_RISK_NOTE_LABELS
+            for flag in self.interaction_risk_flags
+        ):
             return True
         if self.review_notes and _OPERATOR_RISK_NOTE_PATTERN.search(self.review_notes):
             return True
@@ -1427,7 +1472,10 @@ class HumanCompatibilityReviewView(BaseModel):
     request_id: str = Field(max_length=120)
     feature_ref: str = Field(max_length=240)
     spec_ref: str = Field(max_length=64)
-    review_surfaces: list[HumanCompatibilityReviewSurface] = Field(default_factory=list, max_length=8)
+    review_surfaces: list[HumanCompatibilityReviewSurface] = Field(
+        default_factory=list,
+        max_length=8,
+    )
     proposed_behavior_summary: BoundedText
     risk_level: HumanCompatibilityRiskLevel
     review_result: HumanCompatibilityReviewResult
