@@ -1,9 +1,19 @@
 # CCP Agent Instructions
 
-Use the canonical CCP workflow instructions from the sibling specifications repository before working in this repository:
+## Mandatory bootstrap
 
-`../projects/AGENTS.md`
+Before trusting local files, repository evidence, or a commit SHA named by a prompt:
 
-The canonical file defines spec-first planning, Git and pull-request semantics, efficient execution, review, validation, ownership boundaries, and completion reporting.
+- synchronize this repository and the sibling `../projects` repository from `origin`;
+- update only the declared base branches by fast-forward;
+- stop on unrelated local changes, fetch failure, unsafe divergence, or an unavailable remote baseline;
+- verify every referenced SHA in the repository where it is claimed to exist;
+- when a prompt says a SHA is merged into or contained by a branch, verify that it is reachable from that remote branch;
+- stop before editing or implementation when any verification fails. Do not proceed from stale local state.
 
-When the sibling file is unavailable, report that the canonical instructions could not be loaded before continuing.
+Then read and follow:
+
+- `../projects/process/repository-sync-preflight.md`
+- `../projects/AGENTS.md`
+
+These canonical files define the complete procedure and CCP workflow. If either cannot be loaded after synchronization, stop and report the missing governance source.
