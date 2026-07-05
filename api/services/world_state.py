@@ -11,6 +11,7 @@ from models import (
     RuntimeIdentityResolveRequest,
     WorldStateClaimInput,
     WorldStateClaimSummary,
+    WorldStateClaimVerifyRequest,
     WorldStateClaimView,
     WorldStateDiagnosticsResponse,
     WorldStateFreshnessState,
@@ -20,11 +21,29 @@ from models import (
 )
 from services.companion_contracts import companion_contracts_repository
 from services.runtime_identity import resolve_runtime_identity
-from services.runtime_state import runtime_state_db_path
+from services.runtime_state import (
+    record_runtime_event,
+    runtime_session_by_id,
+    runtime_state_db_path,
+    validate_runtime_turn_session,
+)
 
 _WORLD_STATE_REPOSITORY: WorldStateRepository | None = None
 _TERMINAL_FRESHNESS_STATES = {"expired", "superseded"}
 _SENSITIVE_LEVELS = {"high", "restricted"}
+_TRUSTED_VERIFICATION_SOURCES = {
+    "tool_output",
+    "integration_event",
+    "sensor_update",
+    "repository_inspection",
+    "calendar_event",
+    "automation_workflow",
+}
+_VERIFIED_AUTHORITIES = {
+    "verified_tool_output",
+    "trusted_integration_event",
+    "derived_from_multiple_sources",
+}
 _DOMAIN_ALLOWLISTS: dict[str, set[str]] = {
     "general_assistant": {"active_task", "active_project", "pending_action", "runtime_surface"},
     "technical_architect": {
@@ -116,6 +135,42 @@ def _material_value(value: Any) -> str:
     return _json(value)
 
 
+def _value_digest_from_material(material: str) -> str:
+    return f"wsvalue_{sha256(material.encode('utf-8')).hexdigest()}"
+
+
+def _record_verification_decision(
+    body: WorldStateClaimVerifyRequest,
+    *,
+    decision: str,
+    reason: str | None = None,
+) -> None:
+    if not body.runtime_session_id:
+        return
+    payload: dict[str, Any] = {
+        "request_id": body.request_id,
+        "world_state_claim_id": body.world_state_claim_id,
+        "decision": decision,
+        "verification_source_type": body.verification_source_type,
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    if decision == "accepted":
+        payload.update(
+            {
+                "verified_at": body.verified_at,
+                "resulting_authority": body.resulting_authority,
+                "resulting_freshness_state": body.resulting_freshness_state,
+            }
+        )
+    record_runtime_event(
+        runtime_session_id=body.runtime_session_id,
+        runtime_turn_id=body.runtime_turn_id,
+        event_type="world_state_verification_evaluated",
+        event_payload_json=payload,
+    )
+
+
 class WorldStateRepository:
     def __init__(self, db_path: Path | None = None) -> None:
         self.db_path = db_path or runtime_state_db_path()
@@ -144,6 +199,8 @@ class WorldStateRepository:
                     material_value_json TEXT NOT NULL,
                     source_type TEXT NOT NULL,
                     source_ref TEXT NOT NULL,
+                    verification_source_type TEXT,
+                    verification_source_ref TEXT,
                     confidence REAL NOT NULL,
                     freshness_state TEXT NOT NULL,
                     state_authority TEXT NOT NULL,
@@ -171,6 +228,21 @@ class WorldStateRepository:
                     created_at TEXT NOT NULL
                 );
                 """
+            )
+            self._ensure_claim_columns(conn)
+
+    def _ensure_claim_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(runtime_world_state_claims);").fetchall()
+        }
+        if "verification_source_type" not in existing:
+            conn.execute(
+                "ALTER TABLE runtime_world_state_claims ADD COLUMN verification_source_type TEXT;"
+            )
+        if "verification_source_ref" not in existing:
+            conn.execute(
+                "ALTER TABLE runtime_world_state_claims ADD COLUMN verification_source_ref TEXT;"
             )
 
     def upsert_claim(
@@ -201,7 +273,8 @@ class WorldStateRepository:
                 conn.execute(
                     """
                     UPDATE runtime_world_state_claims
-                    SET entity_type = ?, domain = ?, value_json = ?, source_type = ?, source_ref = ?,
+                    SET entity_type = ?, domain = ?, value_json = ?,
+                        source_type = ?, source_ref = ?,
                         confidence = ?, freshness_state = ?, state_authority = ?, observed_at = ?,
                         last_verified_at = ?, expires_at = ?, ttl_seconds = ?,
                         revalidation_interval_seconds = ?, confirmation_policy = ?,
@@ -248,12 +321,16 @@ class WorldStateRepository:
                     """
                     INSERT INTO runtime_world_state_claims (
                         world_state_claim_id, owner_id, entity_id, entity_type, domain, attribute,
-                        value_json, material_value_json, source_type, source_ref, confidence,
+                        value_json, material_value_json, source_type, source_ref,
+                        verification_source_type, verification_source_ref, confidence,
                         freshness_state, state_authority, observed_at, last_verified_at,
                         expires_at, ttl_seconds, revalidation_interval_seconds,
                         confirmation_policy, sensitivity, scope_labels_json,
                         created_at, updated_at, superseded_by_claim_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?
+                    );
                     """,
                     (
                         claim_id,
@@ -266,6 +343,8 @@ class WorldStateRepository:
                         _material_value(claim.value_json),
                         claim.source_type,
                         claim.source_ref,
+                        None,
+                        None,
                         claim.confidence,
                         claim.freshness_state,
                         claim.state_authority,
@@ -335,6 +414,135 @@ class WorldStateRepository:
                 conflict_map=self._conflict_map(conn, owner_id),
             )
             return claim_view, transitions
+
+    def verify_claim(
+        self,
+        body: WorldStateClaimVerifyRequest,
+    ) -> tuple[WorldStateClaimView, list[WorldStateTransition]]:
+        session = (
+            runtime_session_by_id(body.runtime_session_id)
+            if body.runtime_session_id
+            else None
+        )
+        if body.runtime_session_id and session is None:
+            raise RuntimeError("runtime_session_not_found")
+        if session is not None and (
+            session.owner_id != body.owner_id
+            or session.conversation_id != body.conversation_id
+            or session.surface != body.surface
+        ):
+            raise RuntimeError("runtime_session_mismatch")
+        if body.runtime_session_id and body.runtime_turn_id:
+            validate_runtime_turn_session(
+                runtime_session_id=body.runtime_session_id,
+                runtime_turn_id=body.runtime_turn_id,
+            )
+        if body.verification_source_type not in _TRUSTED_VERIFICATION_SOURCES:
+            _record_verification_decision(body, decision="rejected", reason="invalid_source")
+            raise RuntimeError("invalid_verification_source")
+        if body.resulting_authority not in _VERIFIED_AUTHORITIES:
+            _record_verification_decision(body, decision="rejected", reason="invalid_authority")
+            raise RuntimeError("invalid_verification_authority")
+        if body.resulting_freshness_state in {"expired", "superseded", "conflicted"}:
+            _record_verification_decision(body, decision="rejected", reason="invalid_freshness")
+            raise RuntimeError("invalid_verification_freshness")
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM runtime_world_state_claims
+                WHERE owner_id = ? AND world_state_claim_id = ?
+                LIMIT 1;
+                """,
+                (body.owner_id, body.world_state_claim_id),
+            ).fetchone()
+            if row is None:
+                _record_verification_decision(body, decision="rejected", reason="claim_not_found")
+                raise RuntimeError("world_state_claim_not_found")
+            conflict_map = self._conflict_map(conn, body.owner_id)
+            effective = self._effective_freshness_state(
+                row,
+                now=datetime.now(UTC),
+                conflict_ids=conflict_map.get(body.world_state_claim_id, []),
+            )
+            if effective == "superseded":
+                _record_verification_decision(body, decision="rejected", reason="superseded")
+                raise RuntimeError("world_state_claim_superseded")
+            if effective == "expired":
+                _record_verification_decision(body, decision="rejected", reason="expired")
+                raise RuntimeError("world_state_claim_expired")
+            if effective == "conflicted":
+                _record_verification_decision(body, decision="rejected", reason="conflicted")
+                raise RuntimeError("world_state_claim_conflicted")
+            if (
+                _value_digest_from_material(row["material_value_json"])
+                != body.expected_value_digest
+            ):
+                _record_verification_decision(
+                    body,
+                    decision="rejected",
+                    reason="expected_value_mismatch",
+                )
+                raise RuntimeError("expected_value_mismatch")
+
+            now = _now()
+            conn.execute(
+                """
+                UPDATE runtime_world_state_claims
+                SET verification_source_type = ?, verification_source_ref = ?,
+                    confidence = ?, freshness_state = ?, state_authority = ?,
+                    observed_at = ?, last_verified_at = ?, expires_at = ?,
+                    ttl_seconds = ?, revalidation_interval_seconds = ?, updated_at = ?
+                WHERE owner_id = ? AND world_state_claim_id = ?;
+                """,
+                (
+                    body.verification_source_type,
+                    body.verification_source_ref,
+                    body.resulting_confidence,
+                    body.resulting_freshness_state,
+                    body.resulting_authority,
+                    body.observed_at,
+                    body.verified_at,
+                    body.resulting_expires_at,
+                    body.resulting_ttl_seconds,
+                    body.resulting_revalidation_interval_seconds,
+                    now,
+                    body.owner_id,
+                    body.world_state_claim_id,
+                ),
+            )
+            transition = self._record_transition(
+                conn,
+                owner_id=body.owner_id,
+                claim_id=body.world_state_claim_id,
+                transition_type="verified",
+                metadata_json={
+                    "verification_source_type": body.verification_source_type,
+                    "verification_source_ref": body.verification_source_ref,
+                    "verified_at": body.verified_at,
+                    "observed_at": body.observed_at,
+                    "resulting_authority": body.resulting_authority,
+                    "resulting_freshness_state": body.resulting_freshness_state,
+                },
+            )
+            updated = conn.execute(
+                """
+                SELECT * FROM runtime_world_state_claims
+                WHERE owner_id = ? AND world_state_claim_id = ?
+                LIMIT 1;
+                """,
+                (body.owner_id, body.world_state_claim_id),
+            ).fetchone()
+            assert updated is not None
+            claim_view = self._claim_view_from_row(
+                updated,
+                include_sensitive_values=False,
+                now=datetime.now(UTC),
+                conflict_map=self._conflict_map(conn, body.owner_id),
+            )
+
+        _record_verification_decision(body, decision="accepted")
+        return claim_view, [transition]
 
     def diagnostics(
         self,
@@ -412,7 +620,8 @@ class WorldStateRepository:
         conn.execute(
             """
             INSERT INTO runtime_world_state_transitions (
-                transition_id, world_state_claim_id, owner_id, transition_type, metadata_json, created_at
+                transition_id, world_state_claim_id, owner_id, transition_type,
+                metadata_json, created_at
             ) VALUES (?, ?, ?, ?, ?, ?);
             """,
             (transition_id, claim_id, owner_id, transition_type, _json(metadata_json), created_at),
@@ -580,8 +789,11 @@ class WorldStateRepository:
             attribute=row["attribute"],
             value_json=None if redact else value,
             value_redacted=redact,
+            value_digest=_value_digest_from_material(row["material_value_json"]),
             source_type=row["source_type"],
             source_ref=row["source_ref"],
+            verification_source_type=row["verification_source_type"],
+            verification_source_ref=row["verification_source_ref"],
             confidence=row["confidence"],
             freshness_state=row["freshness_state"],
             effective_freshness_state=effective,
@@ -625,6 +837,12 @@ def upsert_world_state_claim(
     return world_state_repository().upsert_claim(owner_id=owner_id, claim=claim)
 
 
+def verify_world_state_claim(
+    body: WorldStateClaimVerifyRequest,
+) -> tuple[WorldStateClaimView, list[WorldStateTransition]]:
+    return world_state_repository().verify_claim(body)
+
+
 def get_world_state_diagnostics(
     *,
     owner_id: str,
@@ -666,7 +884,10 @@ def resolve_world_state_persona_scope(
     else:
         binding = companion_contracts_repository().surface_binding(surface)
         surface_type = binding.surface_type if binding is not None else "unknown_surface"
-    persona_domains = _DOMAIN_ALLOWLISTS.get(active_persona_id, _DOMAIN_ALLOWLISTS["general_assistant"])
+    persona_domains = _DOMAIN_ALLOWLISTS.get(
+        active_persona_id,
+        _DOMAIN_ALLOWLISTS["general_assistant"],
+    )
     surface_domains = _SURFACE_DOMAIN_RESTRICTIONS.get(
         surface_type,
         _SURFACE_DOMAIN_RESTRICTIONS["unknown_surface"],
@@ -751,7 +972,10 @@ def resolve_world_state(
             prompt_lines.append(f"- {claim.domain}/{label}: [REDACTED] ({suffix})")
         else:
             prompt_lines.append(
-                f"- {claim.domain}/{label}: {json.dumps(claim.value_json, sort_keys=True)} ({suffix})"
+                (
+                    f"- {claim.domain}/{label}: "
+                    f"{json.dumps(claim.value_json, sort_keys=True)} ({suffix})"
+                )
             )
 
     trace = WorldStateResolveTrace(
@@ -759,8 +983,12 @@ def resolve_world_state(
         allowed_domains=sorted(allowed_domains),
         included_claim_count=len(included_claims),
         excluded_claim_count=len(excluded_claims),
-        stale_count=sum(1 for claim in included_claims if claim.effective_freshness_state == "stale"),
-        aging_count=sum(1 for claim in included_claims if claim.effective_freshness_state == "aging"),
+        stale_count=sum(
+            1 for claim in included_claims if claim.effective_freshness_state == "stale"
+        ),
+        aging_count=sum(
+            1 for claim in included_claims if claim.effective_freshness_state == "aging"
+        ),
         expired_count=sum(
             1 for claim in excluded_claims if claim.effective_freshness_state == "expired"
         ),

@@ -128,6 +128,9 @@ RuntimeEventType = Literal[
     "restraint_evaluated",
     "memory_hygiene_evaluated",
     "privacy_context_evaluated",
+    "world_state_verification_evaluated",
+    "capability_authorization_evaluated",
+    "confirmation_challenge_evaluated",
 ]
 
 
@@ -701,9 +704,19 @@ WorldStateSensitivity = Literal["low", "medium", "high", "restricted"]
 WorldStateTransitionType = Literal[
     "created",
     "updated",
+    "verified",
     "superseded",
     "conflicted",
     "resolved",
+]
+
+TrustedWorldStateVerificationSourceType = Literal[
+    "tool_output",
+    "integration_event",
+    "sensor_update",
+    "repository_inspection",
+    "calendar_event",
+    "automation_workflow",
 ]
 
 
@@ -733,6 +746,23 @@ class WorldStateClaimUpsertRequest(RuntimeStateResolveRequest):
     claim: WorldStateClaimInput
 
 
+class WorldStateClaimVerifyRequest(RuntimeStateResolveRequest):
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    world_state_claim_id: str = Field(max_length=120)
+    expected_value_digest: str = Field(max_length=120)
+    verification_source_type: BoundedLabel
+    verification_source_ref: str = Field(max_length=240)
+    observed_at: str
+    verified_at: str
+    resulting_authority: WorldStateAuthority
+    resulting_confidence: float = Field(ge=0.0, le=1.0)
+    resulting_freshness_state: WorldStateFreshnessState
+    resulting_expires_at: str | None = None
+    resulting_ttl_seconds: int | None = Field(default=None, ge=1)
+    resulting_revalidation_interval_seconds: int | None = Field(default=None, ge=1)
+
+
 class WorldStateClaimView(BaseModel):
     world_state_claim_id: str = Field(max_length=120)
     owner_id: str = Field(max_length=120)
@@ -742,8 +772,11 @@ class WorldStateClaimView(BaseModel):
     attribute: BoundedLabel
     value_json: Any | None = None
     value_redacted: bool = False
+    value_digest: str = Field(max_length=120)
     source_type: WorldStateSourceType
     source_ref: str = Field(max_length=240)
+    verification_source_type: BoundedLabel | None = None
+    verification_source_ref: str | None = Field(default=None, max_length=240)
     confidence: float
     freshness_state: WorldStateFreshnessState
     effective_freshness_state: WorldStateFreshnessState
@@ -821,6 +854,146 @@ class WorldStateResolveResponse(BaseModel):
     excluded_claim_summaries: list[WorldStateClaimSummary] = Field(default_factory=list)
     prompt_content: str | None = None
     trace: WorldStateResolveTrace
+
+
+CapabilityAuthorizationPhase = Literal["exposure", "selection", "dispatch"]
+CapabilityOperationClass = Literal[
+    "read",
+    "draft",
+    "external_write",
+    "destructive",
+    "high_impact",
+]
+CapabilityDecisionCode = Literal[
+    "allowed",
+    "authorization_denied",
+    "confirmation_required",
+    "confirmation_accepted",
+    "confirmation_rejected",
+    "revalidation_required",
+]
+CapabilityReasonCode = Literal[
+    "allowed",
+    "runtime_session_mismatch",
+    "runtime_turn_mismatch",
+    "unknown_persona",
+    "unknown_surface",
+    "persona_mismatch",
+    "surface_mismatch",
+    "capability_domain_denied",
+    "surface_unsupported",
+    "argument_digest_required",
+    "argument_digest_mismatch",
+    "relationship_required",
+    "relationship_not_selected",
+    "relationship_not_authorized",
+    "world_state_required",
+    "world_state_not_selected",
+    "world_state_not_authorized",
+    "world_state_revalidation_required",
+    "confirmation_required",
+    "challenge_missing",
+    "challenge_expired",
+    "challenge_mismatch",
+    "challenge_consumed",
+    "challenge_not_confirmed",
+]
+CapabilityConfirmationState = Literal[
+    "not_required",
+    "required",
+    "issued",
+    "accepted",
+    "rejected",
+]
+
+
+class CapabilityRelationshipRequirement(BaseModel):
+    relationship_scope: BoundedLabel | None = None
+    relationship_type: BoundedLabel | None = None
+    selector_ref: str | None = Field(default=None, max_length=120)
+    authorization_required: bool = False
+
+
+class CapabilityWorldStateRequirement(BaseModel):
+    domain: BoundedLabel | None = None
+    attribute: BoundedLabel | None = None
+    entity_id: str | None = Field(default=None, max_length=120)
+    selector_ref: str | None = Field(default=None, max_length=120)
+    min_authority: WorldStateAuthority | None = None
+    min_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_freshness_state: WorldStateFreshnessState | None = None
+    revalidator_id: str | None = Field(default=None, max_length=120)
+
+
+class CapabilityAuthorizationRequest(RuntimeStateResolveRequest):
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    active_persona_id: str = Field(max_length=120)
+    authorization_phase: CapabilityAuthorizationPhase
+    capability_id: str = Field(max_length=120)
+    capability_domain: BoundedLabel
+    operation_class: CapabilityOperationClass
+    argument_digest: str | None = Field(default=None, max_length=120)
+    supported_surfaces: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    relationship_requirements: list[CapabilityRelationshipRequirement] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    selected_relationship_ids: list[str] = Field(default_factory=list, max_length=64)
+    world_state_requirements: list[CapabilityWorldStateRequirement] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    selected_world_state_claim_ids: list[str] = Field(default_factory=list, max_length=64)
+    confirmation_challenge_ref: str | None = Field(default=None, max_length=120)
+
+
+class CapabilityRevalidationSelector(BaseModel):
+    world_state_claim_ids: list[str] = Field(default_factory=list, max_length=64)
+    revalidator_id: str = Field(max_length=120)
+
+
+class CapabilityAuthorizationResult(BaseModel):
+    phase: CapabilityAuthorizationPhase
+    allowed: bool
+    decision_code: CapabilityDecisionCode
+    reason_codes: list[CapabilityReasonCode] = Field(default_factory=list, max_length=16)
+    confirmation_state: CapabilityConfirmationState
+    challenge_ref: str | None = Field(default=None, max_length=120)
+    revalidation_required: bool = False
+    revalidation_selector: CapabilityRevalidationSelector | None = None
+    relationship_ids_used: list[str] = Field(default_factory=list, max_length=64)
+    world_state_claim_ids_used: list[str] = Field(default_factory=list, max_length=64)
+
+
+class CapabilityAuthorizationResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str | None = Field(default=None, max_length=120)
+    capability_id: str = Field(max_length=120)
+    result: CapabilityAuthorizationResult
+
+
+class CapabilityConfirmationRequest(RuntimeStateResolveRequest):
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str = Field(max_length=120)
+    confirmation_challenge_ref: str = Field(max_length=120)
+    capability_id: str = Field(max_length=120)
+    operation_class: CapabilityOperationClass
+    argument_digest: str = Field(max_length=120)
+    confirmed: bool = True
+
+
+class CapabilityConfirmationResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    runtime_session_id: str = Field(max_length=120)
+    runtime_turn_id: str = Field(max_length=120)
+    confirmation_challenge_ref: str = Field(max_length=120)
+    confirmation_state: CapabilityConfirmationState
 
 
 RelationshipStatus = Literal[

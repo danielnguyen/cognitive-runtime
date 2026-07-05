@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
-
 from main import app
+from services.world_state import WorldStateRepository
 
 
 def _iso(delta_seconds: int) -> str:
@@ -62,6 +63,7 @@ def test_world_state_claim_create_and_metadata_round_trip():
     assert claim["freshness_state"] == "fresh"
     assert claim["effective_freshness_state"] == "fresh"
     assert body["transitions"][0]["transition_type"] == "created"
+    assert claim["value_digest"].startswith("wsvalue_")
 
 
 def test_world_state_claim_update_preserves_provenance_requirements():
@@ -237,6 +239,208 @@ def test_world_state_payload_does_not_introduce_memory_or_relationship_contracts
     assert "canonical_memory_ref" not in payload_text
 
 
+def test_world_state_authoritative_verification_persists_transition_and_source():
+    client = TestClient(app)
+    started = client.post(
+        "/v1/runtime/turns/start",
+        json={**_base(), "request_id": "turn-for-verification"},
+    ).json()
+    created = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                source_type="user_report",
+                state_authority="observed_user_report",
+                last_verified_at=None,
+            ),
+        },
+    ).json()["claim"]
+
+    response = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **_base(),
+            "request_id": "verify-claim",
+            "runtime_session_id": started["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": started["runtime_turn"]["runtime_turn_id"],
+            "world_state_claim_id": created["world_state_claim_id"],
+            "expected_value_digest": created["value_digest"],
+            "verification_source_type": "tool_output",
+            "verification_source_ref": "status-check:bounded",
+            "observed_at": _iso(-15),
+            "verified_at": _iso(-5),
+            "resulting_authority": "verified_tool_output",
+            "resulting_confidence": 0.97,
+            "resulting_freshness_state": "fresh",
+            "resulting_expires_at": _iso(600),
+            "resulting_ttl_seconds": 600,
+            "resulting_revalidation_interval_seconds": 300,
+        },
+    )
+    diagnostics = client.post("/v1/world-state/diagnostics", json=_base()).json()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["claim"]["last_verified_at"] is not None
+    assert body["claim"]["verification_source_type"] == "tool_output"
+    assert body["claim"]["verification_source_ref"] == "status-check:bounded"
+    assert body["claim"]["state_authority"] == "verified_tool_output"
+    assert body["transitions"][0]["transition_type"] == "verified"
+    assert any(item["transition_type"] == "verified" for item in diagnostics["transitions"])
+    payload_text = str(diagnostics)
+    assert "status-check:bounded" in payload_text
+    assert "failing" not in diagnostics["transitions"][-1]["metadata_json"].values()
+
+
+def test_world_state_verification_rejects_digest_mismatch_atomically():
+    client = TestClient(app)
+    created = client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim()},
+    ).json()["claim"]
+    before = client.post("/v1/world-state/diagnostics", json=_base()).json()
+
+    response = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **_base(),
+            "request_id": "verify-mismatch",
+            "world_state_claim_id": created["world_state_claim_id"],
+            "expected_value_digest": "wsvalue_wrong",
+            "verification_source_type": "tool_output",
+            "verification_source_ref": "status-check:bounded",
+            "observed_at": _iso(-15),
+            "verified_at": _iso(-5),
+            "resulting_authority": "verified_tool_output",
+            "resulting_confidence": 0.97,
+            "resulting_freshness_state": "fresh",
+        },
+    )
+    after = client.post("/v1/world-state/diagnostics", json=_base()).json()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "expected_value_mismatch"
+    assert after == before
+
+
+def test_world_state_verification_rejects_untrusted_source():
+    client = TestClient(app)
+    started = client.post(
+        "/v1/runtime/turns/start",
+        json={**_base(), "request_id": "turn-for-rejected-verification"},
+    ).json()
+    created = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                source_type="model_inference",
+                state_authority="model_inferred",
+            ),
+        },
+    ).json()["claim"]
+
+    response = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **_base(),
+            "request_id": "verify-untrusted",
+            "runtime_session_id": started["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": started["runtime_turn"]["runtime_turn_id"],
+            "world_state_claim_id": created["world_state_claim_id"],
+            "expected_value_digest": created["value_digest"],
+            "verification_source_type": "model_inference",
+            "verification_source_ref": "self-attested",
+            "observed_at": _iso(-15),
+            "verified_at": _iso(-5),
+            "resulting_authority": "verified_tool_output",
+            "resulting_confidence": 0.97,
+            "resulting_freshness_state": "fresh",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "invalid_verification_source"
+    diagnostics = client.get(
+        f"/v1/runtime/sessions/{started['runtime_session']['runtime_session_id']}"
+    ).json()
+    event = diagnostics["events"][-1]
+    assert event["event_type"] == "world_state_verification_evaluated"
+    assert event["event_payload_json"]["decision"] == "rejected"
+    assert event["event_payload_json"]["reason"] == "invalid_source"
+    assert "passing" not in str(event)
+
+
+def test_existing_world_state_database_upgrades_additively(tmp_path):
+    db_path = tmp_path / "pre_wave3c.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE runtime_world_state_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                world_state_claim_id TEXT NOT NULL UNIQUE,
+                owner_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                attribute TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                material_value_json TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                freshness_state TEXT NOT NULL,
+                state_authority TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                last_verified_at TEXT,
+                expires_at TEXT,
+                ttl_seconds INTEGER,
+                revalidation_interval_seconds INTEGER,
+                confirmation_policy TEXT NOT NULL,
+                sensitivity TEXT NOT NULL,
+                scope_labels_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                superseded_by_claim_id TEXT,
+                UNIQUE(owner_id, world_state_claim_id)
+            );
+            CREATE TABLE runtime_world_state_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transition_id TEXT NOT NULL UNIQUE,
+                world_state_claim_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                transition_type TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO runtime_world_state_claims (
+                world_state_claim_id, owner_id, entity_id, entity_type, domain, attribute,
+                value_json, material_value_json, source_type, source_ref, confidence,
+                freshness_state, state_authority, observed_at, last_verified_at, expires_at,
+                ttl_seconds, revalidation_interval_seconds, confirmation_policy, sensitivity,
+                scope_labels_json, created_at, updated_at, superseded_by_claim_id
+            ) VALUES (
+                'legacy-claim', 'owner', 'repo:primary', 'repository', 'active_repository',
+                'branch_status', '{"status":"passing"}', '{"status":"passing"}',
+                'tool_output', 'legacy', 0.9, 'fresh', 'verified_tool_output',
+                '2026-01-01T00:00:00+00:00', NULL, NULL, 3600, 600, 'none',
+                'medium', '["technical_context"]', '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00', NULL
+            );
+            """
+        )
+
+    repo = WorldStateRepository(db_path=db_path)
+    diagnostics = repo.diagnostics(owner_id="owner")
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(runtime_world_state_claims);")}
+
+    assert {"verification_source_type", "verification_source_ref"} <= columns
+    preserved = [*diagnostics.claims, *diagnostics.excluded_claims]
+    assert preserved[0].world_state_claim_id == "legacy-claim"
+
+
 def test_world_state_resolve_includes_fresh_eligible_claims():
     client = TestClient(app)
     client.post(
@@ -280,7 +484,10 @@ def test_world_state_resolve_excludes_claims_outside_scope_and_requested_domains
 
     assert response.status_code == 200
     assert response.json()["included_claims"] == []
-    assert response.json()["excluded_claim_summaries"][0]["reason"] == "outside_persona_or_surface_scope"
+    assert (
+        response.json()["excluded_claim_summaries"][0]["reason"]
+        == "outside_persona_or_surface_scope"
+    )
 
 
 def test_world_state_resolve_qualifies_stale_claims():

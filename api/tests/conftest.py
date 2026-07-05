@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import anyio
+import fastapi.testclient as fastapi_testclient
 import httpx
 import pytest
-import fastapi.testclient as fastapi_testclient
 import starlette.testclient as starlette_testclient
+from services.capability_authorization import clear_capability_authorization_for_tests
 from services.companion_contracts import reset_companion_contracts_for_tests
 from services.human_compatibility import clear_human_compatibility_for_tests
 from services.relationships import clear_relationships_for_tests
@@ -59,6 +60,7 @@ def isolated_runtime_storage(tmp_path, monkeypatch):
     reset_companion_contracts_for_tests(db_path=contracts_db_path)
     clear_states_for_tests(db_path=runtime_db_path)
     clear_world_state_for_tests(db_path=runtime_db_path)
+    clear_capability_authorization_for_tests(db_path=runtime_db_path)
     clear_relationships_for_tests(db_path=runtime_db_path)
     clear_social_context_for_tests(db_path=runtime_db_path)
     clear_human_compatibility_for_tests(db_path=runtime_db_path)

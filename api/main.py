@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 from models import (
+    CapabilityAuthorizationRequest,
+    CapabilityAuthorizationResponse,
+    CapabilityConfirmationRequest,
+    CapabilityConfirmationResponse,
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
     CompanionProfileActiveResponse,
@@ -61,10 +65,15 @@ from models import (
     SocialContextUsageEventResponse,
     WorldStateClaimResponse,
     WorldStateClaimUpsertRequest,
+    WorldStateClaimVerifyRequest,
     WorldStateDiagnosticsRequest,
     WorldStateDiagnosticsResponse,
     WorldStateResolveRequest,
     WorldStateResolveResponse,
+)
+from services.capability_authorization import (
+    authorize_capability,
+    record_capability_confirmation,
 )
 from services.companion_contracts import companion_contracts_repository
 from services.companion_policy import (
@@ -120,6 +129,7 @@ from services.world_state import (
     get_world_state_diagnostics,
     resolve_world_state,
     upsert_world_state_claim,
+    verify_world_state_claim,
 )
 
 app = FastAPI(title="Cognitive Runtime", version="0.1.0")
@@ -139,10 +149,44 @@ _RELATIONSHIP_DOMAIN_ERROR_STATUS = {
     "social_context_requires_approved_relationship_edge": 409,
 }
 
+_WORLD_STATE_ERROR_STATUS = {
+    "invalid_verification_source": 400,
+    "invalid_verification_authority": 400,
+    "invalid_verification_freshness": 400,
+    "runtime_session_mismatch": 400,
+    "runtime_turn_session_mismatch": 400,
+    "expected_value_mismatch": 409,
+    "world_state_claim_superseded": 409,
+    "world_state_claim_expired": 409,
+    "world_state_claim_conflicted": 409,
+    "runtime_session_not_found": 404,
+    "runtime_turn_not_found": 404,
+    "world_state_claim_not_found": 404,
+}
+
+_CAPABILITY_ERROR_STATUS = {
+    "runtime_session_mismatch": 400,
+    "runtime_turn_session_mismatch": 400,
+    "confirmation_challenge_mismatch": 400,
+    "runtime_session_not_found": 404,
+    "runtime_turn_not_found": 404,
+    "confirmation_challenge_not_found": 404,
+    "confirmation_challenge_expired": 409,
+    "confirmation_challenge_consumed": 409,
+}
+
 
 def _relationship_domain_http_error(exc: RuntimeError) -> HTTPException | None:
     detail = str(exc)
     status_code = _RELATIONSHIP_DOMAIN_ERROR_STATUS.get(detail)
+    if status_code is None:
+        return None
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def _bounded_http_error(exc: RuntimeError, status_map: dict[str, int]) -> HTTPException | None:
+    detail = str(exc)
+    status_code = status_map.get(detail)
     if status_code is None:
         return None
     return HTTPException(status_code=status_code, detail=detail)
@@ -473,6 +517,20 @@ async def world_state_claim_upsert(
     return WorldStateClaimResponse(claim=claim, transitions=transitions)
 
 
+@app.post("/v1/world-state/claims/verify", response_model=WorldStateClaimResponse)
+async def world_state_claim_verify(
+    body: WorldStateClaimVerifyRequest,
+) -> WorldStateClaimResponse:
+    try:
+        claim, transitions = verify_world_state_claim(body)
+    except RuntimeError as exc:
+        http_error = _bounded_http_error(exc, _WORLD_STATE_ERROR_STATUS)
+        if http_error is None:
+            raise
+        raise http_error from exc
+    return WorldStateClaimResponse(claim=claim, transitions=transitions)
+
+
 @app.post("/v1/world-state/diagnostics", response_model=WorldStateDiagnosticsResponse)
 async def world_state_diagnostics(
     body: WorldStateDiagnosticsRequest,
@@ -496,6 +554,32 @@ async def world_state_resolve(
         active_persona_id=body.active_persona_id,
         requested_domains=body.requested_domains,
     )
+
+
+@app.post("/v1/capabilities/authorize", response_model=CapabilityAuthorizationResponse)
+async def capability_authorize(
+    body: CapabilityAuthorizationRequest,
+) -> CapabilityAuthorizationResponse:
+    try:
+        return authorize_capability(body)
+    except RuntimeError as exc:
+        http_error = _bounded_http_error(exc, _CAPABILITY_ERROR_STATUS)
+        if http_error is None:
+            raise
+        raise http_error from exc
+
+
+@app.post("/v1/capabilities/confirm", response_model=CapabilityConfirmationResponse)
+async def capability_confirm(
+    body: CapabilityConfirmationRequest,
+) -> CapabilityConfirmationResponse:
+    try:
+        return record_capability_confirmation(body)
+    except RuntimeError as exc:
+        http_error = _bounded_http_error(exc, _CAPABILITY_ERROR_STATUS)
+        if http_error is None:
+            raise
+        raise http_error from exc
 
 
 @app.post(
