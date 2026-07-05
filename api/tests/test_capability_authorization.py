@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 from main import app
+from services.world_state import (
+    TrustedWorldStateVerifier,
+    configure_trusted_world_state_verifiers_for_tests,
+)
 
 
 def _iso(delta_seconds: int) -> str:
@@ -24,6 +29,25 @@ def _start_turn(client: TestClient) -> dict[str, object]:
         "/v1/runtime/turns/start",
         json={**_base(), "request_id": "capability-turn"},
     ).json()
+
+
+def _configure_repo_verifier() -> None:
+    configure_trusted_world_state_verifiers_for_tests(
+        [
+            TrustedWorldStateVerifier(
+                verifier_id="repo-status-revalidator",
+                verification_source_type="tool_output",
+                allowed_source_refs=frozenset({"repo-status-revalidator"}),
+                max_authority="verified_tool_output",
+                allowed_domains=frozenset({"active_repository"}),
+                allowed_attributes=frozenset({"branch_status"}),
+                max_confidence=0.99,
+                max_freshness_state="fresh",
+                max_ttl_seconds=600,
+                max_revalidation_interval_seconds=300,
+            )
+        ]
+    )
 
 
 def _claim(**overrides) -> dict[str, object]:
@@ -228,6 +252,7 @@ def test_relationship_required_authorization_rejects_revoked_sensitive_and_unsel
 
 def test_selection_dispatch_world_state_revalidation_then_verification_rerun():
     client = TestClient(app)
+    _configure_repo_verifier()
     turn = _start_turn(client)
     stale_claim = client.post(
         "/v1/world-state/claims/upsert",
@@ -274,6 +299,7 @@ def test_selection_dispatch_world_state_revalidation_then_verification_rerun():
             "runtime_turn_id": turn["runtime_turn"]["runtime_turn_id"],
             "world_state_claim_id": stale_claim["world_state_claim_id"],
             "expected_value_digest": stale_claim["value_digest"],
+            "verifier_id": "repo-status-revalidator",
             "verification_source_type": "tool_output",
             "verification_source_ref": "repo-status-revalidator",
             "observed_at": _iso(-10),
@@ -290,6 +316,67 @@ def test_selection_dispatch_world_state_revalidation_then_verification_rerun():
     rerun = client.post("/v1/capabilities/authorize", json=request).json()["result"]
     assert rerun["allowed"] is True
     assert rerun["world_state_claim_ids_used"] == [stale_claim["world_state_claim_id"]]
+
+
+def test_reverify_before_use_requires_current_turn_verification_then_rerun_allows():
+    client = TestClient(app)
+    _configure_repo_verifier()
+    turn = _start_turn(client)
+    claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(confirmation_policy="reverify_before_use"),
+        },
+    ).json()["claim"]
+    request = _authorized_request(
+        turn,
+        authorization_phase="selection",
+        argument_digest="args_reverify_policy",
+        world_state_requirements=[
+            {
+                "domain": "active_repository",
+                "attribute": "branch_status",
+                "revalidator_id": "repo-status-revalidator",
+            }
+        ],
+        selected_world_state_claim_ids=[claim["world_state_claim_id"]],
+    )
+
+    first = client.post("/v1/capabilities/authorize", json=request).json()["result"]
+    assert first["allowed"] is False
+    assert first["decision_code"] == "revalidation_required"
+    assert first["revalidation_selector"]["world_state_claim_ids"] == [
+        claim["world_state_claim_id"]
+    ]
+
+    verified = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **_base(),
+            "request_id": "verify-reverify-policy",
+            "runtime_session_id": turn["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": turn["runtime_turn"]["runtime_turn_id"],
+            "world_state_claim_id": claim["world_state_claim_id"],
+            "expected_value_digest": claim["value_digest"],
+            "verifier_id": "repo-status-revalidator",
+            "verification_source_type": "tool_output",
+            "verification_source_ref": "repo-status-revalidator",
+            "observed_at": _iso(-10),
+            "verified_at": _iso(-5),
+            "resulting_authority": "verified_tool_output",
+            "resulting_confidence": 0.98,
+            "resulting_freshness_state": "fresh",
+            "resulting_expires_at": _iso(600),
+            "resulting_ttl_seconds": 600,
+            "resulting_revalidation_interval_seconds": 300,
+        },
+    )
+    assert verified.status_code == 200
+
+    rerun = client.post("/v1/capabilities/authorize", json=request).json()["result"]
+    assert rerun["allowed"] is True
+    assert rerun["revalidation_required"] is False
 
 
 def test_inferred_low_confidence_state_does_not_authorize_risky_action():
@@ -333,6 +420,110 @@ def test_inferred_low_confidence_state_does_not_authorize_risky_action():
     assert result["challenge_ref"] is None
 
 
+def test_world_state_authorization_uses_persona_surface_scope_and_sensitivity():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    health_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                entity_id="health:private",
+                entity_type="health_observation",
+                domain="active_health_observation",
+                attribute="condition",
+                sensitivity="medium",
+            ),
+        },
+    ).json()["claim"]
+    restricted_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                entity_id="repo:secret",
+                domain="active_repository",
+                sensitivity="restricted",
+            ),
+        },
+    ).json()["claim"]
+
+    outside_scope = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            world_state_requirements=[{"domain": "active_health_observation"}],
+            selected_world_state_claim_ids=[health_claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+    restricted = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            world_state_requirements=[{"domain": "active_repository"}],
+            selected_world_state_claim_ids=[restricted_claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+
+    assert outside_scope["allowed"] is False
+    assert "world_state_required" in outside_scope["reason_codes"]
+    assert restricted["allowed"] is False
+    assert "world_state_not_authorized" in restricted["reason_codes"]
+
+
+def test_world_state_confirmation_policy_requires_current_confirmation_for_non_read():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(confirmation_policy="confirm_before_action"),
+        },
+    ).json()["claim"]
+    request = _authorized_request(
+        turn,
+        authorization_phase="selection",
+        capability_id="draft.local_message",
+        operation_class="draft",
+        argument_digest="args_draft_claim",
+        world_state_requirements=[{"domain": "active_repository"}],
+        selected_world_state_claim_ids=[claim["world_state_claim_id"]],
+    )
+
+    selection = client.post("/v1/capabilities/authorize", json=request).json()["result"]
+    assert selection["allowed"] is False
+    assert selection["decision_code"] == "confirmation_required"
+    assert selection["challenge_ref"]
+
+    next_turn = _start_turn(client)
+    confirmed = client.post(
+        "/v1/capabilities/confirm",
+        json={
+            **_base(),
+            "request_id": "confirm-claim-policy",
+            "runtime_session_id": turn["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": next_turn["runtime_turn"]["runtime_turn_id"],
+            "confirmation_challenge_ref": selection["challenge_ref"],
+            "capability_id": "draft.local_message",
+            "operation_class": "draft",
+            "argument_digest": "args_draft_claim",
+            "confirmed": True,
+        },
+    )
+    assert confirmed.status_code == 200
+    dispatch = client.post(
+        "/v1/capabilities/authorize",
+        json={
+            **request,
+            "runtime_turn_id": next_turn["runtime_turn"]["runtime_turn_id"],
+            "authorization_phase": "dispatch",
+            "confirmation_challenge_ref": selection["challenge_ref"],
+        },
+    ).json()["result"]
+    assert dispatch["allowed"] is True
+
+
 def test_risky_confirmation_is_exact_one_use_and_privacy_safe():
     client = TestClient(app)
     turn = _start_turn(client)
@@ -367,13 +558,31 @@ def test_risky_confirmation_is_exact_one_use_and_privacy_safe():
     assert mismatch.status_code == 400
     assert mismatch.json()["detail"] == "confirmation_challenge_mismatch"
 
+    same_turn = client.post(
+        "/v1/capabilities/confirm",
+        json={
+            **_base(),
+            "request_id": "confirm-same-turn",
+            "runtime_session_id": turn["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": turn["runtime_turn"]["runtime_turn_id"],
+            "confirmation_challenge_ref": challenge_ref,
+            "capability_id": "integration.external_write.test",
+            "operation_class": "external_write",
+            "argument_digest": "args_digest_stable",
+            "confirmed": True,
+        },
+    )
+    assert same_turn.status_code == 400
+    assert same_turn.json()["detail"] == "confirmation_turn_not_distinct"
+
+    next_turn = _start_turn(client)
     confirmed = client.post(
         "/v1/capabilities/confirm",
         json={
             **_base(),
             "request_id": "confirm-ok",
             "runtime_session_id": turn["runtime_session"]["runtime_session_id"],
-            "runtime_turn_id": turn["runtime_turn"]["runtime_turn_id"],
+            "runtime_turn_id": next_turn["runtime_turn"]["runtime_turn_id"],
             "confirmation_challenge_ref": challenge_ref,
             "capability_id": "integration.external_write.test",
             "operation_class": "external_write",
@@ -384,7 +593,7 @@ def test_risky_confirmation_is_exact_one_use_and_privacy_safe():
     assert confirmed.status_code == 200
 
     dispatch_request = _authorized_request(
-        turn,
+        next_turn,
         authorization_phase="dispatch",
         capability_id="integration.external_write.test",
         operation_class="external_write",
@@ -406,6 +615,129 @@ def test_risky_confirmation_is_exact_one_use_and_privacy_safe():
     assert "args_digest_stable" not in diagnostics_text
     assert "raw_secret_argument" not in diagnostics_text
     assert "integration.external_write.test" in diagnostics_text
+
+
+def test_explicit_confirmation_rejection_cannot_later_dispatch_or_be_accepted():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    selection = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_rejected",
+        ),
+    ).json()["result"]
+    next_turn = _start_turn(client)
+    rejected = client.post(
+        "/v1/capabilities/confirm",
+        json={
+            **_base(),
+            "request_id": "confirm-reject",
+            "runtime_session_id": turn["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": next_turn["runtime_turn"]["runtime_turn_id"],
+            "confirmation_challenge_ref": selection["challenge_ref"],
+            "capability_id": "integration.external_write.test",
+            "operation_class": "external_write",
+            "argument_digest": "args_rejected",
+            "confirmed": False,
+        },
+    )
+    assert rejected.status_code == 200
+    later_accept = client.post(
+        "/v1/capabilities/confirm",
+        json={
+            **_base(),
+            "request_id": "confirm-after-reject",
+            "runtime_session_id": turn["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": next_turn["runtime_turn"]["runtime_turn_id"],
+            "confirmation_challenge_ref": selection["challenge_ref"],
+            "capability_id": "integration.external_write.test",
+            "operation_class": "external_write",
+            "argument_digest": "args_rejected",
+            "confirmed": True,
+        },
+    )
+    assert later_accept.status_code == 409
+    dispatch = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            next_turn,
+            authorization_phase="dispatch",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_rejected",
+            confirmation_challenge_ref=selection["challenge_ref"],
+        ),
+    ).json()["result"]
+    assert dispatch["allowed"] is False
+    assert "challenge_rejected" in dispatch["reason_codes"]
+
+
+def test_concurrent_dispatch_consumes_confirmation_once():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    selection = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_concurrent",
+        ),
+    ).json()["result"]
+    next_turn = _start_turn(client)
+    confirmed = client.post(
+        "/v1/capabilities/confirm",
+        json={
+            **_base(),
+            "request_id": "confirm-concurrent",
+            "runtime_session_id": turn["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": next_turn["runtime_turn"]["runtime_turn_id"],
+            "confirmation_challenge_ref": selection["challenge_ref"],
+            "capability_id": "integration.external_write.test",
+            "operation_class": "external_write",
+            "argument_digest": "args_concurrent",
+            "confirmed": True,
+        },
+    )
+    assert confirmed.status_code == 200
+    dispatch_request = _authorized_request(
+        next_turn,
+        authorization_phase="dispatch",
+        capability_id="integration.external_write.test",
+        operation_class="external_write",
+        argument_digest="args_concurrent",
+        confirmation_challenge_ref=selection["challenge_ref"],
+    )
+
+    def dispatch_once() -> dict[str, object]:
+        return TestClient(app).post(
+            "/v1/capabilities/authorize",
+            json=dispatch_request,
+        ).json()["result"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: dispatch_once(), range(2)))
+
+    allowed = [result for result in results if result["allowed"] is True]
+    denied = [result for result in results if result["allowed"] is False]
+    assert len(allowed) == 1
+    assert len(denied) == 1
+    assert "challenge_consumed" in denied[0]["reason_codes"]
+    diagnostics = client.get(
+        f"/v1/runtime/sessions/{turn['runtime_session']['runtime_session_id']}"
+    ).json()
+    consumed_events = [
+        event
+        for event in diagnostics["events"]
+        if event["event_type"] == "confirmation_challenge_evaluated"
+        and event["event_payload_json"].get("confirmation_state") == "consumed"
+    ]
+    assert len(consumed_events) == 1
 
 
 def test_read_and_draft_do_not_require_risky_confirmation():

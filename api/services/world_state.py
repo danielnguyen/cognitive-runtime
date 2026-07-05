@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -31,19 +32,46 @@ from services.runtime_state import (
 _WORLD_STATE_REPOSITORY: WorldStateRepository | None = None
 _TERMINAL_FRESHNESS_STATES = {"expired", "superseded"}
 _SENSITIVE_LEVELS = {"high", "restricted"}
-_TRUSTED_VERIFICATION_SOURCES = {
-    "tool_output",
-    "integration_event",
-    "sensor_update",
-    "repository_inspection",
-    "calendar_event",
-    "automation_workflow",
-}
 _VERIFIED_AUTHORITIES = {
     "verified_tool_output",
     "trusted_integration_event",
     "derived_from_multiple_sources",
 }
+_AUTHORITY_ORDER = {
+    "unverified_assumption": 0,
+    "model_inferred": 0,
+    "observed_user_report": 1,
+    "derived_from_multiple_sources": 2,
+    "trusted_integration_event": 3,
+    "verified_tool_output": 4,
+}
+_FRESHNESS_ORDER = {
+    "fresh": 0,
+    "aging": 1,
+    "stale": 2,
+    "unknown": 3,
+    "expired": 4,
+    "superseded": 5,
+    "conflicted": 6,
+}
+
+
+@dataclass(frozen=True)
+class TrustedWorldStateVerifier:
+    verifier_id: str
+    verification_source_type: str
+    allowed_source_refs: frozenset[str] = field(default_factory=frozenset)
+    max_authority: str = "derived_from_multiple_sources"
+    allowed_domains: frozenset[str] = field(default_factory=frozenset)
+    allowed_attributes: frozenset[str] = field(default_factory=frozenset)
+    allowed_entity_ids: frozenset[str] = field(default_factory=frozenset)
+    max_confidence: float = 1.0
+    max_freshness_state: str = "fresh"
+    max_ttl_seconds: int | None = None
+    max_revalidation_interval_seconds: int | None = None
+
+
+_TRUSTED_VERIFIERS: dict[str, TrustedWorldStateVerifier] = {}
 _DOMAIN_ALLOWLISTS: dict[str, set[str]] = {
     "general_assistant": {"active_task", "active_project", "pending_action", "runtime_surface"},
     "technical_architect": {
@@ -151,6 +179,7 @@ def _record_verification_decision(
         "request_id": body.request_id,
         "world_state_claim_id": body.world_state_claim_id,
         "decision": decision,
+        "verifier_id": body.verifier_id,
         "verification_source_type": body.verification_source_type,
     }
     if reason is not None:
@@ -169,6 +198,70 @@ def _record_verification_decision(
         event_type="world_state_verification_evaluated",
         event_payload_json=payload,
     )
+
+
+def configure_trusted_world_state_verifiers_for_tests(
+    verifiers: list[TrustedWorldStateVerifier],
+) -> None:
+    _TRUSTED_VERIFIERS.clear()
+    _TRUSTED_VERIFIERS.update({verifier.verifier_id: verifier for verifier in verifiers})
+
+
+def clear_trusted_world_state_verifiers_for_tests() -> None:
+    _TRUSTED_VERIFIERS.clear()
+
+
+def _verification_policy_reason(
+    *,
+    verifier: TrustedWorldStateVerifier | None,
+    body: WorldStateClaimVerifyRequest,
+    row: sqlite3.Row | None = None,
+) -> str | None:
+    if body.verifier_id is None:
+        return "trusted_verifier_required"
+    if verifier is None:
+        return "unknown_trusted_verifier"
+    if body.verification_source_type != verifier.verification_source_type:
+        return "verification_source_mismatch"
+    if (
+        verifier.allowed_source_refs
+        and body.verification_source_ref not in verifier.allowed_source_refs
+    ):
+        return "verification_source_ref_not_allowed"
+    if body.resulting_authority not in _VERIFIED_AUTHORITIES:
+        return "invalid_verification_authority"
+    if _AUTHORITY_ORDER[body.resulting_authority] > _AUTHORITY_ORDER[verifier.max_authority]:
+        return "verification_authority_escalation"
+    if body.resulting_confidence > verifier.max_confidence:
+        return "verification_confidence_escalation"
+    if body.resulting_freshness_state in {"expired", "superseded", "conflicted"}:
+        return "invalid_verification_freshness"
+    if (
+        _FRESHNESS_ORDER[body.resulting_freshness_state]
+        < _FRESHNESS_ORDER[verifier.max_freshness_state]
+    ):
+        return "verification_freshness_escalation"
+    if (
+        verifier.max_ttl_seconds is not None
+        and body.resulting_ttl_seconds is not None
+        and body.resulting_ttl_seconds > verifier.max_ttl_seconds
+    ):
+        return "verification_ttl_escalation"
+    if (
+        verifier.max_revalidation_interval_seconds is not None
+        and body.resulting_revalidation_interval_seconds is not None
+        and body.resulting_revalidation_interval_seconds
+        > verifier.max_revalidation_interval_seconds
+    ):
+        return "verification_revalidation_interval_escalation"
+    if row is not None:
+        if verifier.allowed_domains and row["domain"] not in verifier.allowed_domains:
+            return "verification_domain_not_allowed"
+        if verifier.allowed_attributes and row["attribute"] not in verifier.allowed_attributes:
+            return "verification_selector_not_allowed"
+        if verifier.allowed_entity_ids and row["entity_id"] not in verifier.allowed_entity_ids:
+            return "verification_selector_not_allowed"
+    return None
 
 
 class WorldStateRepository:
@@ -199,6 +292,7 @@ class WorldStateRepository:
                     material_value_json TEXT NOT NULL,
                     source_type TEXT NOT NULL,
                     source_ref TEXT NOT NULL,
+                    verification_verifier_id TEXT,
                     verification_source_type TEXT,
                     verification_source_ref TEXT,
                     confidence REAL NOT NULL,
@@ -206,6 +300,9 @@ class WorldStateRepository:
                     state_authority TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     last_verified_at TEXT,
+                    last_verified_runtime_session_id TEXT,
+                    last_verified_runtime_turn_id TEXT,
+                    last_verification_request_id TEXT,
                     expires_at TEXT,
                     ttl_seconds INTEGER,
                     revalidation_interval_seconds INTEGER,
@@ -240,9 +337,28 @@ class WorldStateRepository:
             conn.execute(
                 "ALTER TABLE runtime_world_state_claims ADD COLUMN verification_source_type TEXT;"
             )
+        if "verification_verifier_id" not in existing:
+            conn.execute(
+                "ALTER TABLE runtime_world_state_claims ADD COLUMN verification_verifier_id TEXT;"
+            )
         if "verification_source_ref" not in existing:
             conn.execute(
                 "ALTER TABLE runtime_world_state_claims ADD COLUMN verification_source_ref TEXT;"
+            )
+        if "last_verified_runtime_session_id" not in existing:
+            conn.execute(
+                "ALTER TABLE runtime_world_state_claims "
+                "ADD COLUMN last_verified_runtime_session_id TEXT;"
+            )
+        if "last_verified_runtime_turn_id" not in existing:
+            conn.execute(
+                "ALTER TABLE runtime_world_state_claims "
+                "ADD COLUMN last_verified_runtime_turn_id TEXT;"
+            )
+        if "last_verification_request_id" not in existing:
+            conn.execute(
+                "ALTER TABLE runtime_world_state_claims "
+                "ADD COLUMN last_verification_request_id TEXT;"
             )
 
     def upsert_claim(
@@ -275,8 +391,13 @@ class WorldStateRepository:
                     UPDATE runtime_world_state_claims
                     SET entity_type = ?, domain = ?, value_json = ?,
                         source_type = ?, source_ref = ?,
+                        verification_verifier_id = NULL, verification_source_type = NULL,
+                        verification_source_ref = NULL,
                         confidence = ?, freshness_state = ?, state_authority = ?, observed_at = ?,
-                        last_verified_at = ?, expires_at = ?, ttl_seconds = ?,
+                        last_verified_at = ?, last_verified_runtime_session_id = NULL,
+                        last_verified_runtime_turn_id = NULL,
+                        last_verification_request_id = NULL,
+                        expires_at = ?, ttl_seconds = ?,
                         revalidation_interval_seconds = ?, confirmation_policy = ?,
                         sensitivity = ?, scope_labels_json = ?, updated_at = ?
                     WHERE world_state_claim_id = ?;
@@ -322,14 +443,17 @@ class WorldStateRepository:
                     INSERT INTO runtime_world_state_claims (
                         world_state_claim_id, owner_id, entity_id, entity_type, domain, attribute,
                         value_json, material_value_json, source_type, source_ref,
-                        verification_source_type, verification_source_ref, confidence,
+                        verification_verifier_id, verification_source_type,
+                        verification_source_ref, confidence,
                         freshness_state, state_authority, observed_at, last_verified_at,
-                        expires_at, ttl_seconds, revalidation_interval_seconds,
+                        last_verified_runtime_session_id, last_verified_runtime_turn_id,
+                        last_verification_request_id, expires_at, ttl_seconds,
+                        revalidation_interval_seconds,
                         confirmation_policy, sensitivity, scope_labels_json,
                         created_at, updated_at, superseded_by_claim_id
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     );
                     """,
                     (
@@ -345,11 +469,15 @@ class WorldStateRepository:
                         claim.source_ref,
                         None,
                         None,
+                        None,
                         claim.confidence,
                         claim.freshness_state,
                         claim.state_authority,
                         claim.observed_at,
                         claim.last_verified_at,
+                        None,
+                        None,
+                        None,
                         claim.expires_at,
                         claim.ttl_seconds,
                         claim.revalidation_interval_seconds,
@@ -437,15 +565,11 @@ class WorldStateRepository:
                 runtime_session_id=body.runtime_session_id,
                 runtime_turn_id=body.runtime_turn_id,
             )
-        if body.verification_source_type not in _TRUSTED_VERIFICATION_SOURCES:
-            _record_verification_decision(body, decision="rejected", reason="invalid_source")
-            raise RuntimeError("invalid_verification_source")
-        if body.resulting_authority not in _VERIFIED_AUTHORITIES:
-            _record_verification_decision(body, decision="rejected", reason="invalid_authority")
-            raise RuntimeError("invalid_verification_authority")
-        if body.resulting_freshness_state in {"expired", "superseded", "conflicted"}:
-            _record_verification_decision(body, decision="rejected", reason="invalid_freshness")
-            raise RuntimeError("invalid_verification_freshness")
+        verifier = _TRUSTED_VERIFIERS.get(body.verifier_id or "")
+        policy_reason = _verification_policy_reason(verifier=verifier, body=body)
+        if policy_reason is not None:
+            _record_verification_decision(body, decision="rejected", reason=policy_reason)
+            raise RuntimeError(policy_reason)
 
         with self._connect() as conn:
             row = conn.execute(
@@ -459,6 +583,10 @@ class WorldStateRepository:
             if row is None:
                 _record_verification_decision(body, decision="rejected", reason="claim_not_found")
                 raise RuntimeError("world_state_claim_not_found")
+            policy_reason = _verification_policy_reason(verifier=verifier, body=body, row=row)
+            if policy_reason is not None:
+                _record_verification_decision(body, decision="rejected", reason=policy_reason)
+                raise RuntimeError(policy_reason)
             conflict_map = self._conflict_map(conn, body.owner_id)
             effective = self._effective_freshness_state(
                 row,
@@ -489,13 +617,18 @@ class WorldStateRepository:
             conn.execute(
                 """
                 UPDATE runtime_world_state_claims
-                SET verification_source_type = ?, verification_source_ref = ?,
+                SET verification_verifier_id = ?, verification_source_type = ?,
+                    verification_source_ref = ?,
                     confidence = ?, freshness_state = ?, state_authority = ?,
-                    observed_at = ?, last_verified_at = ?, expires_at = ?,
+                    observed_at = ?, last_verified_at = ?,
+                    last_verified_runtime_session_id = ?,
+                    last_verified_runtime_turn_id = ?, last_verification_request_id = ?,
+                    expires_at = ?,
                     ttl_seconds = ?, revalidation_interval_seconds = ?, updated_at = ?
                 WHERE owner_id = ? AND world_state_claim_id = ?;
                 """,
                 (
+                    body.verifier_id,
                     body.verification_source_type,
                     body.verification_source_ref,
                     body.resulting_confidence,
@@ -503,6 +636,9 @@ class WorldStateRepository:
                     body.resulting_authority,
                     body.observed_at,
                     body.verified_at,
+                    body.runtime_session_id,
+                    body.runtime_turn_id,
+                    body.request_id,
                     body.resulting_expires_at,
                     body.resulting_ttl_seconds,
                     body.resulting_revalidation_interval_seconds,
@@ -518,6 +654,7 @@ class WorldStateRepository:
                 transition_type="verified",
                 metadata_json={
                     "verification_source_type": body.verification_source_type,
+                    "verification_verifier_id": body.verifier_id,
                     "verification_source_ref": body.verification_source_ref,
                     "verified_at": body.verified_at,
                     "observed_at": body.observed_at,
@@ -792,6 +929,7 @@ class WorldStateRepository:
             value_digest=_value_digest_from_material(row["material_value_json"]),
             source_type=row["source_type"],
             source_ref=row["source_ref"],
+            verification_verifier_id=row["verification_verifier_id"],
             verification_source_type=row["verification_source_type"],
             verification_source_ref=row["verification_source_ref"],
             confidence=row["confidence"],
@@ -800,6 +938,9 @@ class WorldStateRepository:
             state_authority=row["state_authority"],
             observed_at=row["observed_at"],
             last_verified_at=row["last_verified_at"],
+            last_verified_runtime_session_id=row["last_verified_runtime_session_id"],
+            last_verified_runtime_turn_id=row["last_verified_runtime_turn_id"],
+            last_verification_request_id=row["last_verification_request_id"],
             expires_at=row["expires_at"],
             ttl_seconds=row["ttl_seconds"],
             revalidation_interval_seconds=row["revalidation_interval_seconds"],
@@ -856,6 +997,7 @@ def get_world_state_diagnostics(
 
 def clear_world_state_for_tests(db_path: Path | None = None) -> None:
     global _WORLD_STATE_REPOSITORY
+    clear_trusted_world_state_verifiers_for_tests()
     _WORLD_STATE_REPOSITORY = WorldStateRepository(db_path=db_path)
 
 

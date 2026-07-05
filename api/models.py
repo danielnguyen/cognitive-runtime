@@ -751,6 +751,7 @@ class WorldStateClaimVerifyRequest(RuntimeStateResolveRequest):
     runtime_turn_id: str | None = Field(default=None, max_length=120)
     world_state_claim_id: str = Field(max_length=120)
     expected_value_digest: str = Field(max_length=120)
+    verifier_id: BoundedLabel | None = None
     verification_source_type: BoundedLabel
     verification_source_ref: str = Field(max_length=240)
     observed_at: str
@@ -775,6 +776,7 @@ class WorldStateClaimView(BaseModel):
     value_digest: str = Field(max_length=120)
     source_type: WorldStateSourceType
     source_ref: str = Field(max_length=240)
+    verification_verifier_id: BoundedLabel | None = None
     verification_source_type: BoundedLabel | None = None
     verification_source_ref: str | None = Field(default=None, max_length=240)
     confidence: float
@@ -783,6 +785,9 @@ class WorldStateClaimView(BaseModel):
     state_authority: WorldStateAuthority
     observed_at: str
     last_verified_at: str | None = None
+    last_verified_runtime_session_id: str | None = Field(default=None, max_length=120)
+    last_verified_runtime_turn_id: str | None = Field(default=None, max_length=120)
+    last_verification_request_id: str | None = Field(default=None, max_length=120)
     expires_at: str | None = None
     ttl_seconds: int | None = None
     revalidation_interval_seconds: int | None = None
@@ -892,9 +897,11 @@ CapabilityReasonCode = Literal[
     "world_state_not_authorized",
     "world_state_revalidation_required",
     "confirmation_required",
+    "originating_turn_required",
     "challenge_missing",
     "challenge_expired",
     "challenge_mismatch",
+    "challenge_rejected",
     "challenge_consumed",
     "challenge_not_confirmed",
 ]

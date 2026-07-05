@@ -5,7 +5,11 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 from main import app
-from services.world_state import WorldStateRepository
+from services.world_state import (
+    TrustedWorldStateVerifier,
+    WorldStateRepository,
+    configure_trusted_world_state_verifiers_for_tests,
+)
 
 
 def _iso(delta_seconds: int) -> str:
@@ -19,6 +23,24 @@ def _base() -> dict[str, object]:
         "conversation_id": "conv-1",
         "surface": "dev",
     }
+
+
+def _configure_repo_verifier(**overrides) -> None:
+    verifier = TrustedWorldStateVerifier(
+        verifier_id="repo-status-revalidator",
+        verification_source_type="tool_output",
+        allowed_source_refs=frozenset({"repo-status-revalidator", "status-check:bounded"}),
+        max_authority="verified_tool_output",
+        allowed_domains=frozenset({"active_repository"}),
+        allowed_attributes=frozenset({"branch_status"}),
+        max_confidence=0.99,
+        max_freshness_state="fresh",
+        max_ttl_seconds=600,
+        max_revalidation_interval_seconds=300,
+    )
+    configure_trusted_world_state_verifiers_for_tests([
+        TrustedWorldStateVerifier(**{**verifier.__dict__, **overrides})
+    ])
 
 
 def _claim(**overrides) -> dict[str, object]:
@@ -241,6 +263,7 @@ def test_world_state_payload_does_not_introduce_memory_or_relationship_contracts
 
 def test_world_state_authoritative_verification_persists_transition_and_source():
     client = TestClient(app)
+    _configure_repo_verifier()
     started = client.post(
         "/v1/runtime/turns/start",
         json={**_base(), "request_id": "turn-for-verification"},
@@ -266,6 +289,7 @@ def test_world_state_authoritative_verification_persists_transition_and_source()
             "runtime_turn_id": started["runtime_turn"]["runtime_turn_id"],
             "world_state_claim_id": created["world_state_claim_id"],
             "expected_value_digest": created["value_digest"],
+            "verifier_id": "repo-status-revalidator",
             "verification_source_type": "tool_output",
             "verification_source_ref": "status-check:bounded",
             "observed_at": _iso(-15),
@@ -283,6 +307,7 @@ def test_world_state_authoritative_verification_persists_transition_and_source()
     assert response.status_code == 200
     body = response.json()
     assert body["claim"]["last_verified_at"] is not None
+    assert body["claim"]["verification_verifier_id"] == "repo-status-revalidator"
     assert body["claim"]["verification_source_type"] == "tool_output"
     assert body["claim"]["verification_source_ref"] == "status-check:bounded"
     assert body["claim"]["state_authority"] == "verified_tool_output"
@@ -295,6 +320,7 @@ def test_world_state_authoritative_verification_persists_transition_and_source()
 
 def test_world_state_verification_rejects_digest_mismatch_atomically():
     client = TestClient(app)
+    _configure_repo_verifier()
     created = client.post(
         "/v1/world-state/claims/upsert",
         json={**_base(), "claim": _claim()},
@@ -308,6 +334,7 @@ def test_world_state_verification_rejects_digest_mismatch_atomically():
             "request_id": "verify-mismatch",
             "world_state_claim_id": created["world_state_claim_id"],
             "expected_value_digest": "wsvalue_wrong",
+            "verifier_id": "repo-status-revalidator",
             "verification_source_type": "tool_output",
             "verification_source_ref": "status-check:bounded",
             "observed_at": _iso(-15),
@@ -326,6 +353,7 @@ def test_world_state_verification_rejects_digest_mismatch_atomically():
 
 def test_world_state_verification_rejects_untrusted_source():
     client = TestClient(app)
+    _configure_repo_verifier()
     started = client.post(
         "/v1/runtime/turns/start",
         json={**_base(), "request_id": "turn-for-rejected-verification"},
@@ -350,6 +378,7 @@ def test_world_state_verification_rejects_untrusted_source():
             "runtime_turn_id": started["runtime_turn"]["runtime_turn_id"],
             "world_state_claim_id": created["world_state_claim_id"],
             "expected_value_digest": created["value_digest"],
+            "verifier_id": "repo-status-revalidator",
             "verification_source_type": "model_inference",
             "verification_source_ref": "self-attested",
             "observed_at": _iso(-15),
@@ -361,15 +390,94 @@ def test_world_state_verification_rejects_untrusted_source():
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "invalid_verification_source"
+    assert response.json()["detail"] == "verification_source_mismatch"
     diagnostics = client.get(
         f"/v1/runtime/sessions/{started['runtime_session']['runtime_session_id']}"
     ).json()
     event = diagnostics["events"][-1]
     assert event["event_type"] == "world_state_verification_evaluated"
     assert event["event_payload_json"]["decision"] == "rejected"
-    assert event["event_payload_json"]["reason"] == "invalid_source"
+    assert event["event_payload_json"]["reason"] == "verification_source_mismatch"
     assert "passing" not in str(event)
+
+
+def test_world_state_verification_requires_configured_trusted_verifier():
+    client = TestClient(app)
+    created = client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim()},
+    ).json()["claim"]
+
+    response = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **_base(),
+            "request_id": "verify-missing-verifier",
+            "world_state_claim_id": created["world_state_claim_id"],
+            "expected_value_digest": created["value_digest"],
+            "verification_source_type": "tool_output",
+            "verification_source_ref": "status-check:bounded",
+            "observed_at": _iso(-15),
+            "verified_at": _iso(-5),
+            "resulting_authority": "verified_tool_output",
+            "resulting_confidence": 0.97,
+            "resulting_freshness_state": "fresh",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "trusted_verifier_required"
+
+
+def test_world_state_verification_rejects_source_ref_authority_and_domain_escalation():
+    client = TestClient(app)
+    _configure_repo_verifier(max_authority="derived_from_multiple_sources")
+    created = client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim()},
+    ).json()["claim"]
+
+    base_verify = {
+        **_base(),
+        "request_id": "verify-policy",
+        "world_state_claim_id": created["world_state_claim_id"],
+        "expected_value_digest": created["value_digest"],
+        "verifier_id": "repo-status-revalidator",
+        "verification_source_type": "tool_output",
+        "verification_source_ref": "forged-ref",
+        "observed_at": _iso(-15),
+        "verified_at": _iso(-5),
+        "resulting_authority": "derived_from_multiple_sources",
+        "resulting_confidence": 0.97,
+        "resulting_freshness_state": "fresh",
+    }
+    forged = client.post("/v1/world-state/claims/verify", json=base_verify)
+    authority = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **base_verify,
+            "request_id": "verify-authority-escalation",
+            "verification_source_ref": "status-check:bounded",
+            "resulting_authority": "verified_tool_output",
+        },
+    )
+
+    _configure_repo_verifier(allowed_domains=frozenset({"active_project"}))
+    domain = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **base_verify,
+            "request_id": "verify-domain-escalation",
+            "verification_source_ref": "status-check:bounded",
+        },
+    )
+
+    assert forged.status_code == 403
+    assert forged.json()["detail"] == "verification_source_ref_not_allowed"
+    assert authority.status_code == 403
+    assert authority.json()["detail"] == "verification_authority_escalation"
+    assert domain.status_code == 403
+    assert domain.json()["detail"] == "verification_domain_not_allowed"
 
 
 def test_existing_world_state_database_upgrades_additively(tmp_path):
@@ -436,7 +544,14 @@ def test_existing_world_state_database_upgrades_additively(tmp_path):
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(runtime_world_state_claims);")}
 
-    assert {"verification_source_type", "verification_source_ref"} <= columns
+    assert {
+        "verification_verifier_id",
+        "verification_source_type",
+        "verification_source_ref",
+        "last_verified_runtime_session_id",
+        "last_verified_runtime_turn_id",
+        "last_verification_request_id",
+    } <= columns
     preserved = [*diagnostics.claims, *diagnostics.excluded_claims]
     assert preserved[0].world_state_claim_id == "legacy-claim"
 
