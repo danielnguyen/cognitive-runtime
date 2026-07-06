@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 from main import app
 from services.world_state import (
@@ -15,19 +16,19 @@ def _iso(delta_seconds: int) -> str:
     return (datetime.now(UTC) + timedelta(seconds=delta_seconds)).isoformat()
 
 
-def _base() -> dict[str, object]:
+def _base(*, surface: str = "dev") -> dict[str, object]:
     return {
         "request_id": "capability-test",
         "owner_id": "owner",
         "conversation_id": "conv-1",
-        "surface": "dev",
+        "surface": surface,
     }
 
 
-def _start_turn(client: TestClient) -> dict[str, object]:
+def _start_turn(client: TestClient, *, surface: str = "dev") -> dict[str, object]:
     return client.post(
         "/v1/runtime/turns/start",
-        json={**_base(), "request_id": "capability-turn"},
+        json={**_base(surface=surface), "request_id": "capability-turn"},
     ).json()
 
 
@@ -162,6 +163,45 @@ def _relationship(client: TestClient, **edge_overrides) -> str:
     )
     assert response.status_code == 200
     return response.json()["relationship"]["relationship_id"]
+
+
+def _relationship_requirement(
+    *,
+    relationship_scope: str = "project_context",
+    relationship_type: str = "works_on",
+) -> list[dict[str, str]]:
+    return [
+        {
+            "relationship_scope": relationship_scope,
+            "relationship_type": relationship_type,
+        }
+    ]
+
+
+def _relationship_authorization_result(
+    client: TestClient,
+    turn: dict[str, object],
+    *,
+    relationship_id: str | None = None,
+    relationship_requirements: list[dict[str, str]] | None = None,
+    **overrides,
+) -> dict[str, object]:
+    selected_relationship_ids = [relationship_id] if relationship_id else []
+    response = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            relationship_requirements=(
+                relationship_requirements
+                if relationship_requirements is not None
+                else _relationship_requirement()
+            ),
+            selected_relationship_ids=selected_relationship_ids,
+            **overrides,
+        ),
+    )
+    assert response.status_code == 200
+    return response.json()["result"]
 
 
 def _authorized_request(turn: dict[str, object], **overrides) -> dict[str, object]:
@@ -311,62 +351,270 @@ def test_exposure_denies_blocked_domain_and_unsupported_surface():
     assert "surface_unsupported" in result["reason_codes"]
 
 
-def test_relationship_required_authorization_rejects_revoked_sensitive_and_unselected_edges():
+def test_relationship_required_exposure_allows_active_eligible_relationship():
     client = TestClient(app)
     turn = _start_turn(client)
     rel_id = _relationship(client)
 
-    allowed = client.post(
-        "/v1/capabilities/authorize",
-        json=_authorized_request(
-            turn,
-            relationship_requirements=[
-                {"relationship_scope": "project_context", "relationship_type": "works_on"}
-            ],
-            selected_relationship_ids=[rel_id],
-        ),
-    ).json()["result"]
-    assert allowed["allowed"] is True
-    assert allowed["relationship_ids_used"] == [rel_id]
+    result = _relationship_authorization_result(client, turn, relationship_id=rel_id)
 
-    sensitive_rel_id = _relationship(
+    assert result["allowed"] is True
+    assert result["phase"] == "exposure"
+    assert result["relationship_ids_used"] == [rel_id]
+
+
+def test_relationship_required_selection_allows_active_eligible_relationship():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    rel_id = _relationship(client)
+
+    result = _relationship_authorization_result(
         client,
-        relationship_id="rel-sensitive",
-        sensitivity_level="restricted",
+        turn,
+        relationship_id=rel_id,
+        authorization_phase="selection",
+        argument_digest="args_relationship_selection",
     )
-    denied = client.post(
+
+    assert result["allowed"] is True
+    assert result["phase"] == "selection"
+    assert result["relationship_ids_used"] == [rel_id]
+
+
+def test_relationship_required_dispatch_allows_active_eligible_relationship():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    rel_id = _relationship(client)
+
+    result = _relationship_authorization_result(
+        client,
+        turn,
+        relationship_id=rel_id,
+        authorization_phase="dispatch",
+        argument_digest="args_relationship_dispatch",
+    )
+
+    assert result["allowed"] is True
+    assert result["phase"] == "dispatch"
+    assert result["relationship_ids_used"] == [rel_id]
+
+
+def test_relationship_required_missing_context_denies_with_bounded_reason():
+    client = TestClient(app)
+    turn = _start_turn(client)
+
+    result = _relationship_authorization_result(client, turn)
+
+    assert result["allowed"] is False
+    assert result["decision_code"] == "authorization_denied"
+    assert result["reason_codes"] == ["relationship_required"]
+    assert result["relationship_ids_used"] == []
+
+
+def test_relationship_required_uses_eligible_selection_when_no_ids_are_provided():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    rel_id = _relationship(client)
+
+    result = _relationship_authorization_result(client, turn)
+
+    assert result["allowed"] is True
+    assert result["relationship_ids_used"] == [rel_id]
+
+
+def test_selected_unrelated_relationship_denies_with_not_authorized_reason():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    rel_id = _relationship(
+        client,
+        relationship_id="rel-unrelated-type",
+        relationship_type="documents",
+    )
+
+    result = _relationship_authorization_result(client, turn, relationship_id=rel_id)
+
+    assert result["allowed"] is False
+    assert result["decision_code"] == "authorization_denied"
+    assert result["reason_codes"] == ["relationship_not_authorized"]
+    assert result["relationship_ids_used"] == []
+
+
+@pytest.mark.parametrize(
+    ("case_id", "edge_overrides", "requirement"),
+    [
+        ("revoked", {"status": "revoked"}, None),
+        ("restricted", {"sensitivity_level": "restricted"}, None),
+        ("expired", {"valid_until": _iso(-60)}, None),
+        ("provisional", {"status": "provisional", "source_type": "tool_output"}, None),
+        (
+            "low-confidence",
+            {"confidence": 0.4, "source_type": "tool_output"},
+            None,
+        ),
+        ("wrong-type", {"relationship_type": "documents"}, None),
+        (
+            "wrong-scope",
+            {"relationship_scope": "operations_context"},
+            None,
+        ),
+        (
+            "outside-active-persona-scope",
+            {"allowed_persona_scopes_json": ["personal_companion"]},
+            None,
+        ),
+    ],
+)
+def test_selected_ineligible_relationship_states_do_not_authorize(
+    case_id: str,
+    edge_overrides: dict[str, object],
+    requirement: list[dict[str, str]] | None,
+):
+    client = TestClient(app)
+    turn = _start_turn(client)
+    rel_id = _relationship(
+        client,
+        relationship_id=f"rel-{case_id}",
+        **edge_overrides,
+    )
+
+    result = _relationship_authorization_result(
+        client,
+        turn,
+        relationship_id=rel_id,
+        relationship_requirements=requirement,
+    )
+
+    assert result["allowed"] is False
+    assert result["decision_code"] == "authorization_denied"
+    assert result["reason_codes"] == ["relationship_not_authorized"]
+    assert result["relationship_ids_used"] == []
+
+
+def test_selected_conflicted_relationship_does_not_authorize():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    first_rel_id = _relationship(
+        client,
+        relationship_id="rel-conflicted-one",
+        relationship_type="defaults_to",
+    )
+    client.post(
+        "/v1/relationships/entities/upsert",
+        json={
+            **_base(),
+            "entity": {
+                "entity_id": "repo:secondary",
+                "entity_type": "repository",
+                "canonical_label": "secondary repository",
+                "domain": "project_context",
+                "sensitivity_level": "medium",
+                "source_type": "trusted_config",
+                "source_ref": "pytest",
+                "status": "active",
+            },
+        },
+    )
+    _relationship(
+        client,
+        relationship_id="rel-conflicted-two",
+        object_entity_id="repo:secondary",
+        relationship_type="defaults_to",
+    )
+
+    result = _relationship_authorization_result(
+        client,
+        turn,
+        relationship_id=first_rel_id,
+        relationship_requirements=_relationship_requirement(
+            relationship_type="defaults_to"
+        ),
+    )
+
+    assert result["allowed"] is False
+    assert result["reason_codes"] == ["relationship_not_authorized"]
+    assert result["relationship_ids_used"] == []
+
+
+def test_relationship_outside_surface_scope_does_not_authorize():
+    client = TestClient(app)
+    turn = _start_turn(client, surface="unknown")
+    rel_id = _relationship(
+        client,
+        relationship_id="rel-surface-scope",
+        relationship_scope="creative_context",
+    )
+
+    result = _relationship_authorization_result(
+        client,
+        turn,
+        relationship_id=rel_id,
+        relationship_requirements=_relationship_requirement(
+            relationship_scope="creative_context"
+        ),
+        surface="unknown",
+        active_persona_id="general_assistant",
+        capability_domain="general_assistance",
+        supported_surfaces=["unknown"],
+    )
+
+    assert result["allowed"] is False
+    assert result["reason_codes"] == ["relationship_not_authorized"]
+    assert result["relationship_ids_used"] == []
+
+
+def test_relationship_ids_used_are_bounded_to_eligible_selected_ids():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    eligible_rel_id = _relationship(client, relationship_id="rel-eligible")
+    wrong_type_rel_id = _relationship(
+        client,
+        relationship_id="rel-wrong-type",
+        relationship_type="documents",
+    )
+
+    result = client.post(
         "/v1/capabilities/authorize",
         json=_authorized_request(
             turn,
-            relationship_requirements=[
-                {"relationship_scope": "project_context", "relationship_type": "works_on"}
-            ],
-            selected_relationship_ids=[sensitive_rel_id],
+            relationship_requirements=_relationship_requirement(),
+            selected_relationship_ids=[eligible_rel_id, wrong_type_rel_id],
         ),
     ).json()["result"]
-    assert denied["allowed"] is False
-    assert "relationship_not_authorized" in denied["reason_codes"]
 
-    revoked = client.post(
-        "/v1/relationships/edges/revoke",
-        json={**_base(), "relationship_id": rel_id},
+    assert result["allowed"] is True
+    assert result["relationship_ids_used"] == [eligible_rel_id]
+    assert wrong_type_rel_id not in result["relationship_ids_used"]
+    assert "source_refs_json" not in str(result)
+    assert "pytest" not in str(result)
+
+
+def test_relationship_authorization_event_records_bounded_ids_and_reasons():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    rel_id = _relationship(client, relationship_id="rel-event-bounded")
+
+    result = _relationship_authorization_result(
+        client,
+        turn,
+        relationship_id=rel_id,
+        request_id="relationship-event-allow",
     )
-    assert revoked.status_code == 200
-    denied_after_revoke = client.post(
-        "/v1/capabilities/authorize",
-        json=_authorized_request(
-            turn,
-            authorization_phase="dispatch",
-            argument_digest="args_read_1",
-            relationship_requirements=[
-                {"relationship_scope": "project_context", "relationship_type": "works_on"}
-            ],
-            selected_relationship_ids=[rel_id],
-        ),
-    ).json()["result"]
-    assert denied_after_revoke["allowed"] is False
-    assert "relationship_not_authorized" in denied_after_revoke["reason_codes"]
+    assert result["allowed"] is True
 
+    runtime_session_id = turn["runtime_session"]["runtime_session_id"]
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}").json()
+    event_payload = [
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "capability_authorization_evaluated"
+        and event["event_payload_json"]["request_id"] == "relationship-event-allow"
+    ][-1]
+
+    assert event_payload["relationship_ids_used"] == [rel_id]
+    assert event_payload["reason_codes"] == ["allowed"]
+    assert "source_refs_json" not in str(event_payload)
+    assert "relationship_evidence" not in str(event_payload)
+    assert "pytest" not in str(event_payload)
 
 def test_selection_dispatch_world_state_revalidation_then_verification_rerun():
     client = TestClient(app)
