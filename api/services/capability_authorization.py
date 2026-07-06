@@ -181,6 +181,7 @@ class CapabilityAuthorizationRepository:
             body.operation_class in _RISKY_OPERATION_CLASSES
             or world_state_confirmation_required
         )
+        challenge_reasons: list[str] = []
         if confirmation_needed:
             if body.authorization_phase == "selection":
                 if not body.runtime_turn_id:
@@ -194,10 +195,6 @@ class CapabilityAuthorizationRepository:
                     confirmation_state = "required"
             elif body.authorization_phase == "dispatch":
                 confirmation_state = "required"
-                challenge_reasons = self._consume_dispatch_challenge_atomic(body)
-                reason_codes.extend(challenge_reasons)
-                if not challenge_reasons:
-                    confirmation_state = "accepted"
             else:
                 confirmation_state = "required"
 
@@ -206,6 +203,23 @@ class CapabilityAuthorizationRepository:
             and "world_state_revalidation_required" not in reason_codes
         ):
             reason_codes.append("world_state_revalidation_required")
+
+        non_challenge_reasons = [
+            code
+            for code in reason_codes
+            if not code.startswith("challenge_")
+            and code not in {"confirmation_required"}
+        ]
+        if (
+            confirmation_needed
+            and body.authorization_phase == "dispatch"
+            and revalidation_selector is None
+            and not non_challenge_reasons
+        ):
+            challenge_reasons = self._consume_dispatch_challenge_atomic(body)
+            reason_codes.extend(challenge_reasons)
+            if not challenge_reasons:
+                confirmation_state = "accepted"
 
         allowed = not reason_codes
         decision_code = "allowed"
@@ -532,6 +546,8 @@ class CapabilityAuthorizationRepository:
         return challenge_ref
 
     def _consume_dispatch_challenge_atomic(self, body: CapabilityAuthorizationRequest) -> list[str]:
+        if not body.runtime_turn_id:
+            return ["dispatch_turn_required"]
         if not body.confirmation_challenge_ref:
             return ["challenge_missing"]
         now = _now()
@@ -558,6 +574,13 @@ class CapabilityAuthorizationRepository:
             if row["status"] != "accepted":
                 conn.rollback()
                 return ["challenge_not_confirmed"]
+            if row["confirmed_runtime_turn_id"] != body.runtime_turn_id:
+                conn.rollback()
+                return ["challenge_turn_mismatch"]
+            turn_current_reason = self._dispatch_turn_current_reason(conn, row, body)
+            if turn_current_reason is not None:
+                conn.rollback()
+                return [turn_current_reason]
             cursor = conn.execute(
                 """
                 UPDATE capability_confirmation_challenges
@@ -570,6 +593,7 @@ class CapabilityAuthorizationRepository:
                   AND operation_class = ?
                   AND argument_digest = ?
                   AND status = 'accepted'
+                  AND confirmed_runtime_turn_id = ?
                   AND consumed_at IS NULL
                   AND expires_at > ?;
                 """,
@@ -583,6 +607,7 @@ class CapabilityAuthorizationRepository:
                     body.capability_id,
                     body.operation_class,
                     body.argument_digest,
+                    body.runtime_turn_id,
                     now,
                 ),
             )
@@ -608,6 +633,50 @@ class CapabilityAuthorizationRepository:
             },
         )
         return []
+
+    def _dispatch_turn_current_reason(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        body: CapabilityAuthorizationRequest,
+    ) -> str | None:
+        turn = conn.execute(
+            """
+            SELECT * FROM conversation_runtime_turns
+            WHERE runtime_session_id = ? AND runtime_turn_id = ?
+            LIMIT 1;
+            """,
+            (body.runtime_session_id, body.runtime_turn_id),
+        ).fetchone()
+        if turn is None:
+            return "runtime_turn_mismatch"
+        if turn["turn_status"] in {"completed", "abandoned"}:
+            return "confirmation_turn_not_current"
+        if _parse_ts(turn["created_at"]) <= _parse_ts(row["issued_at"]):
+            return "confirmation_turn_not_current"
+        active_turn = conn.execute(
+            """
+            SELECT runtime_turn_id FROM conversation_runtime_turns
+            WHERE runtime_session_id = ? AND turn_status NOT IN ('completed', 'abandoned')
+            ORDER BY id DESC
+            LIMIT 1;
+            """,
+            (body.runtime_session_id,),
+        ).fetchone()
+        latest_turn = conn.execute(
+            """
+            SELECT runtime_turn_id FROM conversation_runtime_turns
+            WHERE runtime_session_id = ?
+            ORDER BY id DESC
+            LIMIT 1;
+            """,
+            (body.runtime_session_id,),
+        ).fetchone()
+        if active_turn is None or active_turn["runtime_turn_id"] != body.runtime_turn_id:
+            return "confirmation_turn_not_current"
+        if latest_turn is None or latest_turn["runtime_turn_id"] != body.runtime_turn_id:
+            return "confirmation_turn_not_current"
+        return None
 
     def _validate_current_confirmation_turn(
         self,
