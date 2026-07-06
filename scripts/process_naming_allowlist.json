@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "reviewed_at": "2026-07-06",
+  "reviewed_by": "Codex",
+  "entries": [
+    {
+      "path": "api/models.py",
+      "token": "phase",
+      "pattern": "phase",
+      "bucket": "domain-approved capability authorization terminology",
+      "reason": "Existing capability authorization response model exposes phase as part of the current API contract; renaming it would be a compatibility migration.",
+      "context_contains": "phase: CapabilityAuthorizationPhase",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/models.py",
+      "token": "pass",
+      "pattern": "pass",
+      "bucket": "domain-approved diagnostic status terminology",
+      "reason": "Existing diagnostic result status uses pass/warn/fail terminology; changing the API enum is out of scope for this baseline guardrail.",
+      "context_contains": "DiagnosticResult = Literal[\"pass\", \"warn\", \"fail\"]",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/capability_authorization.py",
+      "token": "phase",
+      "pattern": "phase",
+      "bucket": "domain-approved capability authorization terminology",
+      "reason": "Existing authorization logic branches on authorization_phase as part of the current capability authorization API contract.",
+      "context_contains": "if body.authorization_phase in {\"selection\", \"dispatch\"} and not body.argument_digest:",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/capability_authorization.py",
+      "token": "phase",
+      "pattern": "phase",
+      "bucket": "domain-approved capability authorization terminology",
+      "reason": "Existing authorization challenge issuance depends on the selection authorization phase; renaming would change current API semantics.",
+      "context_contains": "if body.authorization_phase == \"selection\":",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/capability_authorization.py",
+      "token": "phase",
+      "pattern": "phase",
+      "bucket": "domain-approved capability authorization terminology",
+      "reason": "Existing authorization challenge flow depends on the dispatch authorization phase; renaming would change current API semantics.",
+      "context_contains": "elif body.authorization_phase == \"dispatch\":",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/capability_authorization.py",
+      "token": "phase",
+      "pattern": "phase",
+      "bucket": "domain-approved capability authorization terminology",
+      "reason": "Existing dispatch confirmation logic uses authorization_phase as part of the current capability authorization API contract.",
+      "context_contains": "and body.authorization_phase == \"dispatch\"",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/capability_authorization.py",
+      "token": "phase",
+      "pattern": "phase",
+      "bucket": "domain-approved capability authorization terminology",
+      "reason": "Existing authorization result copies the request authorization_phase into the phase API field; renaming would change current API behavior.",
+      "context_contains": "phase=body.authorization_phase,",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/capability_authorization.py",
+      "token": "phase",
+      "pattern": "phase",
+      "bucket": "domain-approved capability authorization terminology",
+      "reason": "Existing runtime trace payload records phase for capability authorization events; renaming would change the current trace contract.",
+      "context_contains": "\"phase\": body.authorization_phase,",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/interaction_diagnostics.py",
+      "token": "PASS",
+      "pattern": "pass",
+      "bucket": "domain-approved diagnostic status terminology",
+      "reason": "Existing diagnostic pass constant is status vocabulary for the diagnostic API, not delivery-process naming.",
+      "context_contains": "_DIAGNOSTIC_PASS = \"pass\"",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/interaction_diagnostics.py",
+      "token": "pass",
+      "pattern": "pass",
+      "bucket": "domain-approved diagnostic status terminology",
+      "reason": "Existing diagnostic pass status value is part of current pass/warn/fail diagnostic behavior.",
+      "context_contains": "_DIAGNOSTIC_PASS = \"pass\"",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/interaction_diagnostics.py",
+      "token": "PASS",
+      "pattern": "pass",
+      "bucket": "domain-approved diagnostic status terminology",
+      "reason": "Existing diagnostic result returns the pass status constant for no-finding cases; changing it would alter current diagnostic behavior.",
+      "context_contains": "return _DIAGNOSTIC_PASS",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": false
+    },
+    {
+      "path": "api/services/persona_containment.py",
+      "token": "cluster",
+      "pattern": "cluster",
+      "bucket": "ambiguous infrastructure-domain terminology",
+      "reason": "Existing persona containment marker recognizes infrastructure cluster wording in user text; changing classifier vocabulary is out of scope for this baseline guardrail.",
+      "context_contains": "\"cluster\",",
+      "reviewed_at": "2026-07-06",
+      "reviewed_by": "Codex",
+      "removal_required_later": true
+    }
+  ]
+}
