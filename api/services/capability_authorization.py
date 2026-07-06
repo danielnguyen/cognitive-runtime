@@ -27,7 +27,10 @@ from services.runtime_state import (
     runtime_state_db_path,
     validate_runtime_turn_session,
 )
-from services.world_state import resolve_world_state
+from services.world_state import (
+    resolve_world_state,
+    trusted_world_state_verifier_selector_reason,
+)
 
 _CAPABILITY_AUTH_REPOSITORY: CapabilityAuthorizationRepository | None = None
 _RISKY_OPERATION_CLASSES = {"external_write", "destructive", "high_impact"}
@@ -187,7 +190,7 @@ class CapabilityAuthorizationRepository:
                 if not body.runtime_turn_id:
                     confirmation_state = "required"
                     reason_codes.append("originating_turn_required")
-                elif body.argument_digest and not reason_codes:
+                elif body.argument_digest and not reason_codes and revalidation_selector is None:
                     challenge_ref = self._issue_challenge(body)
                     confirmation_state = "issued"
                     reason_codes.append("confirmation_required")
@@ -198,10 +201,9 @@ class CapabilityAuthorizationRepository:
             else:
                 confirmation_state = "required"
 
-        if (
-            revalidation_selector is not None
-            and "world_state_revalidation_required" not in reason_codes
-        ):
+        if revalidation_selector is not None and reason_codes:
+            revalidation_selector = None
+        if revalidation_selector is not None:
             reason_codes.append("world_state_revalidation_required")
 
         non_challenge_reasons = [
@@ -394,9 +396,37 @@ class CapabilityAuthorizationRepository:
         claim_map = {claim.world_state_claim_id: claim for claim in resolved.included_claims}
         reasons: list[str] = []
         used: list[str] = []
-        revalidation_claims: list[str] = []
-        revalidator_id: str | None = None
+        revalidation_candidates: dict[str, set[str]] = {}
         confirmation_required = False
+
+        def add_revalidation_candidate(
+            *,
+            claim_id: str,
+            claim: Any,
+            revalidator_id: str | None,
+            min_authority: str | None = None,
+            min_confidence: float | None = None,
+            max_freshness_state: str | None = None,
+        ) -> None:
+            if (
+                claim.last_verified_runtime_session_id == body.runtime_session_id
+                and claim.last_verified_runtime_turn_id == body.runtime_turn_id
+            ):
+                reasons.append("world_state_revalidation_inadequate")
+                return
+            reason = trusted_world_state_verifier_selector_reason(
+                verifier_id=revalidator_id,
+                claim=claim,
+                min_authority=min_authority,
+                min_confidence=min_confidence,
+                max_freshness_state=max_freshness_state,
+            )
+            if reason is not None:
+                reasons.append(reason)
+                return
+            assert revalidator_id is not None
+            revalidation_candidates.setdefault(revalidator_id, set()).add(claim_id)
+
         for requirement in body.world_state_requirements:
             candidates = [
                 claim_map[claim_id]
@@ -424,38 +454,61 @@ class CapabilityAuthorizationRepository:
                     "expired",
                     "superseded",
                     "conflicted",
-                    "unknown",
                 }:
                     reasons.append("world_state_not_authorized")
                     continue
-                if claim.effective_freshness_state == "stale" and requirement.revalidator_id:
-                    revalidation_claims.append(claim.world_state_claim_id)
-                    revalidator_id = requirement.revalidator_id
+                if claim.effective_freshness_state in {"stale", "unknown"}:
+                    add_revalidation_candidate(
+                        claim_id=claim.world_state_claim_id,
+                        claim=claim,
+                        revalidator_id=requirement.revalidator_id,
+                        max_freshness_state=requirement.max_freshness_state or "aging",
+                    )
                     continue
                 if requirement.max_freshness_state and (
                     _FRESHNESS_ORDER[claim.effective_freshness_state]
                     > _FRESHNESS_ORDER[requirement.max_freshness_state]
                 ):
-                    reasons.append("world_state_not_authorized")
+                    add_revalidation_candidate(
+                        claim_id=claim.world_state_claim_id,
+                        claim=claim,
+                        revalidator_id=requirement.revalidator_id,
+                        max_freshness_state=requirement.max_freshness_state,
+                    )
                     continue
                 if (
                     requirement.min_confidence is not None
                     and claim.confidence < requirement.min_confidence
                 ):
-                    reasons.append("world_state_not_authorized")
+                    add_revalidation_candidate(
+                        claim_id=claim.world_state_claim_id,
+                        claim=claim,
+                        revalidator_id=requirement.revalidator_id,
+                        min_confidence=requirement.min_confidence,
+                    )
                     continue
                 if requirement.min_authority and (
                     _AUTHORIZED_AUTHORITIES[claim.state_authority]
                     < _AUTHORIZED_AUTHORITIES[requirement.min_authority]
                 ):
-                    reasons.append("world_state_not_authorized")
+                    add_revalidation_candidate(
+                        claim_id=claim.world_state_claim_id,
+                        claim=claim,
+                        revalidator_id=requirement.revalidator_id,
+                        min_authority=requirement.min_authority,
+                    )
                     continue
                 if body.operation_class in _RISKY_OPERATION_CLASSES and claim.state_authority in {
                     "model_inferred",
                     "unverified_assumption",
                     "observed_user_report",
                 }:
-                    reasons.append("world_state_not_authorized")
+                    add_revalidation_candidate(
+                        claim_id=claim.world_state_claim_id,
+                        claim=claim,
+                        revalidator_id=requirement.revalidator_id,
+                        min_authority="derived_from_multiple_sources",
+                    )
                     continue
                 if (
                     claim.confirmation_policy == "confirm_before_action"
@@ -472,17 +525,21 @@ class CapabilityAuthorizationRepository:
                         claim.last_verified_runtime_session_id != body.runtime_session_id
                         or claim.last_verified_runtime_turn_id != body.runtime_turn_id
                     ):
-                        if requirement.revalidator_id:
-                            revalidation_claims.append(claim.world_state_claim_id)
-                            revalidator_id = requirement.revalidator_id
-                            continue
-                        reasons.append("world_state_revalidation_required")
+                        add_revalidation_candidate(
+                            claim_id=claim.world_state_claim_id,
+                            claim=claim,
+                            revalidator_id=requirement.revalidator_id,
+                            max_freshness_state=requirement.max_freshness_state or "aging",
+                        )
                         continue
                 used.append(claim.world_state_claim_id)
         selector = None
-        if revalidation_claims and revalidator_id:
+        if len(revalidation_candidates) > 1:
+            reasons.append("world_state_revalidator_conflict")
+        if revalidation_candidates and not reasons:
+            revalidator_id, claim_ids = next(iter(revalidation_candidates.items()))
             selector = CapabilityRevalidationSelector(
-                world_state_claim_ids=sorted(set(revalidation_claims)),
+                world_state_claim_ids=sorted(claim_ids),
                 revalidator_id=revalidator_id,
             )
         return sorted(set(reasons)), sorted(set(used)), selector, confirmation_required

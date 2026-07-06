@@ -1,0 +1,16 @@
+verifiers:
+  - verifier_id: repo-status-revalidator
+    verification_source_type: tool_output
+    allowed_source_refs:
+      - repo-status-revalidator
+    max_authority: verified_tool_output
+    allowed_domains:
+      - active_repository
+      - active_project
+      - active_tool_session
+    allowed_attributes: []
+    allowed_entity_ids: []
+    max_confidence: 0.95
+    max_ttl_seconds: 900
+    max_revalidation_interval_seconds: 300
+    max_freshness_state: fresh

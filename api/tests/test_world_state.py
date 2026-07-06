@@ -3,12 +3,15 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 from main import app
 from services.world_state import (
     TrustedWorldStateVerifier,
     WorldStateRepository,
+    clear_trusted_world_state_verifiers_for_tests,
     configure_trusted_world_state_verifiers_for_tests,
+    trusted_world_state_verifiers,
 )
 
 
@@ -41,6 +44,43 @@ def _configure_repo_verifier(**overrides) -> None:
     configure_trusted_world_state_verifiers_for_tests([
         TrustedWorldStateVerifier(**{**verifier.__dict__, **overrides})
     ])
+
+
+def _registry_yaml(**overrides) -> str:
+    values = {
+        "verifier_id": "repo-status-revalidator",
+        "verification_source_type": "tool_output",
+        "allowed_source_refs": ["status-check:bounded"],
+        "max_authority": "verified_tool_output",
+        "allowed_domains": ["active_repository"],
+        "allowed_attributes": ["branch_status"],
+        "allowed_entity_ids": [],
+        "max_confidence": 0.99,
+        "max_ttl_seconds": 600,
+        "max_revalidation_interval_seconds": 300,
+        "max_freshness_state": "fresh",
+    }
+    values.update(overrides)
+    lines = ["verifiers:", "  - verifier_id: " + str(values["verifier_id"])]
+    for key in (
+        "verification_source_type",
+        "max_authority",
+        "max_confidence",
+        "max_ttl_seconds",
+        "max_revalidation_interval_seconds",
+        "max_freshness_state",
+    ):
+        lines.append(f"    {key}: {values[key]}")
+    for key in (
+        "allowed_source_refs",
+        "allowed_domains",
+        "allowed_attributes",
+        "allowed_entity_ids",
+    ):
+        lines.append(f"    {key}:")
+        for item in values[key]:
+            lines.append(f"      - {item}")
+    return "\n".join(lines) + "\n"
 
 
 def _claim(**overrides) -> dict[str, object]:
@@ -297,7 +337,6 @@ def test_world_state_authoritative_verification_persists_transition_and_source()
             "resulting_authority": "verified_tool_output",
             "resulting_confidence": 0.97,
             "resulting_freshness_state": "fresh",
-            "resulting_expires_at": _iso(600),
             "resulting_ttl_seconds": 600,
             "resulting_revalidation_interval_seconds": 300,
         },
@@ -427,6 +466,139 @@ def test_world_state_verification_requires_configured_trusted_verifier():
 
     assert response.status_code == 400
     assert response.json()["detail"] == "trusted_verifier_required"
+
+
+def test_world_state_verification_loads_production_registry_from_env(tmp_path, monkeypatch):
+    client = TestClient(app)
+    clear_trusted_world_state_verifiers_for_tests()
+    registry_path = tmp_path / "trusted-verifiers.yaml"
+    registry_path.write_text(_registry_yaml(), encoding="utf-8")
+    monkeypatch.setenv("TRUSTED_WORLD_STATE_VERIFIERS_PATH", str(registry_path))
+    created = client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim()},
+    ).json()["claim"]
+
+    response = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **_base(),
+            "request_id": "verify-env-registry",
+            "world_state_claim_id": created["world_state_claim_id"],
+            "expected_value_digest": created["value_digest"],
+            "verifier_id": "repo-status-revalidator",
+            "verification_source_type": "tool_output",
+            "verification_source_ref": "status-check:bounded",
+            "observed_at": _iso(-15),
+            "verified_at": _iso(-5),
+            "resulting_authority": "verified_tool_output",
+            "resulting_confidence": 0.97,
+            "resulting_freshness_state": "fresh",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["claim"]["verification_verifier_id"] == "repo-status-revalidator"
+
+
+def test_trusted_verifier_registry_invalid_configs_fail_closed(tmp_path, monkeypatch):
+    clear_trusted_world_state_verifiers_for_tests()
+    missing_path = tmp_path / "missing.yaml"
+    monkeypatch.setenv("TRUSTED_WORLD_STATE_VERIFIERS_PATH", str(missing_path))
+    with pytest.raises(RuntimeError, match="trusted_verifier_registry_invalid"):
+        trusted_world_state_verifiers()
+
+    duplicate_entries = "verifiers:\n" + _registry_yaml().replace("verifiers:\n", "", 1) * 2
+    for name, content in {
+        "malformed.yaml": "verifiers: [",
+        "duplicate.yaml": duplicate_entries,
+        "invalid-policy.yaml": _registry_yaml(allowed_source_refs=[]),
+        "unknown-field.yaml": _registry_yaml() + "    surprise: nope\n",
+    }.items():
+        clear_trusted_world_state_verifiers_for_tests()
+        registry_path = tmp_path / name
+        registry_path.write_text(content, encoding="utf-8")
+        monkeypatch.setenv("TRUSTED_WORLD_STATE_VERIFIERS_PATH", str(registry_path))
+        with pytest.raises(RuntimeError, match="trusted_verifier_registry_invalid"):
+            trusted_world_state_verifiers()
+
+
+def test_world_state_verification_uses_configured_temporal_bounds_when_omitted():
+    client = TestClient(app)
+    _configure_repo_verifier()
+    created = client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim(source_type="user_report")},
+    ).json()["claim"]
+
+    response = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **_base(),
+            "request_id": "verify-omitted-bounds",
+            "world_state_claim_id": created["world_state_claim_id"],
+            "expected_value_digest": created["value_digest"],
+            "verifier_id": "repo-status-revalidator",
+            "verification_source_type": "tool_output",
+            "verification_source_ref": "status-check:bounded",
+            "observed_at": _iso(-15),
+            "verified_at": _iso(-5),
+            "resulting_authority": "verified_tool_output",
+            "resulting_confidence": 0.97,
+            "resulting_freshness_state": "fresh",
+        },
+    )
+
+    assert response.status_code == 200
+    claim = response.json()["claim"]
+    assert claim["ttl_seconds"] == 600
+    assert claim["revalidation_interval_seconds"] == 300
+    assert claim["expires_at"] is not None
+
+
+def test_world_state_verification_rejects_unbounded_time_without_mutation():
+    client = TestClient(app)
+    _configure_repo_verifier()
+    created = client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim(source_type="user_report")},
+    ).json()["claim"]
+    before = client.post("/v1/world-state/diagnostics", json=_base()).json()
+    base_verify = {
+        **_base(),
+        "world_state_claim_id": created["world_state_claim_id"],
+        "expected_value_digest": created["value_digest"],
+        "verifier_id": "repo-status-revalidator",
+        "verification_source_type": "tool_output",
+        "verification_source_ref": "status-check:bounded",
+        "observed_at": _iso(-15),
+        "verified_at": _iso(-5),
+        "resulting_authority": "verified_tool_output",
+        "resulting_confidence": 0.97,
+        "resulting_freshness_state": "fresh",
+    }
+
+    oversized_ttl = client.post(
+        "/v1/world-state/claims/verify",
+        json={**base_verify, "request_id": "verify-ttl-too-large", "resulting_ttl_seconds": 601},
+    )
+    future_observation = client.post(
+        "/v1/world-state/claims/verify",
+        json={**base_verify, "request_id": "verify-future-observed", "observed_at": _iso(60)},
+    )
+    late_expiry = client.post(
+        "/v1/world-state/claims/verify",
+        json={**base_verify, "request_id": "verify-late-expiry", "resulting_expires_at": _iso(600)},
+    )
+    after = client.post("/v1/world-state/diagnostics", json=_base()).json()
+
+    assert oversized_ttl.status_code == 403
+    assert oversized_ttl.json()["detail"] == "verification_ttl_escalation"
+    assert future_observation.status_code == 400
+    assert future_observation.json()["detail"] == "verification_timestamp_in_future"
+    assert late_expiry.status_code == 403
+    assert late_expiry.json()["detail"] == "verification_expiry_escalation"
+    assert after == before
 
 
 def test_world_state_verification_rejects_source_ref_authority_and_domain_escalation():

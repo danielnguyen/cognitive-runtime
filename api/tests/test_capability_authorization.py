@@ -40,12 +40,43 @@ def _configure_repo_verifier() -> None:
                 allowed_source_refs=frozenset({"repo-status-revalidator"}),
                 max_authority="verified_tool_output",
                 allowed_domains=frozenset({"active_repository"}),
-                allowed_attributes=frozenset({"branch_status"}),
+                allowed_attributes=frozenset({"branch_status", "build_status"}),
                 max_confidence=0.99,
                 max_freshness_state="fresh",
                 max_ttl_seconds=600,
                 max_revalidation_interval_seconds=300,
             )
+        ]
+    )
+
+
+def _configure_two_repo_verifiers() -> None:
+    configure_trusted_world_state_verifiers_for_tests(
+        [
+            TrustedWorldStateVerifier(
+                verifier_id="repo-status-revalidator",
+                verification_source_type="tool_output",
+                allowed_source_refs=frozenset({"repo-status-revalidator"}),
+                max_authority="verified_tool_output",
+                allowed_domains=frozenset({"active_repository"}),
+                allowed_attributes=frozenset({"branch_status"}),
+                max_confidence=0.99,
+                max_freshness_state="fresh",
+                max_ttl_seconds=600,
+                max_revalidation_interval_seconds=300,
+            ),
+            TrustedWorldStateVerifier(
+                verifier_id="build-status-revalidator",
+                verification_source_type="tool_output",
+                allowed_source_refs=frozenset({"build-status-revalidator"}),
+                max_authority="verified_tool_output",
+                allowed_domains=frozenset({"active_repository"}),
+                allowed_attributes=frozenset({"build_status"}),
+                max_confidence=0.99,
+                max_freshness_state="fresh",
+                max_ttl_seconds=600,
+                max_revalidation_interval_seconds=300,
+            ),
         ]
     )
 
@@ -394,7 +425,6 @@ def test_selection_dispatch_world_state_revalidation_then_verification_rerun():
             "resulting_authority": "verified_tool_output",
             "resulting_confidence": 0.98,
             "resulting_freshness_state": "fresh",
-            "resulting_expires_at": _iso(600),
             "resulting_ttl_seconds": 600,
             "resulting_revalidation_interval_seconds": 300,
         },
@@ -454,7 +484,6 @@ def test_reverify_before_use_requires_current_turn_verification_then_rerun_allow
             "resulting_authority": "verified_tool_output",
             "resulting_confidence": 0.98,
             "resulting_freshness_state": "fresh",
-            "resulting_expires_at": _iso(600),
             "resulting_ttl_seconds": 600,
             "resulting_revalidation_interval_seconds": 300,
         },
@@ -464,6 +493,329 @@ def test_reverify_before_use_requires_current_turn_verification_then_rerun_allow
     rerun = client.post("/v1/capabilities/authorize", json=request).json()["result"]
     assert rerun["allowed"] is True
     assert rerun["revalidation_required"] is False
+
+
+def test_stale_world_state_without_configured_verifier_denies_without_selector():
+    client = TestClient(app)
+    turn = _start_turn(client)
+    stale_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                observed_at=_iso(-500),
+                expires_at=None,
+                ttl_seconds=None,
+                revalidation_interval_seconds=300,
+            ),
+        },
+    ).json()["claim"]
+
+    result = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            argument_digest="args_stale_without_revalidator",
+            world_state_requirements=[{"domain": "active_repository"}],
+            selected_world_state_claim_ids=[stale_claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+
+    assert result["allowed"] is False
+    assert result["decision_code"] == "authorization_denied"
+    assert "world_state_revalidator_required" in result["reason_codes"]
+    assert result["revalidation_selector"] is None
+    assert result["world_state_claim_ids_used"] == []
+
+
+def test_unknown_or_unauthorized_revalidator_returns_no_selector():
+    client = TestClient(app)
+    _configure_repo_verifier()
+    turn = _start_turn(client)
+    stale_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                observed_at=_iso(-500),
+                expires_at=None,
+                ttl_seconds=None,
+                revalidation_interval_seconds=300,
+            ),
+        },
+    ).json()["claim"]
+    build_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                attribute="other_status",
+                value_json={"status": "stale"},
+                observed_at=_iso(-500),
+                expires_at=None,
+                ttl_seconds=None,
+                revalidation_interval_seconds=300,
+            ),
+        },
+    ).json()["claim"]
+
+    unknown = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            argument_digest="args_unknown_revalidator",
+            world_state_requirements=[
+                {"domain": "active_repository", "revalidator_id": "missing-revalidator"}
+            ],
+            selected_world_state_claim_ids=[stale_claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+    unauthorized = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            argument_digest="args_unauthorized_revalidator",
+            world_state_requirements=[
+                {"domain": "active_repository", "revalidator_id": "repo-status-revalidator"}
+            ],
+            selected_world_state_claim_ids=[build_claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+
+    assert "world_state_revalidator_not_configured" in unknown["reason_codes"]
+    assert unknown["revalidation_selector"] is None
+    assert "world_state_revalidator_not_authorized" in unauthorized["reason_codes"]
+    assert unauthorized["revalidation_selector"] is None
+
+
+def test_low_confidence_and_authority_use_configured_revalidation_rule():
+    client = TestClient(app)
+    _configure_repo_verifier()
+    turn = _start_turn(client)
+    claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(confidence=0.5, state_authority="observed_user_report"),
+        },
+    ).json()["claim"]
+
+    result = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            argument_digest="args_low_quality_revalidator",
+            world_state_requirements=[
+                {
+                    "domain": "active_repository",
+                    "attribute": "branch_status",
+                    "min_authority": "verified_tool_output",
+                    "min_confidence": 0.9,
+                    "revalidator_id": "repo-status-revalidator",
+                }
+            ],
+            selected_world_state_claim_ids=[claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+
+    assert result["decision_code"] == "revalidation_required"
+    assert result["revalidation_selector"] == {
+        "world_state_claim_ids": [claim["world_state_claim_id"]],
+        "revalidator_id": "repo-status-revalidator",
+    }
+    assert result["world_state_claim_ids_used"] == []
+
+
+def test_mixed_revalidators_fail_closed_without_mixing_claim_ids():
+    client = TestClient(app)
+    _configure_two_repo_verifiers()
+    turn = _start_turn(client)
+    branch_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                observed_at=_iso(-500),
+                expires_at=None,
+                ttl_seconds=None,
+                revalidation_interval_seconds=300,
+            ),
+        },
+    ).json()["claim"]
+    build_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                attribute="build_status",
+                value_json={"status": "stale"},
+                observed_at=_iso(-500),
+                expires_at=None,
+                ttl_seconds=None,
+                revalidation_interval_seconds=300,
+            ),
+        },
+    ).json()["claim"]
+
+    result = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            argument_digest="args_mixed_revalidators",
+            world_state_requirements=[
+                {
+                    "domain": "active_repository",
+                    "attribute": "branch_status",
+                    "revalidator_id": "repo-status-revalidator",
+                },
+                {
+                    "domain": "active_repository",
+                    "attribute": "build_status",
+                    "revalidator_id": "build-status-revalidator",
+                },
+            ],
+            selected_world_state_claim_ids=[
+                branch_claim["world_state_claim_id"],
+                build_claim["world_state_claim_id"],
+            ],
+        ),
+    ).json()["result"]
+
+    assert result["decision_code"] == "authorization_denied"
+    assert "world_state_revalidator_conflict" in result["reason_codes"]
+    assert result["revalidation_selector"] is None
+    assert result["world_state_claim_ids_used"] == []
+
+
+def test_hard_denial_takes_precedence_over_revalidation_and_challenge():
+    client = TestClient(app)
+    _configure_repo_verifier()
+    turn = _start_turn(client)
+    stale_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                observed_at=_iso(-500),
+                expires_at=None,
+                ttl_seconds=None,
+                revalidation_interval_seconds=300,
+            ),
+        },
+    ).json()["claim"]
+
+    result = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            active_persona_id="personal_companion",
+            authorization_phase="selection",
+            operation_class="external_write",
+            argument_digest="args_hard_denial_plus_stale",
+            world_state_requirements=[
+                {"domain": "active_repository", "revalidator_id": "repo-status-revalidator"}
+            ],
+            selected_world_state_claim_ids=[stale_claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+
+    assert result["decision_code"] == "authorization_denied"
+    assert "persona_mismatch" in result["reason_codes"]
+    assert result["revalidation_selector"] is None
+    assert result["challenge_ref"] is None
+
+
+def test_revalidation_required_selection_issues_no_confirmation_challenge():
+    client = TestClient(app)
+    _configure_repo_verifier()
+    turn = _start_turn(client)
+    stale_claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={
+            **_base(),
+            "claim": _claim(
+                observed_at=_iso(-500),
+                expires_at=None,
+                ttl_seconds=None,
+                revalidation_interval_seconds=300,
+            ),
+        },
+    ).json()["claim"]
+
+    result = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            operation_class="external_write",
+            argument_digest="args_revalidation_no_challenge",
+            world_state_requirements=[
+                {"domain": "active_repository", "revalidator_id": "repo-status-revalidator"}
+            ],
+            selected_world_state_claim_ids=[stale_claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+
+    assert result["decision_code"] == "revalidation_required"
+    assert result["confirmation_state"] == "required"
+    assert result["challenge_ref"] is None
+
+
+def test_current_turn_verification_that_remains_inadequate_does_not_loop():
+    client = TestClient(app)
+    _configure_repo_verifier()
+    turn = _start_turn(client)
+    claim = client.post(
+        "/v1/world-state/claims/upsert",
+        json={**_base(), "claim": _claim(source_type="user_report")},
+    ).json()["claim"]
+    verified = client.post(
+        "/v1/world-state/claims/verify",
+        json={
+            **_base(),
+            "request_id": "verify-current-turn-low-confidence",
+            "runtime_session_id": turn["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": turn["runtime_turn"]["runtime_turn_id"],
+            "world_state_claim_id": claim["world_state_claim_id"],
+            "expected_value_digest": claim["value_digest"],
+            "verifier_id": "repo-status-revalidator",
+            "verification_source_type": "tool_output",
+            "verification_source_ref": "repo-status-revalidator",
+            "observed_at": _iso(-10),
+            "verified_at": _iso(-5),
+            "resulting_authority": "verified_tool_output",
+            "resulting_confidence": 0.5,
+            "resulting_freshness_state": "fresh",
+        },
+    )
+    assert verified.status_code == 200
+
+    result = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorized_request(
+            turn,
+            authorization_phase="selection",
+            argument_digest="args_current_turn_inadequate",
+            world_state_requirements=[
+                {
+                    "domain": "active_repository",
+                    "attribute": "branch_status",
+                    "min_confidence": 0.9,
+                    "revalidator_id": "repo-status-revalidator",
+                }
+            ],
+            selected_world_state_claim_ids=[claim["world_state_claim_id"]],
+        ),
+    ).json()["result"]
+
+    assert result["decision_code"] == "authorization_denied"
+    assert "world_state_revalidation_inadequate" in result["reason_codes"]
+    assert result["revalidation_selector"] is None
 
 
 def test_inferred_low_confidence_state_does_not_authorize_risky_action():
@@ -503,7 +855,7 @@ def test_inferred_low_confidence_state_does_not_authorize_risky_action():
     ).json()["result"]
 
     assert result["allowed"] is False
-    assert "world_state_not_authorized" in result["reason_codes"]
+    assert "world_state_revalidator_required" in result["reason_codes"]
     assert result["challenge_ref"] is None
 
 

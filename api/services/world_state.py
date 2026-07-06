@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+import yaml
 from models import (
     RuntimeIdentityResolveRequest,
     WorldStateClaimInput,
@@ -54,6 +56,30 @@ _FRESHNESS_ORDER = {
     "superseded": 5,
     "conflicted": 6,
 }
+_VERIFIER_CONFIG_ENV = "TRUSTED_WORLD_STATE_VERIFIERS_PATH"
+_TRUSTED_VERIFICATION_SOURCE_TYPES = {
+    "tool_output",
+    "integration_event",
+    "sensor_update",
+    "repository_inspection",
+    "calendar_event",
+    "automation_workflow",
+}
+_ACTIVE_FRESHNESS_STATES = {"fresh", "aging", "stale", "unknown"}
+_VERIFIER_CONFIG_KEYS = {
+    "verifier_id",
+    "verification_source_type",
+    "allowed_source_refs",
+    "max_authority",
+    "allowed_domains",
+    "allowed_attributes",
+    "allowed_entity_ids",
+    "max_confidence",
+    "max_ttl_seconds",
+    "max_revalidation_interval_seconds",
+    "max_freshness_state",
+}
+_MATERIAL_FUTURE_SKEW_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -67,11 +93,13 @@ class TrustedWorldStateVerifier:
     allowed_entity_ids: frozenset[str] = field(default_factory=frozenset)
     max_confidence: float = 1.0
     max_freshness_state: str = "fresh"
-    max_ttl_seconds: int | None = None
-    max_revalidation_interval_seconds: int | None = None
+    max_ttl_seconds: int = 300
+    max_revalidation_interval_seconds: int = 300
 
 
-_TRUSTED_VERIFIERS: dict[str, TrustedWorldStateVerifier] = {}
+_TRUSTED_VERIFIER_TEST_OVERRIDE: dict[str, TrustedWorldStateVerifier] | None = None
+_TRUSTED_VERIFIER_CACHE_PATH: str | None = None
+_TRUSTED_VERIFIER_CACHE: dict[str, TrustedWorldStateVerifier] | None = None
 _DOMAIN_ALLOWLISTS: dict[str, set[str]] = {
     "general_assistant": {"active_task", "active_project", "pending_action", "runtime_surface"},
     "technical_architect": {
@@ -152,6 +180,24 @@ def _parse_ts(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+def _parse_aware_ts(value: str | None, *, reason: str) -> datetime:
+    if not value:
+        raise RuntimeError(reason)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise RuntimeError(reason) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RuntimeError(reason)
+    return parsed.astimezone(UTC)
+
+
+def _finite_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def _seconds_between(now: datetime, value: str | None) -> float | None:
     parsed = _parse_ts(value)
     if parsed is None:
@@ -172,6 +218,7 @@ def _record_verification_decision(
     *,
     decision: str,
     reason: str | None = None,
+    accepted_at: str | None = None,
 ) -> None:
     if not body.runtime_session_id:
         return
@@ -187,7 +234,7 @@ def _record_verification_decision(
     if decision == "accepted":
         payload.update(
             {
-                "verified_at": body.verified_at,
+                "verified_at": accepted_at or body.verified_at,
                 "resulting_authority": body.resulting_authority,
                 "resulting_freshness_state": body.resulting_freshness_state,
             }
@@ -203,12 +250,177 @@ def _record_verification_decision(
 def configure_trusted_world_state_verifiers_for_tests(
     verifiers: list[TrustedWorldStateVerifier],
 ) -> None:
-    _TRUSTED_VERIFIERS.clear()
-    _TRUSTED_VERIFIERS.update({verifier.verifier_id: verifier for verifier in verifiers})
+    global _TRUSTED_VERIFIER_TEST_OVERRIDE
+    _TRUSTED_VERIFIER_TEST_OVERRIDE = {
+        verifier.verifier_id: verifier for verifier in verifiers
+    }
 
 
 def clear_trusted_world_state_verifiers_for_tests() -> None:
-    _TRUSTED_VERIFIERS.clear()
+    global _TRUSTED_VERIFIER_TEST_OVERRIDE, _TRUSTED_VERIFIER_CACHE_PATH, _TRUSTED_VERIFIER_CACHE
+    _TRUSTED_VERIFIER_TEST_OVERRIDE = None
+    _TRUSTED_VERIFIER_CACHE_PATH = None
+    _TRUSTED_VERIFIER_CACHE = None
+
+
+def _as_non_empty_string_set(value: Any) -> frozenset[str] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            return None
+        items.append(item)
+    return frozenset(items)
+
+
+def _as_optional_string_set(value: Any) -> frozenset[str] | None:
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        return None
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            return None
+        items.append(item)
+    return frozenset(items)
+
+
+def _load_trusted_world_state_verifiers(path: Path) -> dict[str, TrustedWorldStateVerifier]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle)
+    except OSError as exc:
+        raise RuntimeError("trusted_verifier_registry_invalid") from exc
+    except yaml.YAMLError as exc:
+        raise RuntimeError("trusted_verifier_registry_invalid") from exc
+
+    if not isinstance(loaded, dict) or set(loaded) != {"verifiers"}:
+        raise RuntimeError("trusted_verifier_registry_invalid")
+    entries = loaded.get("verifiers")
+    if not isinstance(entries, list):
+        raise RuntimeError("trusted_verifier_registry_invalid")
+
+    verifiers: dict[str, TrustedWorldStateVerifier] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) - _VERIFIER_CONFIG_KEYS:
+            raise RuntimeError("trusted_verifier_registry_invalid")
+        required = {
+            "verifier_id",
+            "verification_source_type",
+            "allowed_source_refs",
+            "max_authority",
+            "allowed_domains",
+            "max_confidence",
+            "max_ttl_seconds",
+            "max_revalidation_interval_seconds",
+            "max_freshness_state",
+        }
+        if not required <= set(entry):
+            raise RuntimeError("trusted_verifier_registry_invalid")
+        verifier_id = entry["verifier_id"]
+        source_type = entry["verification_source_type"]
+        max_authority = entry["max_authority"]
+        max_freshness_state = entry["max_freshness_state"]
+        if (
+            not isinstance(verifier_id, str)
+            or not verifier_id
+            or verifier_id in verifiers
+            or source_type not in _TRUSTED_VERIFICATION_SOURCE_TYPES
+            or max_authority not in _VERIFIED_AUTHORITIES
+            or max_freshness_state not in _ACTIVE_FRESHNESS_STATES
+        ):
+            raise RuntimeError("trusted_verifier_registry_invalid")
+        allowed_source_refs = _as_non_empty_string_set(entry["allowed_source_refs"])
+        allowed_domains = _as_non_empty_string_set(entry["allowed_domains"])
+        allowed_attributes = _as_optional_string_set(entry.get("allowed_attributes"))
+        allowed_entity_ids = _as_optional_string_set(entry.get("allowed_entity_ids"))
+        max_ttl_seconds = _finite_positive_int(entry["max_ttl_seconds"])
+        max_revalidation_interval_seconds = _finite_positive_int(
+            entry["max_revalidation_interval_seconds"]
+        )
+        max_confidence = entry["max_confidence"]
+        if (
+            allowed_source_refs is None
+            or allowed_domains is None
+            or allowed_attributes is None
+            or allowed_entity_ids is None
+            or max_ttl_seconds is None
+            or max_revalidation_interval_seconds is None
+            or isinstance(max_confidence, bool)
+            or not isinstance(max_confidence, int | float)
+            or max_confidence < 0.0
+            or max_confidence > 1.0
+        ):
+            raise RuntimeError("trusted_verifier_registry_invalid")
+        verifiers[verifier_id] = TrustedWorldStateVerifier(
+            verifier_id=verifier_id,
+            verification_source_type=source_type,
+            allowed_source_refs=allowed_source_refs,
+            max_authority=max_authority,
+            allowed_domains=allowed_domains,
+            allowed_attributes=allowed_attributes,
+            allowed_entity_ids=allowed_entity_ids,
+            max_confidence=float(max_confidence),
+            max_freshness_state=max_freshness_state,
+            max_ttl_seconds=max_ttl_seconds,
+            max_revalidation_interval_seconds=max_revalidation_interval_seconds,
+        )
+    return verifiers
+
+
+def trusted_world_state_verifiers() -> dict[str, TrustedWorldStateVerifier]:
+    global _TRUSTED_VERIFIER_CACHE_PATH, _TRUSTED_VERIFIER_CACHE
+    if _TRUSTED_VERIFIER_TEST_OVERRIDE is not None:
+        return dict(_TRUSTED_VERIFIER_TEST_OVERRIDE)
+    config_path = os.environ.get(_VERIFIER_CONFIG_ENV)
+    if not config_path:
+        return {}
+    if _TRUSTED_VERIFIER_CACHE_PATH == config_path and _TRUSTED_VERIFIER_CACHE is not None:
+        return dict(_TRUSTED_VERIFIER_CACHE)
+    verifiers = _load_trusted_world_state_verifiers(Path(config_path))
+    _TRUSTED_VERIFIER_CACHE_PATH = config_path
+    _TRUSTED_VERIFIER_CACHE = verifiers
+    return dict(verifiers)
+
+
+def trusted_world_state_verifier(verifier_id: str | None) -> TrustedWorldStateVerifier | None:
+    if verifier_id is None:
+        return None
+    return trusted_world_state_verifiers().get(verifier_id)
+
+
+def trusted_world_state_verifier_selector_reason(
+    *,
+    verifier_id: str | None,
+    claim: WorldStateClaimView,
+    min_authority: str | None = None,
+    min_confidence: float | None = None,
+    max_freshness_state: str | None = None,
+) -> str | None:
+    verifier = trusted_world_state_verifier(verifier_id)
+    if verifier_id is None:
+        return "world_state_revalidator_required"
+    if verifier is None:
+        return "world_state_revalidator_not_configured"
+    if verifier.allowed_domains and claim.domain not in verifier.allowed_domains:
+        return "world_state_revalidator_not_authorized"
+    if verifier.allowed_attributes and claim.attribute not in verifier.allowed_attributes:
+        return "world_state_revalidator_not_authorized"
+    if verifier.allowed_entity_ids and claim.entity_id not in verifier.allowed_entity_ids:
+        return "world_state_revalidator_not_authorized"
+    if min_authority and _AUTHORITY_ORDER[verifier.max_authority] < _AUTHORITY_ORDER[min_authority]:
+        return "world_state_revalidation_inadequate"
+    if min_confidence is not None and verifier.max_confidence < min_confidence:
+        return "world_state_revalidation_inadequate"
+    if (
+        max_freshness_state is not None
+        and _FRESHNESS_ORDER[verifier.max_freshness_state]
+        > _FRESHNESS_ORDER[max_freshness_state]
+    ):
+        return "world_state_revalidation_inadequate"
+    return None
 
 
 def _verification_policy_reason(
@@ -223,10 +435,7 @@ def _verification_policy_reason(
         return "unknown_trusted_verifier"
     if body.verification_source_type != verifier.verification_source_type:
         return "verification_source_mismatch"
-    if (
-        verifier.allowed_source_refs
-        and body.verification_source_ref not in verifier.allowed_source_refs
-    ):
+    if body.verification_source_ref not in verifier.allowed_source_refs:
         return "verification_source_ref_not_allowed"
     if body.resulting_authority not in _VERIFIED_AUTHORITIES:
         return "invalid_verification_authority"
@@ -241,16 +450,13 @@ def _verification_policy_reason(
         < _FRESHNESS_ORDER[verifier.max_freshness_state]
     ):
         return "verification_freshness_escalation"
-    if (
-        verifier.max_ttl_seconds is not None
-        and body.resulting_ttl_seconds is not None
-        and body.resulting_ttl_seconds > verifier.max_ttl_seconds
+    if body.resulting_ttl_seconds is not None and (
+        body.resulting_ttl_seconds <= 0 or body.resulting_ttl_seconds > verifier.max_ttl_seconds
     ):
         return "verification_ttl_escalation"
-    if (
-        verifier.max_revalidation_interval_seconds is not None
-        and body.resulting_revalidation_interval_seconds is not None
-        and body.resulting_revalidation_interval_seconds
+    if body.resulting_revalidation_interval_seconds is not None and (
+        body.resulting_revalidation_interval_seconds <= 0
+        or body.resulting_revalidation_interval_seconds
         > verifier.max_revalidation_interval_seconds
     ):
         return "verification_revalidation_interval_escalation"
@@ -262,6 +468,78 @@ def _verification_policy_reason(
         if verifier.allowed_entity_ids and row["entity_id"] not in verifier.allowed_entity_ids:
             return "verification_selector_not_allowed"
     return None
+
+
+def _computed_freshness_from_age(
+    *,
+    age_seconds: float,
+    ttl_seconds: int,
+    revalidation_interval_seconds: int,
+) -> WorldStateFreshnessState:
+    if age_seconds >= ttl_seconds:
+        return "expired"
+    if age_seconds >= revalidation_interval_seconds:
+        return "stale"
+    aging_thresholds = [ttl_seconds * 0.75, revalidation_interval_seconds * 0.75]
+    if age_seconds >= min(aging_thresholds):
+        return "aging"
+    return "fresh"
+
+
+def _bounded_verification_values(
+    *,
+    verifier: TrustedWorldStateVerifier,
+    body: WorldStateClaimVerifyRequest,
+    accepted_at: datetime,
+) -> tuple[str, str, int, int]:
+    observed_at = _parse_aware_ts(body.observed_at, reason="verification_timestamp_invalid")
+    if body.verified_at is not None:
+        _parse_aware_ts(body.verified_at, reason="verification_timestamp_invalid")
+    future_limit = accepted_at + timedelta(seconds=_MATERIAL_FUTURE_SKEW_SECONDS)
+    if observed_at > future_limit:
+        raise RuntimeError("verification_timestamp_in_future")
+    if body.verified_at is not None:
+        verified_at = _parse_aware_ts(body.verified_at, reason="verification_timestamp_invalid")
+        if verified_at > future_limit:
+            raise RuntimeError("verification_timestamp_in_future")
+
+    effective_ttl_seconds = body.resulting_ttl_seconds or verifier.max_ttl_seconds
+    effective_revalidation_interval_seconds = (
+        body.resulting_revalidation_interval_seconds
+        or verifier.max_revalidation_interval_seconds
+    )
+    if effective_ttl_seconds > verifier.max_ttl_seconds:
+        raise RuntimeError("verification_ttl_escalation")
+    if effective_revalidation_interval_seconds > verifier.max_revalidation_interval_seconds:
+        raise RuntimeError("verification_revalidation_interval_escalation")
+
+    age_seconds = max((accepted_at - observed_at).total_seconds(), 0.0)
+    computed_freshness = _computed_freshness_from_age(
+        age_seconds=age_seconds,
+        ttl_seconds=effective_ttl_seconds,
+        revalidation_interval_seconds=effective_revalidation_interval_seconds,
+    )
+    if computed_freshness in {"expired", "superseded", "conflicted"}:
+        raise RuntimeError("invalid_verification_freshness")
+    if _FRESHNESS_ORDER[body.resulting_freshness_state] < _FRESHNESS_ORDER[computed_freshness]:
+        raise RuntimeError("verification_freshness_escalation")
+
+    max_expires_at = observed_at + timedelta(seconds=effective_ttl_seconds)
+    if body.resulting_expires_at:
+        expires_at = _parse_aware_ts(
+            body.resulting_expires_at,
+            reason="verification_timestamp_invalid",
+        )
+        if expires_at > max_expires_at:
+            raise RuntimeError("verification_expiry_escalation")
+    else:
+        expires_at = max_expires_at
+    return (
+        expires_at.isoformat(),
+        observed_at.isoformat(),
+        effective_ttl_seconds,
+        effective_revalidation_interval_seconds,
+    )
 
 
 class WorldStateRepository:
@@ -565,11 +843,23 @@ class WorldStateRepository:
                 runtime_session_id=body.runtime_session_id,
                 runtime_turn_id=body.runtime_turn_id,
             )
-        verifier = _TRUSTED_VERIFIERS.get(body.verifier_id or "")
+        verifier = trusted_world_state_verifier(body.verifier_id)
         policy_reason = _verification_policy_reason(verifier=verifier, body=body)
         if policy_reason is not None:
             _record_verification_decision(body, decision="rejected", reason=policy_reason)
             raise RuntimeError(policy_reason)
+        assert verifier is not None
+        accepted_at = datetime.now(UTC)
+        (
+            effective_expires_at,
+            effective_observed_at,
+            effective_ttl_seconds,
+            effective_revalidation_interval_seconds,
+        ) = _bounded_verification_values(
+            verifier=verifier,
+            body=body,
+            accepted_at=accepted_at,
+        )
 
         with self._connect() as conn:
             row = conn.execute(
@@ -613,7 +903,7 @@ class WorldStateRepository:
                 )
                 raise RuntimeError("expected_value_mismatch")
 
-            now = _now()
+            now = accepted_at.isoformat()
             conn.execute(
                 """
                 UPDATE runtime_world_state_claims
@@ -634,14 +924,14 @@ class WorldStateRepository:
                     body.resulting_confidence,
                     body.resulting_freshness_state,
                     body.resulting_authority,
-                    body.observed_at,
-                    body.verified_at,
+                    effective_observed_at,
+                    now,
                     body.runtime_session_id,
                     body.runtime_turn_id,
                     body.request_id,
-                    body.resulting_expires_at,
-                    body.resulting_ttl_seconds,
-                    body.resulting_revalidation_interval_seconds,
+                    effective_expires_at,
+                    effective_ttl_seconds,
+                    effective_revalidation_interval_seconds,
                     now,
                     body.owner_id,
                     body.world_state_claim_id,
@@ -656,8 +946,8 @@ class WorldStateRepository:
                     "verification_source_type": body.verification_source_type,
                     "verification_verifier_id": body.verifier_id,
                     "verification_source_ref": body.verification_source_ref,
-                    "verified_at": body.verified_at,
-                    "observed_at": body.observed_at,
+                    "verified_at": now,
+                    "observed_at": effective_observed_at,
                     "resulting_authority": body.resulting_authority,
                     "resulting_freshness_state": body.resulting_freshness_state,
                 },
@@ -678,7 +968,7 @@ class WorldStateRepository:
                 conflict_map=self._conflict_map(conn, body.owner_id),
             )
 
-        _record_verification_decision(body, decision="accepted")
+        _record_verification_decision(body, decision="accepted", accepted_at=now)
         return claim_view, [transition]
 
     def diagnostics(
@@ -889,6 +1179,12 @@ class WorldStateRepository:
         age_seconds = _seconds_between(now, row["observed_at"])
         ttl_seconds = row["ttl_seconds"]
         revalidation_seconds = row["revalidation_interval_seconds"]
+        if ttl_seconds is not None and revalidation_seconds is not None and age_seconds is not None:
+            return _computed_freshness_from_age(
+                age_seconds=age_seconds,
+                ttl_seconds=ttl_seconds,
+                revalidation_interval_seconds=revalidation_seconds,
+            )
         if ttl_seconds is not None and age_seconds is not None:
             if age_seconds >= ttl_seconds:
                 return "expired"

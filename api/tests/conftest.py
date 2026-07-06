@@ -57,6 +57,7 @@ def isolated_runtime_storage(tmp_path, monkeypatch):
     runtime_db_path = tmp_path / "runtime" / "runtime_state.sqlite3"
     monkeypatch.setenv("COMPANION_CONTRACTS_DB_PATH", str(contracts_db_path))
     monkeypatch.setenv("COGNITIVE_RUNTIME_DB_PATH", str(runtime_db_path))
+    monkeypatch.delenv("TRUSTED_WORLD_STATE_VERIFIERS_PATH", raising=False)
     reset_companion_contracts_for_tests(db_path=contracts_db_path)
     clear_states_for_tests(db_path=runtime_db_path)
     clear_world_state_for_tests(db_path=runtime_db_path)

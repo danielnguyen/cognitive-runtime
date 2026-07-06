@@ -162,8 +162,12 @@ _WORLD_STATE_ERROR_STATUS = {
     "verification_freshness_escalation": 403,
     "verification_ttl_escalation": 403,
     "verification_revalidation_interval_escalation": 403,
+    "verification_timestamp_invalid": 400,
+    "verification_timestamp_in_future": 400,
+    "verification_expiry_escalation": 403,
     "verification_domain_not_allowed": 403,
     "verification_selector_not_allowed": 403,
+    "trusted_verifier_registry_invalid": 500,
     "runtime_session_mismatch": 400,
     "runtime_turn_session_mismatch": 400,
     "expected_value_mismatch": 409,
@@ -176,6 +180,7 @@ _WORLD_STATE_ERROR_STATUS = {
 }
 
 _CAPABILITY_ERROR_STATUS = {
+    "trusted_verifier_registry_invalid": 500,
     "runtime_session_mismatch": 400,
     "runtime_turn_session_mismatch": 400,
     "confirmation_challenge_mismatch": 400,
