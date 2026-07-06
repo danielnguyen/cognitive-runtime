@@ -35,6 +35,17 @@ For local host-run, `api/.env` is reserved as the canonical app config location.
 - If you keep `COMPANION_CONTRACTS_DB_PATH=/data/companion_contracts.sqlite3`, mount the persistent volume at `/data`.
 - A common deployment failure is `sqlite3.OperationalError: unable to open database file` when the configured DB path and mounted volume path do not match.
 
+### Trusted world-state verifiers
+
+World-state verification is fail-closed unless trusted verifier policy is configured.
+
+- Config key: `TRUSTED_WORLD_STATE_VERIFIERS_PATH`
+- Format: bounded YAML with top-level `verifiers` list
+- Example: `api/config/trusted_world_state_verifiers.example.yaml`
+- The example file is not trusted automatically; it is active only when the environment path points to it.
+- The registry contains verifier IDs, source constraints, allowed domains/selectors, authority/confidence/freshness ceilings, and finite TTL/revalidation bounds. It must not contain credentials or secrets.
+- If the key is absent, verification and revalidation fail closed with an empty registry. If the key is present but the file is missing or invalid, startup/request handling reports bounded configuration failure instead of falling back to permissive behavior.
+
 ### Operator checks
 
 Normal request flow:
