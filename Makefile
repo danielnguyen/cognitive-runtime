@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: dev-test dev-install dev-lint dev-check replay-test smoke dev-start dev-start-reload
+.PHONY: dev-test dev-install dev-lint dev-check process-naming-check replay-test smoke dev-start dev-start-reload
 
 dev-test:
 	@cd api && ./.venv/bin/python -m pytest -q
@@ -12,6 +12,9 @@ dev-lint:
 	@cd api && ./.venv/bin/python -m ruff check .
 
 dev-check: dev-lint dev-test
+
+process-naming-check:
+	@./scripts/check_process_naming.py
 
 replay-test:
 	@cd api && ./.venv/bin/python -m services.runtime_replay
