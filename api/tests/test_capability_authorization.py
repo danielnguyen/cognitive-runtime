@@ -10,6 +10,7 @@ from services.world_state import (
     TrustedWorldStateVerifier,
     configure_trusted_world_state_verifiers_for_tests,
 )
+from services.capability_authorization import configure_capability_registry_for_tests
 
 
 def _iso(delta_seconds: int) -> str:
@@ -23,6 +24,13 @@ def _base(*, surface: str = "dev") -> dict[str, object]:
         "conversation_id": "conv-1",
         "surface": surface,
     }
+
+
+@pytest.fixture(autouse=True)
+def _available_capability_registry():
+    configure_capability_registry_for_tests(available=True)
+    yield
+    configure_capability_registry_for_tests(available=True)
 
 
 def _start_turn(client: TestClient, *, surface: str = "dev") -> dict[str, object]:
@@ -313,6 +321,183 @@ def _complete_turn(
         },
     )
     assert response.status_code == 200
+
+
+def _match_request(text: str, *, surface: str = "desktop", persona: str = "home_operator"):
+    return {
+        **_base(surface=surface),
+        "request_id": "capability-match",
+        "active_persona_id": persona,
+        "current_user_text": text,
+    }
+
+
+def _discovery_request(*, surface: str = "desktop", persona: str = "home_operator"):
+    return {
+        **_base(surface=surface),
+        "request_id": "capability-discovery",
+        "active_persona_id": persona,
+    }
+
+
+def test_registered_natural_language_request_matches_capability():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("Please turn on the office lights."),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_matched"] is True
+    assert result["action_taken"] is False
+    assert result["reason_codes"] == ["matched"]
+    assert result["capability"]["capability_id"] == "office_lights_on"
+
+
+def test_unregistered_request_returns_no_match_and_no_action_taken():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("Archive the old camera footage."),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_matched"] is False
+    assert result["action_taken"] is False
+    assert result["capability"] is None
+    assert result["reason_codes"] == ["no_registered_capability"]
+
+
+def test_endpoint_name_like_request_does_not_infer_capability():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("office_lights_on"),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_matched"] is False
+    assert result["action_taken"] is False
+    assert result["capability"] is None
+    assert result["reason_codes"] == ["raw_capability_name_ignored"]
+
+
+def test_discovery_summary_includes_allowed_and_blocked_examples():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/discover",
+        json=_discovery_request(),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["registry_available"] is True
+    assert result["action_taken"] is False
+    allowed_ids = {item["capability_id"] for item in result["allowed_examples"]}
+    blocked_ids = {item["capability_id"] for item in result["blocked_examples"]}
+    assert "office_lights_on" in allowed_ids
+    assert "external_purchase" in blocked_ids
+
+
+def test_surface_filtering_changes_capability_eligibility():
+    client = TestClient(app)
+
+    allowed = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("restart Jellyfin", surface="desktop"),
+    ).json()["result"]
+    blocked = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("restart Jellyfin", surface="voice_private"),
+    ).json()["result"]
+
+    assert allowed["capability_matched"] is True
+    assert blocked["capability_matched"] is False
+    assert blocked["reason_codes"] == ["surface_not_allowed"]
+    assert blocked["capability"]["capability_id"] == "jellyfin_restart"
+
+
+def test_persona_filtering_changes_capability_eligibility():
+    client = TestClient(app)
+
+    allowed = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("restart Jellyfin", persona="technical_architect"),
+    ).json()["result"]
+    blocked = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("restart Jellyfin", persona="default_assistant"),
+    ).json()["result"]
+
+    assert allowed["capability_matched"] is True
+    assert blocked["capability_matched"] is False
+    assert blocked["reason_codes"] == ["persona_not_allowed"]
+    assert blocked["capability"]["capability_id"] == "jellyfin_restart"
+
+
+def test_match_returns_metadata_for_later_authority_decisions():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("Run a service health check.", persona="technical_architect"),
+    )
+
+    capability = response.json()["result"]["capability"]
+    assert set(capability) >= {
+        "capability_id",
+        "display_name",
+        "domain",
+        "description",
+        "operation_kind",
+        "risk_level",
+        "requires_confirmation",
+        "allowed_surfaces",
+        "allowed_personas",
+        "reversible",
+        "dry_run_supported",
+        "verification_supported",
+        "audit_required",
+    }
+    assert capability["operation_kind"] == "read_only"
+
+
+def test_registry_presence_does_not_authorize_or_execute():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("Turn on the office lights."),
+    ).json()["result"]
+
+    assert result["capability_matched"] is True
+    assert result["action_taken"] is False
+    assert "allowed" not in result
+    assert "decision_code" not in result
+
+
+def test_registry_unavailable_fallback_reports_no_action_taken_or_match():
+    client = TestClient(app)
+    configure_capability_registry_for_tests(available=False)
+
+    response = client.post(
+        "/v1/capabilities/match",
+        json=_match_request("Turn on the office lights."),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_matched"] is False
+    assert result["action_taken"] is False
+    assert result["capability"] is None
+    assert result["reason_codes"] == ["registry_unavailable"]
 
 
 def test_exposure_allows_matching_persona_domain_and_surface():

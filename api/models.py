@@ -862,6 +862,14 @@ class WorldStateResolveResponse(BaseModel):
 
 
 CapabilityAuthorizationPhase = Literal["exposure", "selection", "dispatch"]
+CapabilityOperationKind = Literal[
+    "read_only",
+    "state_change",
+    "restart",
+    "notification",
+    "draft_or_prepare",
+    "blocked_external_action",
+]
 CapabilityOperationClass = Literal[
     "read",
     "draft",
@@ -920,6 +928,82 @@ CapabilityConfirmationState = Literal[
     "accepted",
     "rejected",
 ]
+CapabilityMatchReasonCode = Literal[
+    "matched",
+    "no_registered_capability",
+    "registry_unavailable",
+    "surface_not_allowed",
+    "persona_not_allowed",
+    "raw_capability_name_ignored",
+]
+
+
+class CapabilityRegistryRecord(BaseModel):
+    capability_id: str = Field(max_length=120)
+    display_name: str = Field(max_length=120)
+    domain: BoundedLabel
+    description: str = Field(max_length=300)
+    operation_kind: CapabilityOperationKind
+    risk_level: BoundedLabel
+    requires_confirmation: bool
+    allowed_surfaces: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    allowed_personas: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    reversible: bool
+    dry_run_supported: bool
+    verification_supported: bool
+    audit_required: bool
+
+
+class CapabilityMatchRequest(RuntimeStateResolveRequest):
+    active_persona_id: str = Field(max_length=120)
+    current_user_text: BoundedText
+    registry_enabled: bool = True
+
+
+class CapabilityMatchResult(BaseModel):
+    capability_matched: bool
+    action_taken: Literal[False] = False
+    reason_codes: list[CapabilityMatchReasonCode] = Field(default_factory=list, max_length=8)
+    capability: CapabilityRegistryRecord | None = None
+
+
+class CapabilityMatchResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    active_persona_id: str = Field(max_length=120)
+    result: CapabilityMatchResult
+
+
+class CapabilityDiscoveryRequest(RuntimeStateResolveRequest):
+    active_persona_id: str = Field(max_length=120)
+    registry_enabled: bool = True
+
+
+class CapabilityDiscoveryExample(BaseModel):
+    capability_id: str = Field(max_length=120)
+    display_name: str = Field(max_length=120)
+    description: str = Field(max_length=300)
+    operation_kind: CapabilityOperationKind
+    risk_level: BoundedLabel
+    reason_codes: list[CapabilityMatchReasonCode] = Field(default_factory=list, max_length=8)
+
+
+class CapabilityDiscoveryResult(BaseModel):
+    registry_available: bool
+    action_taken: Literal[False] = False
+    allowed_examples: list[CapabilityDiscoveryExample] = Field(default_factory=list, max_length=16)
+    blocked_examples: list[CapabilityDiscoveryExample] = Field(default_factory=list, max_length=16)
+
+
+class CapabilityDiscoveryResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    active_persona_id: str = Field(max_length=120)
+    result: CapabilityDiscoveryResult
 
 
 class CapabilityRelationshipRequirement(BaseModel):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -11,8 +12,16 @@ from models import (
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
     CapabilityAuthorizationResult,
+    CapabilityDiscoveryExample,
+    CapabilityDiscoveryRequest,
+    CapabilityDiscoveryResponse,
+    CapabilityDiscoveryResult,
+    CapabilityMatchRequest,
+    CapabilityMatchResponse,
+    CapabilityMatchResult,
     CapabilityConfirmationRequest,
     CapabilityConfirmationResponse,
+    CapabilityRegistryRecord,
     CapabilityRevalidationSelector,
     RelationshipSelectRequest,
     RuntimeIdentityResolveRequest,
@@ -33,6 +42,7 @@ from services.world_state import (
 )
 
 _CAPABILITY_AUTH_REPOSITORY: CapabilityAuthorizationRepository | None = None
+_CAPABILITY_REGISTRY_AVAILABLE = True
 _RISKY_OPERATION_CLASSES = {"external_write", "destructive", "high_impact"}
 _AUTHORIZED_AUTHORITIES = {
     "verified_tool_output": 4,
@@ -52,6 +62,129 @@ _FRESHNESS_ORDER = {
     "conflicted": 6,
 }
 _HIGH_IMPACT_OPERATION_CLASSES = {"external_write", "destructive", "high_impact"}
+
+
+@dataclass(frozen=True)
+class RegisteredCapability:
+    record: CapabilityRegistryRecord
+    match_phrases: tuple[str, ...]
+
+
+_CAPABILITY_REGISTRY: tuple[RegisteredCapability, ...] = (
+    RegisteredCapability(
+        record=CapabilityRegistryRecord(
+            capability_id="service_health_check",
+            display_name="Run service health check",
+            domain="operations",
+            description="Reads local service health status without changing state.",
+            operation_kind="read_only",
+            risk_level="low_read_only",
+            requires_confirmation=False,
+            allowed_surfaces=["desktop", "dev", "telegram", "voice_private"],
+            allowed_personas=["default_assistant", "home_operator", "technical_architect"],
+            reversible=True,
+            dry_run_supported=True,
+            verification_supported=True,
+            audit_required=False,
+        ),
+        match_phrases=("health check", "service health", "check service status"),
+    ),
+    RegisteredCapability(
+        record=CapabilityRegistryRecord(
+            capability_id="office_lights_on",
+            display_name="Turn on office lights",
+            domain="home_automation",
+            description="Turns on the office lights through the local automation layer.",
+            operation_kind="state_change",
+            risk_level="low_reversible",
+            requires_confirmation=False,
+            allowed_surfaces=["desktop", "telegram", "voice_private"],
+            allowed_personas=["default_assistant", "home_operator"],
+            reversible=True,
+            dry_run_supported=True,
+            verification_supported=True,
+            audit_required=True,
+        ),
+        match_phrases=(
+            "turn on office lights",
+            "turn on the office lights",
+            "office lights on",
+            "switch on office lights",
+        ),
+    ),
+    RegisteredCapability(
+        record=CapabilityRegistryRecord(
+            capability_id="jellyfin_restart",
+            display_name="Restart Jellyfin",
+            domain="media_operations",
+            description="Starts the local Jellyfin restart flow without executing it.",
+            operation_kind="restart",
+            risk_level="medium_service_interruption",
+            requires_confirmation=True,
+            allowed_surfaces=["desktop", "dev"],
+            allowed_personas=["home_operator", "technical_architect"],
+            reversible=False,
+            dry_run_supported=True,
+            verification_supported=True,
+            audit_required=True,
+        ),
+        match_phrases=("restart jellyfin", "jellyfin restart", "restart media server"),
+    ),
+    RegisteredCapability(
+        record=CapabilityRegistryRecord(
+            capability_id="draft_notification",
+            display_name="Draft notification",
+            domain="communication",
+            description="Prepares a notification draft without sending it.",
+            operation_kind="draft_or_prepare",
+            risk_level="low_prepare_only",
+            requires_confirmation=False,
+            allowed_surfaces=["desktop", "dev", "telegram"],
+            allowed_personas=["default_assistant", "home_operator", "technical_architect"],
+            reversible=True,
+            dry_run_supported=True,
+            verification_supported=False,
+            audit_required=False,
+        ),
+        match_phrases=("draft notification", "prepare notification", "write notification draft"),
+    ),
+    RegisteredCapability(
+        record=CapabilityRegistryRecord(
+            capability_id="send_notification",
+            display_name="Send notification",
+            domain="communication",
+            description="Sending notifications is listed for discovery but not executable here.",
+            operation_kind="notification",
+            risk_level="medium_external_effect",
+            requires_confirmation=True,
+            allowed_surfaces=[],
+            allowed_personas=[],
+            reversible=False,
+            dry_run_supported=False,
+            verification_supported=True,
+            audit_required=True,
+        ),
+        match_phrases=("send notification", "send message", "notify them"),
+    ),
+    RegisteredCapability(
+        record=CapabilityRegistryRecord(
+            capability_id="external_purchase",
+            display_name="External purchase",
+            domain="external_action",
+            description="Buying or booking through an external service is blocked in this runtime.",
+            operation_kind="blocked_external_action",
+            risk_level="blocked_external_effect",
+            requires_confirmation=True,
+            allowed_surfaces=[],
+            allowed_personas=[],
+            reversible=False,
+            dry_run_supported=False,
+            verification_supported=False,
+            audit_required=True,
+        ),
+        match_phrases=("buy", "purchase", "book a", "order"),
+    ),
+)
 
 
 def _now() -> str:
@@ -74,6 +207,38 @@ def _load_json(value: str | None, default: Any) -> Any:
 
 def _digest(prefix: str, material: str) -> str:
     return f"{prefix}_{sha256(material.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _looks_like_raw_capability_name(value: str) -> bool:
+    stripped = value.strip()
+    if " " in stripped:
+        return False
+    return any(marker in stripped for marker in ("/", ".", "_", "::"))
+
+
+def _eligible_reason(
+    capability: CapabilityRegistryRecord,
+    *,
+    surface: str,
+    active_persona_id: str,
+) -> str | None:
+    if surface not in capability.allowed_surfaces:
+        return "surface_not_allowed"
+    if active_persona_id not in capability.allowed_personas:
+        return "persona_not_allowed"
+    return None
+
+
+def _find_registered_capability(text: str) -> RegisteredCapability | None:
+    normalized = _normalized_text(text)
+    for capability in _CAPABILITY_REGISTRY:
+        if any(phrase in normalized for phrase in capability.match_phrases):
+            return capability
+    return None
 
 
 def _session_and_turn(body: CapabilityAuthorizationRequest | CapabilityConfirmationRequest) -> None:
@@ -794,6 +959,84 @@ def capability_authorization_repository() -> CapabilityAuthorizationRepository:
     return _CAPABILITY_AUTH_REPOSITORY
 
 
+def match_registered_capability(body: CapabilityMatchRequest) -> CapabilityMatchResponse:
+    if not _CAPABILITY_REGISTRY_AVAILABLE or not body.registry_enabled:
+        result = CapabilityMatchResult(
+            capability_matched=False,
+            reason_codes=["registry_unavailable"],
+        )
+    elif _looks_like_raw_capability_name(body.current_user_text):
+        result = CapabilityMatchResult(
+            capability_matched=False,
+            reason_codes=["raw_capability_name_ignored"],
+        )
+    else:
+        capability = _find_registered_capability(body.current_user_text)
+        if capability is None:
+            result = CapabilityMatchResult(
+                capability_matched=False,
+                reason_codes=["no_registered_capability"],
+            )
+        else:
+            ineligible_reason = _eligible_reason(
+                capability.record,
+                surface=body.surface,
+                active_persona_id=body.active_persona_id,
+            )
+            result = CapabilityMatchResult(
+                capability_matched=ineligible_reason is None,
+                reason_codes=[ineligible_reason or "matched"],
+                capability=capability.record,
+            )
+    return CapabilityMatchResponse(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        active_persona_id=body.active_persona_id,
+        result=result,
+    )
+
+
+def discover_registered_capabilities(body: CapabilityDiscoveryRequest) -> CapabilityDiscoveryResponse:
+    if not _CAPABILITY_REGISTRY_AVAILABLE or not body.registry_enabled:
+        result = CapabilityDiscoveryResult(registry_available=False)
+    else:
+        allowed_examples: list[CapabilityDiscoveryExample] = []
+        blocked_examples: list[CapabilityDiscoveryExample] = []
+        for capability in _CAPABILITY_REGISTRY:
+            ineligible_reason = _eligible_reason(
+                capability.record,
+                surface=body.surface,
+                active_persona_id=body.active_persona_id,
+            )
+            example = CapabilityDiscoveryExample(
+                capability_id=capability.record.capability_id,
+                display_name=capability.record.display_name,
+                description=capability.record.description,
+                operation_kind=capability.record.operation_kind,
+                risk_level=capability.record.risk_level,
+                reason_codes=[ineligible_reason or "matched"],
+            )
+            if ineligible_reason is None:
+                allowed_examples.append(example)
+            else:
+                blocked_examples.append(example)
+        result = CapabilityDiscoveryResult(
+            registry_available=True,
+            allowed_examples=allowed_examples,
+            blocked_examples=blocked_examples,
+        )
+    return CapabilityDiscoveryResponse(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        active_persona_id=body.active_persona_id,
+        result=result,
+    )
+
+
 def authorize_capability(body: CapabilityAuthorizationRequest) -> CapabilityAuthorizationResponse:
     return capability_authorization_repository().authorize(body)
 
@@ -807,3 +1050,8 @@ def record_capability_confirmation(
 def clear_capability_authorization_for_tests(db_path: Path | None = None) -> None:
     global _CAPABILITY_AUTH_REPOSITORY
     _CAPABILITY_AUTH_REPOSITORY = CapabilityAuthorizationRepository(db_path=db_path)
+
+
+def configure_capability_registry_for_tests(*, available: bool = True) -> None:
+    global _CAPABILITY_REGISTRY_AVAILABLE
+    _CAPABILITY_REGISTRY_AVAILABLE = available

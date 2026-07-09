@@ -4,6 +4,10 @@ from fastapi import FastAPI, HTTPException
 from models import (
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
+    CapabilityDiscoveryRequest,
+    CapabilityDiscoveryResponse,
+    CapabilityMatchRequest,
+    CapabilityMatchResponse,
     CapabilityConfirmationRequest,
     CapabilityConfirmationResponse,
     CompanionPolicyCompileRequest,
@@ -73,6 +77,8 @@ from models import (
 )
 from services.capability_authorization import (
     authorize_capability,
+    discover_registered_capabilities,
+    match_registered_capability,
     record_capability_confirmation,
 )
 from services.companion_contracts import companion_contracts_repository
@@ -586,6 +592,20 @@ async def capability_authorize(
         if http_error is None:
             raise
         raise http_error from exc
+
+
+@app.post("/v1/capabilities/match", response_model=CapabilityMatchResponse)
+async def capability_match(
+    body: CapabilityMatchRequest,
+) -> CapabilityMatchResponse:
+    return match_registered_capability(body)
+
+
+@app.post("/v1/capabilities/discover", response_model=CapabilityDiscoveryResponse)
+async def capability_discover(
+    body: CapabilityDiscoveryRequest,
+) -> CapabilityDiscoveryResponse:
+    return discover_registered_capabilities(body)
 
 
 @app.post("/v1/capabilities/confirm", response_model=CapabilityConfirmationResponse)
