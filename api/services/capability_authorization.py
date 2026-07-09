@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from models import (
+    ActionAuthorityDecision,
+    ActionAuthorityDecisionRequest,
+    ActionAuthorityDecisionResponse,
+    ActionAuthorityLevel,
+    ActionRiskLevel,
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
     CapabilityAuthorizationResult,
@@ -239,6 +244,62 @@ def _find_registered_capability(text: str) -> RegisteredCapability | None:
         if any(phrase in normalized for phrase in capability.match_phrases):
             return capability
     return None
+
+
+def _registered_capability_by_id(capability_id: str) -> RegisteredCapability | None:
+    for capability in _CAPABILITY_REGISTRY:
+        if capability.record.capability_id == capability_id:
+            return capability
+    return None
+
+
+def _risk_from_registry(capability: CapabilityRegistryRecord) -> ActionRiskLevel:
+    risk = capability.risk_level
+    if capability.operation_kind == "read_only" or risk == "low_read_only":
+        return "read_only"
+    if capability.operation_kind == "blocked_external_action" or risk.startswith("blocked"):
+        return "blocked"
+    if capability.operation_kind == "draft_or_prepare" or risk == "low_prepare_only":
+        return "low_reversible"
+    if risk.startswith("high"):
+        return "high_requires_confirmation"
+    if risk.startswith("medium") or capability.requires_confirmation or not capability.reversible:
+        return "medium_requires_confirmation"
+    return "low_reversible"
+
+
+def _higher_risk(current: ActionRiskLevel, candidate: ActionRiskLevel) -> ActionRiskLevel:
+    order = {
+        "read_only": 0,
+        "low_reversible": 1,
+        "medium_requires_confirmation": 2,
+        "high_requires_confirmation": 3,
+        "blocked": 4,
+    }
+    return candidate if order[candidate] > order[current] else current
+
+
+def _append_reason(reasons: list[str], reason: str) -> None:
+    if reason not in reasons and len(reasons) < 16:
+        reasons.append(reason)
+
+
+def _consequence_reason_flags(body: ActionAuthorityDecisionRequest) -> list[str]:
+    flags = body.consequence_flags
+    reasons: list[str] = []
+    if flags.external_consequence:
+        reasons.append("external_consequence")
+    if flags.destructive:
+        reasons.append("destructive_consequence")
+    if flags.data_loss:
+        reasons.append("data_loss_consequence")
+    if flags.security:
+        reasons.append("security_consequence")
+    if flags.financial:
+        reasons.append("financial_consequence")
+    if flags.message:
+        reasons.append("message_consequence")
+    return reasons
 
 
 def _session_and_turn(body: CapabilityAuthorizationRequest | CapabilityConfirmationRequest) -> None:
@@ -1034,6 +1095,131 @@ def discover_registered_capabilities(body: CapabilityDiscoveryRequest) -> Capabi
         surface=body.surface,
         active_persona_id=body.active_persona_id,
         result=result,
+    )
+
+
+def decide_action_authority(
+    body: ActionAuthorityDecisionRequest,
+) -> ActionAuthorityDecisionResponse:
+    reasons: list[str] = []
+    capability = (
+        _registered_capability_by_id(body.capability_id)
+        if _CAPABILITY_REGISTRY_AVAILABLE and body.registry_enabled
+        else None
+    )
+    if capability is None:
+        if not _CAPABILITY_REGISTRY_AVAILABLE or not body.registry_enabled:
+            _append_reason(reasons, "registry_unavailable")
+        else:
+            _append_reason(reasons, "capability_not_registered")
+        decision = ActionAuthorityDecision(
+            capability_id=body.capability_id,
+            risk_level="blocked",
+            authority_level="blocked",
+            requires_confirmation=True,
+            allowed=False,
+            reason_summary=reasons,
+        )
+        return ActionAuthorityDecisionResponse(
+            request_id=body.request_id,
+            owner_id=body.owner_id,
+            conversation_id=body.conversation_id,
+            surface=body.surface,
+            active_persona_id=body.active_persona_id,
+            result=decision,
+        )
+
+    record = capability.record
+    _append_reason(reasons, "registered_capability")
+    risk_level = _risk_from_registry(record)
+
+    ineligible_reason = _eligible_reason(
+        record,
+        surface=body.surface,
+        active_persona_id=body.active_persona_id,
+    )
+    if ineligible_reason is None:
+        _append_reason(reasons, "allowed_surface")
+        _append_reason(reasons, "allowed_persona")
+    else:
+        _append_reason(reasons, ineligible_reason)
+
+    if body.target_resolution_state != "resolved":
+        _append_reason(reasons, "target_not_resolved")
+        risk_level = "blocked"
+
+    if body.world_state_freshness in {"stale", "unknown"}:
+        _append_reason(reasons, f"{body.world_state_freshness}_world_state")
+        if risk_level == "low_reversible":
+            risk_level = "medium_requires_confirmation"
+        elif risk_level not in {"read_only", "blocked"}:
+            risk_level = _higher_risk(risk_level, "medium_requires_confirmation")
+
+    consequence_reasons = _consequence_reason_flags(body)
+    for reason in consequence_reasons:
+        _append_reason(reasons, reason)
+    if consequence_reasons and risk_level != "blocked":
+        risk_level = "high_requires_confirmation"
+
+    interaction_suppresses_execution = (
+        body.interaction_governance_kind == "vent_or_expression"
+        or body.interaction_governance_tension == "high"
+    )
+    if interaction_suppresses_execution:
+        _append_reason(reasons, "interaction_suppresses_execution")
+
+    vague_authorization = body.user_authorization_signal != "explicit"
+    if vague_authorization:
+        _append_reason(reasons, "explicit_authorization_absent")
+
+    if record.operation_kind == "blocked_external_action" or risk_level == "blocked":
+        authority_level: ActionAuthorityLevel = "blocked"
+    elif ineligible_reason is not None:
+        authority_level = "blocked"
+    elif interaction_suppresses_execution or vague_authorization:
+        authority_level = "answer_only" if risk_level == "read_only" else "suggest_only"
+    elif record.operation_kind == "read_only":
+        authority_level = "answer_only"
+    elif record.operation_kind == "draft_or_prepare":
+        authority_level = "prepare_only"
+    elif risk_level == "low_reversible":
+        authority_level = "execute_low_risk"
+    else:
+        authority_level = "execute_after_confirmation"
+
+    requires_confirmation = risk_level in {
+        "medium_requires_confirmation",
+        "high_requires_confirmation",
+        "blocked",
+    }
+    if authority_level in {"answer_only", "prepare_only", "execute_low_risk"}:
+        requires_confirmation = False
+    allowed = authority_level in {"answer_only", "prepare_only", "execute_low_risk"}
+
+    if authority_level == "prepare_only":
+        _append_reason(reasons, "prepare_only")
+    elif authority_level == "execute_low_risk":
+        _append_reason(reasons, "low_reversible_execution")
+    elif authority_level == "execute_after_confirmation":
+        _append_reason(reasons, "confirmation_required")
+    elif authority_level == "blocked":
+        _append_reason(reasons, "execution_blocked")
+
+    decision = ActionAuthorityDecision(
+        capability_id=record.capability_id,
+        risk_level=risk_level,
+        authority_level=authority_level,
+        requires_confirmation=requires_confirmation,
+        allowed=allowed,
+        reason_summary=reasons,
+    )
+    return ActionAuthorityDecisionResponse(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        active_persona_id=body.active_persona_id,
+        result=decision,
     )
 
 
