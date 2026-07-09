@@ -936,6 +936,33 @@ CapabilityMatchReasonCode = Literal[
     "persona_not_allowed",
     "raw_capability_name_ignored",
 ]
+ActionRiskLevel = Literal[
+    "read_only",
+    "low_reversible",
+    "medium_requires_confirmation",
+    "high_requires_confirmation",
+    "blocked",
+]
+ActionAuthorityLevel = Literal[
+    "answer_only",
+    "suggest_only",
+    "prepare_only",
+    "execute_low_risk",
+    "execute_after_confirmation",
+    "blocked",
+]
+ActionTargetResolutionState = Literal["resolved", "ambiguous", "missing"]
+ActionWorldStateFreshness = Literal["fresh", "stale", "unknown"]
+ActionUserAuthorizationSignal = Literal["explicit", "vague", "none"]
+
+
+class ActionConsequenceFlags(BaseModel):
+    external_consequence: bool = False
+    destructive: bool = False
+    data_loss: bool = False
+    security: bool = False
+    financial: bool = False
+    message: bool = False
 
 
 class CapabilityRegistryRecord(BaseModel):
@@ -1004,6 +1031,39 @@ class CapabilityDiscoveryResponse(BaseModel):
     surface: str = Field(max_length=64)
     active_persona_id: str = Field(max_length=120)
     result: CapabilityDiscoveryResult
+
+
+class ActionAuthorityDecisionRequest(RuntimeStateResolveRequest):
+    active_persona_id: str = Field(max_length=120)
+    capability_id: str = Field(max_length=120)
+    target_resolution_state: ActionTargetResolutionState = "resolved"
+    world_state_freshness: ActionWorldStateFreshness = "fresh"
+    consequence_flags: ActionConsequenceFlags = Field(
+        default_factory=ActionConsequenceFlags
+    )
+    interaction_governance_kind: InteractionGovernanceKind | None = None
+    interaction_governance_tension: InteractionGovernanceTension | None = None
+    user_authorization_signal: ActionUserAuthorizationSignal = "explicit"
+    registry_enabled: bool = True
+
+
+class ActionAuthorityDecision(BaseModel):
+    capability_id: str = Field(max_length=120)
+    risk_level: ActionRiskLevel
+    authority_level: ActionAuthorityLevel
+    requires_confirmation: bool
+    allowed: bool
+    reason_summary: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    action_taken: Literal[False] = False
+
+
+class ActionAuthorityDecisionResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    active_persona_id: str = Field(max_length=120)
+    result: ActionAuthorityDecision
 
 
 class CapabilityRelationshipRequirement(BaseModel):

@@ -340,6 +340,27 @@ def _discovery_request(*, surface: str = "desktop", persona: str = "home_operato
     }
 
 
+def _authority_request(
+    capability_id: str,
+    *,
+    surface: str = "desktop",
+    persona: str = "home_operator",
+    **overrides,
+) -> dict[str, object]:
+    request = {
+        **_base(surface=surface),
+        "request_id": "capability-authority",
+        "active_persona_id": persona,
+        "capability_id": capability_id,
+        "target_resolution_state": "resolved",
+        "world_state_freshness": "fresh",
+        "consequence_flags": {},
+        "user_authorization_signal": "explicit",
+    }
+    request.update(overrides)
+    return request
+
+
 def test_registered_natural_language_request_matches_capability():
     client = TestClient(app)
 
@@ -498,6 +519,241 @@ def test_registry_unavailable_fallback_reports_no_action_taken_or_match():
     assert result["action_taken"] is False
     assert result["capability"] is None
     assert result["reason_codes"] == ["registry_unavailable"]
+
+
+def test_read_only_authority_does_not_require_confirmation():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "service_health_check",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_id"] == "service_health_check"
+    assert result["risk_level"] == "read_only"
+    assert result["authority_level"] == "answer_only"
+    assert result["requires_confirmation"] is False
+    assert result["allowed"] is True
+    assert result["action_taken"] is False
+
+
+def test_low_reversible_authority_can_execute_when_context_permits():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request("office_lights_on"),
+    ).json()["result"]
+
+    assert result["risk_level"] == "low_reversible"
+    assert result["authority_level"] == "execute_low_risk"
+    assert result["requires_confirmation"] is False
+    assert result["allowed"] is True
+    assert result["action_taken"] is False
+
+
+def test_prepare_authority_returns_prepare_only():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request("draft_notification"),
+    ).json()["result"]
+
+    assert result["authority_level"] == "prepare_only"
+    assert result["requires_confirmation"] is False
+    assert result["allowed"] is True
+    assert result["action_taken"] is False
+
+
+def test_medium_authority_requires_confirmation_without_direct_execution():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    ).json()["result"]
+
+    assert result["risk_level"] == "medium_requires_confirmation"
+    assert result["authority_level"] == "execute_after_confirmation"
+    assert result["requires_confirmation"] is True
+    assert result["allowed"] is False
+    assert result["action_taken"] is False
+
+
+def test_high_consequence_input_requires_confirmation():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "office_lights_on",
+            consequence_flags={"security": True},
+        ),
+    ).json()["result"]
+
+    assert result["risk_level"] == "high_requires_confirmation"
+    assert result["authority_level"] == "execute_after_confirmation"
+    assert result["requires_confirmation"] is True
+    assert result["allowed"] is False
+    assert result["action_taken"] is False
+
+
+def test_blocked_external_authority_stays_blocked():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request("external_purchase"),
+    ).json()["result"]
+
+    assert result["risk_level"] == "blocked"
+    assert result["authority_level"] == "blocked"
+    assert result["requires_confirmation"] is True
+    assert result["allowed"] is False
+    assert result["action_taken"] is False
+
+
+@pytest.mark.parametrize("target_state", ["ambiguous", "missing"])
+def test_unresolved_target_prevents_execution(target_state: str):
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "office_lights_on",
+            target_resolution_state=target_state,
+        ),
+    ).json()["result"]
+
+    assert result["risk_level"] == "blocked"
+    assert result["authority_level"] == "blocked"
+    assert result["allowed"] is False
+    assert result["action_taken"] is False
+
+
+@pytest.mark.parametrize("freshness", ["stale", "unknown"])
+def test_uncertain_world_state_increases_conservatism(freshness: str):
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "office_lights_on",
+            world_state_freshness=freshness,
+        ),
+    ).json()["result"]
+
+    assert result["risk_level"] == "medium_requires_confirmation"
+    assert result["authority_level"] == "execute_after_confirmation"
+    assert result["requires_confirmation"] is True
+    assert result["allowed"] is False
+    assert result["action_taken"] is False
+
+
+@pytest.mark.parametrize(
+    ("surface", "persona"),
+    [("voice_private", "technical_architect"), ("dev", "default_assistant")],
+)
+def test_context_mismatch_denies_execution_authority(surface: str, persona: str):
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "jellyfin_restart",
+            surface=surface,
+            persona=persona,
+        ),
+    ).json()["result"]
+
+    assert result["authority_level"] == "blocked"
+    assert result["allowed"] is False
+    assert result["action_taken"] is False
+
+
+def test_context_permission_does_not_bypass_elevated_risk():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    ).json()["result"]
+
+    assert result["risk_level"] == "medium_requires_confirmation"
+    assert result["authority_level"] == "execute_after_confirmation"
+    assert result["requires_confirmation"] is True
+    assert result["allowed"] is False
+
+
+def test_vague_authorization_does_not_permit_execution():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "office_lights_on",
+            user_authorization_signal="vague",
+        ),
+    ).json()["result"]
+
+    assert result["authority_level"] == "suggest_only"
+    assert result["allowed"] is False
+    assert result["action_taken"] is False
+    assert "explicit_authorization_absent" in result["reason_summary"]
+
+
+def test_vent_like_interaction_suppresses_execution():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "office_lights_on",
+            interaction_governance_kind="vent_or_expression",
+        ),
+    ).json()["result"]
+
+    assert result["authority_level"] == "suggest_only"
+    assert result["allowed"] is False
+    assert result["action_taken"] is False
+    assert "interaction_suppresses_execution" in result["reason_summary"]
+
+
+def test_authority_endpoint_response_matches_contract_without_execution():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request("office_lights_on"),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert set(result) == {
+        "capability_id",
+        "risk_level",
+        "authority_level",
+        "requires_confirmation",
+        "allowed",
+        "reason_summary",
+        "action_taken",
+    }
+    assert result["action_taken"] is False
 
 
 def test_exposure_allows_matching_persona_domain_and_surface():

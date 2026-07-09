@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 from models import (
+    ActionAuthorityDecisionRequest,
+    ActionAuthorityDecisionResponse,
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
     CapabilityDiscoveryRequest,
@@ -77,6 +79,7 @@ from models import (
 )
 from services.capability_authorization import (
     authorize_capability,
+    decide_action_authority,
     discover_registered_capabilities,
     match_registered_capability,
     record_capability_confirmation,
@@ -606,6 +609,13 @@ async def capability_discover(
     body: CapabilityDiscoveryRequest,
 ) -> CapabilityDiscoveryResponse:
     return discover_registered_capabilities(body)
+
+
+@app.post("/v1/capabilities/authority", response_model=ActionAuthorityDecisionResponse)
+async def capability_authority(
+    body: ActionAuthorityDecisionRequest,
+) -> ActionAuthorityDecisionResponse:
+    return decide_action_authority(body)
 
 
 @app.post("/v1/capabilities/confirm", response_model=CapabilityConfirmationResponse)
