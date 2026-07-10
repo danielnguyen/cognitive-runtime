@@ -954,6 +954,14 @@ ActionAuthorityLevel = Literal[
 ActionTargetResolutionState = Literal["resolved", "ambiguous", "missing"]
 ActionWorldStateFreshness = Literal["fresh", "stale", "unknown"]
 ActionUserAuthorizationSignal = Literal["explicit", "vague", "none"]
+ActionFlowIntent = Literal[
+    "preview_requested",
+    "execution_requested",
+    "confirmation_received",
+    "confirmation_cancelled",
+    "confirmation_expired",
+]
+VerificationMethod = Literal["capability_verification"]
 
 
 class ActionConsequenceFlags(BaseModel):
@@ -1064,6 +1072,57 @@ class ActionAuthorityDecisionResponse(BaseModel):
     surface: str = Field(max_length=64)
     active_persona_id: str = Field(max_length=120)
     result: ActionAuthorityDecision
+
+
+class ActionFlowDecisionRequest(RuntimeStateResolveRequest):
+    active_persona_id: str = Field(max_length=120)
+    capability_id: str = Field(max_length=120)
+    flow_intent: ActionFlowIntent = "execution_requested"
+    target_resolution_state: ActionTargetResolutionState = "resolved"
+    target_label: str | None = Field(default=None, max_length=120)
+    world_state_freshness: ActionWorldStateFreshness = "fresh"
+    affects_multiple_systems: bool = False
+    consequence_flags: ActionConsequenceFlags = Field(
+        default_factory=ActionConsequenceFlags
+    )
+    interaction_governance_kind: InteractionGovernanceKind | None = None
+    interaction_governance_tension: InteractionGovernanceTension | None = None
+    user_authorization_signal: ActionUserAuthorizationSignal = "explicit"
+    registry_enabled: bool = True
+
+
+class DryRunEffect(BaseModel):
+    capability_id: str = Field(max_length=120)
+    display_name: str = Field(max_length=120)
+    operation_kind: CapabilityOperationKind
+    target_label: str | None = Field(default=None, max_length=120)
+    intended_effect: str = Field(max_length=600)
+    reversible: bool
+    consequence_summary: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+
+
+class ActionFlowDecision(BaseModel):
+    capability_id: str = Field(max_length=120)
+    dry_run_required: bool
+    dry_run_supported: bool
+    dry_run_effects: list[DryRunEffect] = Field(default_factory=list, max_length=4)
+    confirmation_required: bool
+    confirmation_text: str | None = Field(default=None, max_length=500)
+    execution_allowed: bool
+    verification_required: bool
+    verification_supported: bool
+    verification_method: VerificationMethod | None = None
+    reason_summary: list[BoundedLabel] = Field(default_factory=list, max_length=16)
+    action_taken: Literal[False] = False
+
+
+class ActionFlowDecisionResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    active_persona_id: str = Field(max_length=120)
+    result: ActionFlowDecision
 
 
 class CapabilityRelationshipRequirement(BaseModel):

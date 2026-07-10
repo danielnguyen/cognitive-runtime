@@ -361,6 +361,29 @@ def _authority_request(
     return request
 
 
+def _flow_request(
+    capability_id: str,
+    *,
+    surface: str = "desktop",
+    persona: str = "home_operator",
+    **overrides,
+) -> dict[str, object]:
+    request = {
+        **_base(surface=surface),
+        "request_id": "capability-flow",
+        "active_persona_id": persona,
+        "capability_id": capability_id,
+        "flow_intent": "execution_requested",
+        "target_resolution_state": "resolved",
+        "world_state_freshness": "fresh",
+        "affects_multiple_systems": False,
+        "consequence_flags": {},
+        "user_authorization_signal": "explicit",
+    }
+    request.update(overrides)
+    return request
+
+
 def test_registered_natural_language_request_matches_capability():
     client = TestClient(app)
 
@@ -753,6 +776,325 @@ def test_authority_endpoint_response_matches_contract_without_execution():
         "reason_summary",
         "action_taken",
     }
+    assert result["action_taken"] is False
+
+
+def test_preview_flow_returns_dry_run_effects_without_action():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "office_lights_on",
+            flow_intent="preview_requested",
+            target_label="office lights",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["dry_run_required"] is True
+    assert result["dry_run_supported"] is True
+    assert result["dry_run_effects"][0]["display_name"] == "Turn on office lights"
+    assert result["dry_run_effects"][0]["target_label"] == "office lights"
+    assert "Would evaluate Turn on office lights" in result["dry_run_effects"][0][
+        "intended_effect"
+    ]
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+
+
+def test_preview_intent_requires_dry_run():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request("office_lights_on", flow_intent="preview_requested"),
+    ).json()["result"]
+
+    assert result["dry_run_required"] is True
+    assert "preview_requested" in result["reason_summary"]
+    assert "dry_run_required" in result["reason_summary"]
+    assert result["action_taken"] is False
+
+
+@pytest.mark.parametrize("target_state", ["ambiguous", "missing"])
+def test_unresolved_target_flow_requires_dry_run_and_blocks_execution(target_state: str):
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "office_lights_on",
+            target_resolution_state=target_state,
+        ),
+    ).json()["result"]
+
+    assert result["dry_run_required"] is True
+    assert result["confirmation_required"] is False
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+    assert "target_not_resolved" in result["reason_summary"]
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "request_overrides"),
+    [
+        (
+            "jellyfin_restart",
+            {"surface": "dev", "persona": "technical_architect"},
+        ),
+        ("office_lights_on", {"consequence_flags": {"security": True}}),
+    ],
+)
+def test_elevated_risk_flow_requires_dry_run(
+    capability_id: str,
+    request_overrides: dict[str, object],
+):
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(capability_id, **request_overrides),
+    ).json()["result"]
+
+    assert result["dry_run_required"] is True
+    assert result["confirmation_required"] is True
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+    assert "medium_or_high_risk" in result["reason_summary"]
+
+
+def test_multiple_system_flow_requires_dry_run_before_execution():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request("office_lights_on", affects_multiple_systems=True),
+    ).json()["result"]
+
+    assert result["dry_run_required"] is True
+    assert result["execution_allowed"] is False
+    assert "multiple_systems" in result["reason_summary"]
+    assert "dry_run_pending" in result["reason_summary"]
+    assert result["action_taken"] is False
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "request_overrides"),
+    [
+        ("office_lights_on", {"consequence_flags": {"destructive": True}}),
+        (
+            "jellyfin_restart",
+            {"surface": "dev", "persona": "technical_architect"},
+        ),
+    ],
+)
+def test_destructive_or_difficult_to_reverse_flow_requires_dry_run(
+    capability_id: str,
+    request_overrides: dict[str, object],
+):
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(capability_id, **request_overrides),
+    ).json()["result"]
+
+    assert result["dry_run_required"] is True
+    assert "difficult_to_reverse" in result["reason_summary"]
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+
+
+def test_scoped_confirmation_text_names_capability_target_and_reason():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+            target_label="media server",
+        ),
+    ).json()["result"]
+
+    assert result["confirmation_required"] is True
+    assert result["confirmation_text"] is not None
+    assert "Restart Jellyfin" in result["confirmation_text"]
+    assert "media server" in result["confirmation_text"]
+    assert "difficult to reverse" in result["confirmation_text"]
+    assert result["confirmation_text"] != "Are you sure?"
+    assert result["action_taken"] is False
+
+
+def test_elevated_risk_flow_requires_scoped_confirmation():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+            target_label="media server",
+        ),
+    ).json()["result"]
+
+    assert result["confirmation_required"] is True
+    assert result["confirmation_text"].startswith("Confirm Restart Jellyfin")
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+
+
+def test_required_confirmation_blocks_execution_until_received():
+    client = TestClient(app)
+
+    pending = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    ).json()["result"]
+    confirmed = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+            flow_intent="confirmation_received",
+        ),
+    ).json()["result"]
+
+    assert pending["confirmation_required"] is True
+    assert pending["execution_allowed"] is False
+    assert confirmed["confirmation_required"] is True
+    assert confirmed["execution_allowed"] is True
+    assert pending["action_taken"] is False
+    assert confirmed["action_taken"] is False
+
+
+def test_confirmation_cancellation_keeps_execution_blocked():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+            flow_intent="confirmation_cancelled",
+        ),
+    ).json()["result"]
+
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+    assert "confirmation_cancelled" in result["reason_summary"]
+
+
+def test_confirmation_expiry_keeps_execution_blocked():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+            flow_intent="confirmation_expired",
+        ),
+    ).json()["result"]
+
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+    assert "confirmation_expired" in result["reason_summary"]
+
+
+def test_ambiguous_target_flow_blocks_execution_pending_clarification():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+            target_resolution_state="ambiguous",
+            target_label="media service",
+        ),
+    ).json()["result"]
+
+    assert result["dry_run_required"] is True
+    assert result["confirmation_required"] is False
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+    assert "target_not_resolved" in result["reason_summary"]
+
+
+def test_dry_run_flow_is_not_execution():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request("office_lights_on", flow_intent="preview_requested"),
+    ).json()["result"]
+
+    assert result["dry_run_required"] is True
+    assert result["dry_run_effects"]
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+    assert "execution_allowed_by_policy" not in result["reason_summary"]
+    assert not any("executed" in reason for reason in result["reason_summary"])
+
+
+def test_verification_requirement_returned_for_verifiable_allowed_flow():
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "jellyfin_restart",
+            surface="dev",
+            persona="technical_architect",
+            flow_intent="confirmation_received",
+        ),
+    ).json()["result"]
+
+    assert result["execution_allowed"] is True
+    assert result["verification_supported"] is True
+    assert result["verification_required"] is True
+    assert result["verification_method"] == "capability_verification"
+    assert result["action_taken"] is False
+
+
+def test_flow_endpoint_response_matches_contract_without_execution():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request("office_lights_on"),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert set(result) == {
+        "capability_id",
+        "dry_run_required",
+        "dry_run_supported",
+        "dry_run_effects",
+        "confirmation_required",
+        "confirmation_text",
+        "execution_allowed",
+        "verification_required",
+        "verification_supported",
+        "verification_method",
+        "reason_summary",
+        "action_taken",
+    }
+    assert result["capability_id"] == "office_lights_on"
     assert result["action_taken"] is False
 
 
