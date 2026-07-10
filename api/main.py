@@ -4,6 +4,8 @@ from fastapi import FastAPI, HTTPException
 from models import (
     ActionAuthorityDecisionRequest,
     ActionAuthorityDecisionResponse,
+    ActionFlowDecisionRequest,
+    ActionFlowDecisionResponse,
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
     CapabilityDiscoveryRequest,
@@ -80,6 +82,7 @@ from models import (
 from services.capability_authorization import (
     authorize_capability,
     decide_action_authority,
+    decide_action_flow,
     discover_registered_capabilities,
     match_registered_capability,
     record_capability_confirmation,
@@ -616,6 +619,13 @@ async def capability_authority(
     body: ActionAuthorityDecisionRequest,
 ) -> ActionAuthorityDecisionResponse:
     return decide_action_authority(body)
+
+
+@app.post("/v1/capabilities/flow", response_model=ActionFlowDecisionResponse)
+async def capability_flow(
+    body: ActionFlowDecisionRequest,
+) -> ActionFlowDecisionResponse:
+    return decide_action_flow(body)
 
 
 @app.post("/v1/capabilities/confirm", response_model=CapabilityConfirmationResponse)

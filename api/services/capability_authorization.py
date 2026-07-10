@@ -13,6 +13,9 @@ from models import (
     ActionAuthorityDecisionRequest,
     ActionAuthorityDecisionResponse,
     ActionAuthorityLevel,
+    ActionFlowDecision,
+    ActionFlowDecisionRequest,
+    ActionFlowDecisionResponse,
     ActionRiskLevel,
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
@@ -28,6 +31,7 @@ from models import (
     CapabilityConfirmationResponse,
     CapabilityRegistryRecord,
     CapabilityRevalidationSelector,
+    DryRunEffect,
     RelationshipSelectRequest,
     RuntimeIdentityResolveRequest,
 )
@@ -284,7 +288,9 @@ def _append_reason(reasons: list[str], reason: str) -> None:
         reasons.append(reason)
 
 
-def _consequence_reason_flags(body: ActionAuthorityDecisionRequest) -> list[str]:
+def _consequence_reason_flags(
+    body: ActionAuthorityDecisionRequest | ActionFlowDecisionRequest,
+) -> list[str]:
     flags = body.consequence_flags
     reasons: list[str] = []
     if flags.external_consequence:
@@ -300,6 +306,83 @@ def _consequence_reason_flags(body: ActionAuthorityDecisionRequest) -> list[str]
     if flags.message:
         reasons.append("message_consequence")
     return reasons
+
+
+def _flow_consequence_summary(
+    *,
+    body: ActionFlowDecisionRequest,
+    record: CapabilityRegistryRecord,
+) -> list[str]:
+    consequences: list[str] = []
+    if body.affects_multiple_systems:
+        _append_reason(consequences, "multiple_systems")
+    for reason in _consequence_reason_flags(body):
+        _append_reason(consequences, reason)
+    if not record.reversible:
+        _append_reason(consequences, "difficult_to_reverse")
+    if record.requires_confirmation:
+        _append_reason(consequences, "requires_confirmation")
+    return consequences
+
+
+def _dry_run_effect(
+    *,
+    body: ActionFlowDecisionRequest,
+    record: CapabilityRegistryRecord,
+    consequence_summary: list[str],
+) -> DryRunEffect:
+    target = f" for {body.target_label}" if body.target_label else ""
+    reversibility = (
+        "The registry marks it as reversible."
+        if record.reversible
+        else "The registry marks it as difficult to reverse."
+    )
+    multi_system = (
+        " It may affect multiple systems." if body.affects_multiple_systems else ""
+    )
+    return DryRunEffect(
+        capability_id=record.capability_id,
+        display_name=record.display_name,
+        operation_kind=record.operation_kind,
+        target_label=body.target_label,
+        intended_effect=(
+            f"Would evaluate {record.display_name}{target} as a "
+            f"{record.operation_kind} capability. Registry note: "
+            f"{record.description} {reversibility}{multi_system}"
+        ),
+        reversible=record.reversible,
+        consequence_summary=consequence_summary,
+    )
+
+
+def _confirmation_text(
+    *,
+    body: ActionFlowDecisionRequest,
+    record: CapabilityRegistryRecord,
+    consequence_summary: list[str],
+) -> str:
+    target = f" for {body.target_label}" if body.target_label else ""
+    consequences: list[str] = []
+    if "multiple_systems" in consequence_summary:
+        consequences.append("may affect multiple systems")
+    if "external_consequence" in consequence_summary:
+        consequences.append("may have an external consequence")
+    if "destructive_consequence" in consequence_summary:
+        consequences.append("may be destructive")
+    if "data_loss_consequence" in consequence_summary:
+        consequences.append("may risk data loss")
+    if "security_consequence" in consequence_summary:
+        consequences.append("may affect security")
+    if "financial_consequence" in consequence_summary:
+        consequences.append("may have financial impact")
+    if "message_consequence" in consequence_summary:
+        consequences.append("may send or affect a message")
+    if "difficult_to_reverse" in consequence_summary:
+        consequences.append("may be difficult to reverse")
+    if not consequences:
+        consequences.append("requires explicit confirmation before execution")
+    consequence_text = "; ".join(consequences[:4])
+    return f"Confirm {record.display_name}{target}. This {consequence_text}."
 
 
 def _session_and_turn(body: CapabilityAuthorizationRequest | CapabilityConfirmationRequest) -> None:
@@ -1214,6 +1297,171 @@ def decide_action_authority(
         reason_summary=reasons,
     )
     return ActionAuthorityDecisionResponse(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        active_persona_id=body.active_persona_id,
+        result=decision,
+    )
+
+
+def decide_action_flow(body: ActionFlowDecisionRequest) -> ActionFlowDecisionResponse:
+    authority_response = decide_action_authority(
+        ActionAuthorityDecisionRequest(
+            request_id=body.request_id,
+            owner_id=body.owner_id,
+            conversation_id=body.conversation_id,
+            surface=body.surface,
+            active_persona_id=body.active_persona_id,
+            capability_id=body.capability_id,
+            target_resolution_state=body.target_resolution_state,
+            world_state_freshness=body.world_state_freshness,
+            consequence_flags=body.consequence_flags,
+            interaction_governance_kind=body.interaction_governance_kind,
+            interaction_governance_tension=body.interaction_governance_tension,
+            user_authorization_signal=body.user_authorization_signal,
+            registry_enabled=body.registry_enabled,
+        )
+    )
+    authority = authority_response.result
+    capability = (
+        _registered_capability_by_id(body.capability_id)
+        if _CAPABILITY_REGISTRY_AVAILABLE and body.registry_enabled
+        else None
+    )
+    record = capability.record if capability else None
+    reasons = list(authority.reason_summary)
+    target_unresolved = body.target_resolution_state != "resolved"
+    cancelled_or_expired = body.flow_intent in {
+        "confirmation_cancelled",
+        "confirmation_expired",
+    }
+    medium_or_high_risk = authority.risk_level in {
+        "medium_requires_confirmation",
+        "high_requires_confirmation",
+    }
+    consequence_reasons = _consequence_reason_flags(body)
+    difficult_to_reverse = bool(
+        (record is not None and not record.reversible)
+        or body.consequence_flags.destructive
+        or body.consequence_flags.data_loss
+    )
+    dry_run_required = bool(
+        body.flow_intent == "preview_requested"
+        or target_unresolved
+        or medium_or_high_risk
+        or body.affects_multiple_systems
+        or difficult_to_reverse
+    )
+    if body.flow_intent == "preview_requested":
+        _append_reason(reasons, "preview_requested")
+    if dry_run_required:
+        _append_reason(reasons, "dry_run_required")
+    if medium_or_high_risk:
+        _append_reason(reasons, "medium_or_high_risk")
+    if body.affects_multiple_systems:
+        _append_reason(reasons, "multiple_systems")
+    if difficult_to_reverse:
+        _append_reason(reasons, "difficult_to_reverse")
+    for reason in consequence_reasons:
+        _append_reason(reasons, reason)
+    if body.flow_intent == "confirmation_received":
+        _append_reason(reasons, "confirmation_received")
+    elif body.flow_intent == "confirmation_cancelled":
+        _append_reason(reasons, "confirmation_cancelled")
+    elif body.flow_intent == "confirmation_expired":
+        _append_reason(reasons, "confirmation_expired")
+
+    consequence_summary = (
+        _flow_consequence_summary(body=body, record=record) if record else []
+    )
+    dry_run_effects = (
+        [
+            _dry_run_effect(
+                body=body,
+                record=record,
+                consequence_summary=consequence_summary,
+            )
+        ]
+        if dry_run_required and record is not None
+        else []
+    )
+    confirmation_required = bool(
+        authority.requires_confirmation
+        and authority.authority_level == "execute_after_confirmation"
+        and not target_unresolved
+    )
+    confirmation_text = (
+        _confirmation_text(
+            body=body,
+            record=record,
+            consequence_summary=consequence_summary,
+        )
+        if confirmation_required and record is not None
+        else None
+    )
+    if confirmation_required and body.flow_intent != "confirmation_received":
+        _append_reason(reasons, "confirmation_required")
+
+    low_risk_execution_allowed = bool(
+        authority.allowed
+        and authority.authority_level
+        in {"answer_only", "prepare_only", "execute_low_risk"}
+    )
+    confirmed_execution_allowed = bool(
+        authority.authority_level == "execute_after_confirmation"
+        and body.flow_intent == "confirmation_received"
+    )
+    dry_run_gate_satisfied = bool(
+        not dry_run_required or body.flow_intent == "confirmation_received"
+    )
+    if dry_run_required and not dry_run_gate_satisfied:
+        _append_reason(reasons, "dry_run_pending")
+    execution_allowed = bool(
+        (low_risk_execution_allowed or confirmed_execution_allowed)
+        and dry_run_gate_satisfied
+        and not target_unresolved
+        and not cancelled_or_expired
+        and body.flow_intent != "preview_requested"
+    )
+    if execution_allowed:
+        _append_reason(reasons, "execution_allowed_by_policy")
+    else:
+        _append_reason(reasons, "execution_not_allowed")
+
+    verification_supported = bool(record.verification_supported) if record else False
+    execution_possible_after_confirmation = bool(
+        (
+            low_risk_execution_allowed
+            or authority.authority_level == "execute_after_confirmation"
+        )
+        and not target_unresolved
+        and not cancelled_or_expired
+        and body.flow_intent != "preview_requested"
+    )
+    verification_required = bool(
+        verification_supported and execution_possible_after_confirmation
+    )
+    if verification_required:
+        _append_reason(reasons, "verification_required")
+
+    decision = ActionFlowDecision(
+        capability_id=authority.capability_id,
+        dry_run_required=dry_run_required,
+        dry_run_supported=bool(record.dry_run_supported) if record else False,
+        dry_run_effects=dry_run_effects,
+        confirmation_required=confirmation_required,
+        confirmation_text=confirmation_text,
+        execution_allowed=execution_allowed,
+        verification_required=verification_required,
+        verification_supported=verification_supported,
+        verification_method=(
+            "capability_verification" if verification_supported else None
+        ),
+        reason_summary=reasons,
+    )
+    return ActionFlowDecisionResponse(
         request_id=body.request_id,
         owner_id=body.owner_id,
         conversation_id=body.conversation_id,
