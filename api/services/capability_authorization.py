@@ -100,6 +100,29 @@ _CAPABILITY_REGISTRY: tuple[RegisteredCapability, ...] = (
     ),
     RegisteredCapability(
         record=CapabilityRegistryRecord(
+            capability_id="runtime.world_state.read",
+            display_name="Read runtime world state",
+            domain="software_architecture",
+            description="Reads bounded runtime world-state claims as structured context.",
+            operation_kind="read_only",
+            risk_level="low_read_only",
+            requires_confirmation=False,
+            allowed_surfaces=["dev", "vscode"],
+            allowed_personas=["technical_architect"],
+            reversible=True,
+            dry_run_supported=True,
+            verification_supported=True,
+            audit_required=False,
+        ),
+        match_phrases=(
+            "read runtime world state",
+            "runtime world state",
+            "read world state",
+            "show runtime world state",
+        ),
+    ),
+    RegisteredCapability(
+        record=CapabilityRegistryRecord(
             capability_id="office_lights_on",
             display_name="Turn on office lights",
             domain="home_automation",

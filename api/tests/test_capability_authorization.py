@@ -432,6 +432,56 @@ def test_endpoint_name_like_request_does_not_infer_capability():
     assert result["reason_codes"] == ["raw_capability_name_ignored"]
 
 
+def test_runtime_world_state_request_matches_exact_capability():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/match",
+        json=_match_request(
+            "Please read runtime world state for this repository.",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_matched"] is True
+    assert result["action_taken"] is False
+    assert result["reason_codes"] == ["matched"]
+    capability = result["capability"]
+    assert capability["capability_id"] == "runtime.world_state.read"
+    assert capability["domain"] == "software_architecture"
+    assert capability["operation_kind"] == "read_only"
+    assert capability["risk_level"] == "low_read_only"
+    assert capability["allowed_surfaces"] == ["dev", "vscode"]
+    assert capability["allowed_personas"] == ["technical_architect"]
+    assert capability["requires_confirmation"] is False
+    assert capability["dry_run_supported"] is True
+    assert capability["verification_supported"] is True
+    assert capability["audit_required"] is False
+
+
+def test_raw_runtime_world_state_capability_name_does_not_infer_match():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/match",
+        json=_match_request(
+            "runtime.world_state.read",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_matched"] is False
+    assert result["action_taken"] is False
+    assert result["capability"] is None
+    assert result["reason_codes"] == ["raw_capability_name_ignored"]
+
+
 def test_discovery_summary_includes_allowed_and_blocked_examples():
     client = TestClient(app)
 
@@ -448,6 +498,26 @@ def test_discovery_summary_includes_allowed_and_blocked_examples():
     blocked_ids = {item["capability_id"] for item in result["blocked_examples"]}
     assert "office_lights_on" in allowed_ids
     assert "external_purchase" in blocked_ids
+
+
+def test_runtime_world_state_discovery_is_allowed_for_matching_context():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/discover",
+        json=_discovery_request(surface="dev", persona="technical_architect"),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["action_taken"] is False
+    allowed = {
+        item["capability_id"]: item for item in result["allowed_examples"]
+    }
+    assert "runtime.world_state.read" in allowed
+    assert allowed["runtime.world_state.read"]["operation_kind"] == "read_only"
+    assert allowed["runtime.world_state.read"]["risk_level"] == "low_read_only"
+    assert allowed["runtime.world_state.read"]["reason_codes"] == ["matched"]
 
 
 def test_surface_filtering_changes_capability_eligibility():
@@ -484,6 +554,35 @@ def test_persona_filtering_changes_capability_eligibility():
     assert blocked["capability_matched"] is False
     assert blocked["reason_codes"] == ["persona_not_allowed"]
     assert blocked["capability"]["capability_id"] == "jellyfin_restart"
+
+
+@pytest.mark.parametrize(
+    ("surface", "persona", "reason_code"),
+    [
+        ("desktop", "technical_architect", "surface_not_allowed"),
+        ("dev", "home_operator", "persona_not_allowed"),
+    ],
+)
+def test_runtime_world_state_context_filtering_applies(
+    surface: str,
+    persona: str,
+    reason_code: str,
+):
+    client = TestClient(app)
+
+    result = client.post(
+        "/v1/capabilities/match",
+        json=_match_request(
+            "show runtime world state",
+            surface=surface,
+            persona=persona,
+        ),
+    ).json()["result"]
+
+    assert result["capability_matched"] is False
+    assert result["action_taken"] is False
+    assert result["reason_codes"] == [reason_code]
+    assert result["capability"]["capability_id"] == "runtime.world_state.read"
 
 
 def test_match_returns_metadata_for_later_authority_decisions():
@@ -559,6 +658,28 @@ def test_read_only_authority_does_not_require_confirmation():
     assert response.status_code == 200
     result = response.json()["result"]
     assert result["capability_id"] == "service_health_check"
+    assert result["risk_level"] == "read_only"
+    assert result["authority_level"] == "answer_only"
+    assert result["requires_confirmation"] is False
+    assert result["allowed"] is True
+    assert result["action_taken"] is False
+
+
+def test_runtime_world_state_authority_is_answer_only_without_confirmation():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/authority",
+        json=_authority_request(
+            "runtime.world_state.read",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_id"] == "runtime.world_state.read"
     assert result["risk_level"] == "read_only"
     assert result["authority_level"] == "answer_only"
     assert result["requires_confirmation"] is False
@@ -801,6 +922,54 @@ def test_preview_flow_returns_dry_run_effects_without_action():
         "intended_effect"
     ]
     assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+
+
+def test_runtime_world_state_preview_flow_returns_dry_run_without_action():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "runtime.world_state.read",
+            surface="dev",
+            persona="technical_architect",
+            flow_intent="preview_requested",
+            target_label="repository context",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_id"] == "runtime.world_state.read"
+    assert result["dry_run_required"] is True
+    assert result["dry_run_supported"] is True
+    assert result["dry_run_effects"][0]["display_name"] == "Read runtime world state"
+    assert result["dry_run_effects"][0]["target_label"] == "repository context"
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+
+
+def test_runtime_world_state_allowed_flow_signals_verification_without_action():
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/capabilities/flow",
+        json=_flow_request(
+            "runtime.world_state.read",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_id"] == "runtime.world_state.read"
+    assert result["dry_run_supported"] is True
+    assert result["execution_allowed"] is True
+    assert result["verification_supported"] is True
+    assert result["verification_required"] is True
+    assert result["verification_method"] == "capability_verification"
     assert result["action_taken"] is False
 
 
