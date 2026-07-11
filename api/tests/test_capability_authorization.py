@@ -384,6 +384,52 @@ def _flow_request(
     return request
 
 
+def _action_summary_request(
+    client: TestClient,
+    *,
+    request_id: str = "action-summary",
+    owner_id: str = "owner",
+    conversation_id: str = "conv-1",
+    surface: str = "dev",
+    runtime_turn_id: str | None = None,
+    **overrides,
+) -> dict[str, object]:
+    session_response = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": f"{request_id}-session",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        },
+    )
+    assert session_response.status_code == 200
+    runtime_session_id = session_response.json()["runtime_session"][
+        "runtime_session_id"
+    ]
+    request = {
+        "request_id": request_id,
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "surface": surface,
+        "runtime_session_id": runtime_session_id,
+        "runtime_turn_id": runtime_turn_id,
+        "capability_id": "runtime.world_state.read",
+        "active_persona_id": "technical_architect",
+        "risk_level": "read_only",
+        "authority_level": "answer_only",
+        "confirmation_status": "not_required",
+        "policy_reason_codes": ["registered_capability", "execution_allowed_by_policy"],
+        "execution_status": "executed",
+        "execution_reason_code": "adapter_completed",
+        "verification_status": "passed",
+        "verification_reason_code": "result_check_passed",
+        "degradation_reason": None,
+    }
+    request.update(overrides)
+    return request
+
+
 def test_registered_natural_language_request_matches_capability():
     client = TestClient(app)
 
@@ -1265,6 +1311,358 @@ def test_flow_endpoint_response_matches_contract_without_execution():
     }
     assert result["capability_id"] == "office_lights_on"
     assert result["action_taken"] is False
+
+
+def test_action_summary_returns_complete_contract_and_matching_runtime_event():
+    client = TestClient(app)
+    request = _action_summary_request(client)
+
+    response = client.post("/v1/capabilities/action-summary", json=request)
+
+    assert response.status_code == 200
+    payload = response.json()
+    result = payload["result"]
+    assert set(result) == {
+        "action_id",
+        "capability_id",
+        "requested_by",
+        "surface_type",
+        "active_persona_id",
+        "risk_level",
+        "authority_level",
+        "confirmation_status",
+        "execution_status",
+        "verification_status",
+        "degradation_reason",
+        "policy_reason_codes",
+        "execution_reason_code",
+        "verification_reason_code",
+        "user_visible_summary",
+    }
+    assert result == {
+        "action_id": result["action_id"],
+        "capability_id": "runtime.world_state.read",
+        "requested_by": "conversation_participant",
+        "surface_type": "dev",
+        "active_persona_id": "technical_architect",
+        "risk_level": "read_only",
+        "authority_level": "answer_only",
+        "confirmation_status": "not_required",
+        "execution_status": "executed",
+        "verification_status": "passed",
+        "degradation_reason": None,
+        "policy_reason_codes": [
+            "registered_capability",
+            "execution_allowed_by_policy",
+        ],
+        "execution_reason_code": "adapter_completed",
+        "verification_reason_code": "result_check_passed",
+        "user_visible_summary": (
+            "Action runtime.world_state.read was executed and verification passed."
+        ),
+    }
+    assert result["action_id"].startswith("act_")
+    assert request["request_id"] not in result["action_id"]
+
+    diagnostics = client.get(
+        f"/v1/runtime/sessions/{request['runtime_session_id']}"
+    ).json()
+    event = next(
+        event
+        for event in diagnostics["events"]
+        if event["event_type"] == "action_summary_recorded"
+    )
+    event_payload = event["event_payload_json"]
+    for field, value in result.items():
+        assert event_payload[field] == value
+    assert event_payload["request_id"] == request["request_id"]
+    assert event_payload["runtime_session_id"] == request["runtime_session_id"]
+
+
+def test_action_summary_identity_is_stable_and_changes_with_action_identity():
+    client = TestClient(app)
+    original = _action_summary_request(client)
+
+    first = client.post("/v1/capabilities/action-summary", json=original).json()["result"]
+    repeated = client.post("/v1/capabilities/action-summary", json=original).json()["result"]
+    assert first["action_id"] == repeated["action_id"]
+
+    changed_requests = [
+        {**original, "request_id": "action-summary-other"},
+        {**original, "capability_id": "service_health_check"},
+        _action_summary_request(client, owner_id="owner-other"),
+        _action_summary_request(client, conversation_id="conv-other"),
+    ]
+    turn = client.post(
+        "/v1/runtime/turns/start",
+        json={
+            **_base(),
+            "request_id": "action-summary-turn",
+        },
+    ).json()["runtime_turn"]
+    changed_requests.append({**original, "runtime_turn_id": turn["runtime_turn_id"]})
+
+    changed_ids = {
+        client.post("/v1/capabilities/action-summary", json=request).json()["result"][
+            "action_id"
+        ]
+        for request in changed_requests
+    }
+    assert first["action_id"] not in changed_ids
+    assert len(changed_ids) == len(changed_requests)
+
+
+def test_blocked_action_summary_reports_no_action_and_rejects_passed_verification():
+    client = TestClient(app)
+    request = _action_summary_request(
+        client,
+        risk_level="blocked",
+        authority_level="blocked",
+        confirmation_status="required_pending",
+        policy_reason_codes=["surface_not_allowed"],
+        execution_status="blocked_by_policy",
+        execution_reason_code=None,
+        verification_status="unknown",
+        verification_reason_code=None,
+    )
+
+    response = client.post("/v1/capabilities/action-summary", json=request)
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["execution_status"] == "blocked_by_policy"
+    assert result["degradation_reason"] == "surface_not_allowed"
+    assert "No action was taken" in result["user_visible_summary"]
+    assert "success" not in result["user_visible_summary"].lower()
+
+    impossible = client.post(
+        "/v1/capabilities/action-summary",
+        json={**request, "verification_status": "passed"},
+    )
+    assert impossible.status_code == 422
+
+
+def test_not_attempted_action_summary_reports_no_action():
+    client = TestClient(app)
+    request = _action_summary_request(
+        client,
+        execution_status="not_attempted",
+        execution_reason_code=None,
+        verification_status="not_supported",
+        verification_reason_code=None,
+    )
+    result = client.post(
+        "/v1/capabilities/action-summary",
+        json=request,
+    ).json()["result"]
+
+    assert result["execution_status"] == "not_attempted"
+    assert result["verification_status"] == "not_supported"
+    assert "No action was taken" in result["user_visible_summary"]
+    impossible = client.post(
+        "/v1/capabilities/action-summary",
+        json={**request, "verification_status": "failed"},
+    )
+    assert impossible.status_code == 422
+
+
+def test_action_summary_rejects_execution_that_policy_does_not_permit():
+    client = TestClient(app)
+    response = client.post(
+        "/v1/capabilities/action-summary",
+        json=_action_summary_request(
+            client,
+            risk_level="blocked",
+            authority_level="blocked",
+            confirmation_status="accepted",
+            execution_status="executed",
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+def test_failed_action_summary_is_degraded_without_success_claim():
+    client = TestClient(app)
+    response = client.post(
+        "/v1/capabilities/action-summary",
+        json=_action_summary_request(
+            client,
+            execution_status="failed",
+            execution_reason_code="integration_unavailable",
+            verification_status="unknown",
+            verification_reason_code=None,
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["execution_status"] == "failed"
+    assert result["degradation_reason"] == "integration_unavailable"
+    assert "failed" in result["user_visible_summary"]
+    assert "success" not in result["user_visible_summary"].lower()
+
+
+def test_partial_action_summary_remains_explicitly_degraded():
+    client = TestClient(app)
+    result = client.post(
+        "/v1/capabilities/action-summary",
+        json=_action_summary_request(
+            client,
+            execution_status="partially_executed",
+            execution_reason_code=None,
+            verification_status="passed",
+        ),
+    ).json()["result"]
+
+    assert result["execution_status"] == "partially_executed"
+    assert result["degradation_reason"] == "partial_execution"
+    assert "partially completed" in result["user_visible_summary"]
+    assert "degraded" in result["user_visible_summary"]
+
+
+def test_unknown_action_summary_preserves_uncertainty_without_retry_or_success():
+    client = TestClient(app)
+    result = client.post(
+        "/v1/capabilities/action-summary",
+        json=_action_summary_request(
+            client,
+            execution_status="unknown",
+            execution_reason_code=None,
+            verification_status="unknown",
+            verification_reason_code=None,
+        ),
+    ).json()["result"]
+
+    assert result["execution_status"] == "unknown"
+    assert result["degradation_reason"] == "execution_state_unknown"
+    assert "could not be confirmed" in result["user_visible_summary"]
+    assert "No success is claimed" in result["user_visible_summary"]
+    assert "retry" not in result["user_visible_summary"].lower()
+
+
+@pytest.mark.parametrize(
+    ("verification_status", "expected_text", "claims_verified_success"),
+    [
+        ("passed", "verification passed", True),
+        ("failed", "verification failed", False),
+        ("unknown", "verification could not be confirmed", False),
+        ("not_required", "Verification was not required", False),
+        ("not_supported", "Verification is not supported", False),
+    ],
+)
+def test_executed_action_summary_reports_verification_truthfully(
+    verification_status: str,
+    expected_text: str,
+    claims_verified_success: bool,
+):
+    client = TestClient(app)
+    result = client.post(
+        "/v1/capabilities/action-summary",
+        json=_action_summary_request(
+            client,
+            verification_status=verification_status,
+            verification_reason_code=(
+                "result_check_failed" if verification_status == "failed" else None
+            ),
+        ),
+    ).json()["result"]
+
+    assert expected_text in result["user_visible_summary"]
+    assert ("verification passed" in result["user_visible_summary"]) is (
+        claims_verified_success
+    )
+    if verification_status == "failed":
+        assert result["degradation_reason"] == "result_check_failed"
+    if verification_status == "unknown":
+        assert result["degradation_reason"] == "verification_unknown"
+
+
+def test_cancelled_action_summary_is_distinct_from_policy_blocking():
+    client = TestClient(app)
+    result = client.post(
+        "/v1/capabilities/action-summary",
+        json=_action_summary_request(
+            client,
+            confirmation_status="cancelled",
+            execution_status="cancelled_by_user",
+            execution_reason_code=None,
+            verification_status="not_required",
+            verification_reason_code=None,
+        ),
+    ).json()["result"]
+
+    assert result["execution_status"] == "cancelled_by_user"
+    assert result["execution_status"] != "blocked_by_policy"
+    assert result["degradation_reason"] is None
+    assert "cancelled" in result["user_visible_summary"]
+    assert "No action was taken" in result["user_visible_summary"]
+
+
+@pytest.mark.parametrize(
+    "private_field",
+    [
+        "raw_prompt",
+        "raw_output",
+        "metadata",
+        "credentials",
+        "endpoint_url",
+        "exception_details",
+        "tool_arguments",
+    ],
+)
+def test_action_summary_request_rejects_private_or_arbitrary_fields(private_field: str):
+    client = TestClient(app)
+    request = _action_summary_request(client)
+    request[private_field] = {"secret": "private-value"}
+
+    response = client.post("/v1/capabilities/action-summary", json=request)
+
+    assert response.status_code == 422
+
+
+def test_action_summary_request_rejects_url_shaped_identifiers():
+    client = TestClient(app)
+    request = _action_summary_request(client)
+
+    response = client.post(
+        "/v1/capabilities/action-summary",
+        json={**request, "capability_id": "https://private.example/action"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_action_summary_event_contains_only_bounded_normalized_fields():
+    client = TestClient(app)
+    request = _action_summary_request(
+        client,
+        execution_status="executed",
+        verification_status="failed",
+        verification_reason_code="result_check_failed",
+    )
+    response = client.post("/v1/capabilities/action-summary", json=request)
+    result = response.json()["result"]
+
+    diagnostics = client.get(
+        f"/v1/runtime/sessions/{request['runtime_session_id']}"
+    ).json()
+    event_payload = next(
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "action_summary_recorded"
+    )
+
+    assert set(event_payload) == {
+        "request_id",
+        "owner_id",
+        "conversation_id",
+        "runtime_session_id",
+        "runtime_turn_id",
+        *result.keys(),
+    }
+    assert all(event_payload[field] == value for field, value in result.items())
+    assert "private-value" not in str(event_payload)
 
 
 def test_exposure_allows_matching_persona_domain_and_surface():

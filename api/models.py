@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 AttentionStatus = Literal["active", "paused", "resolved"]
 BoundedLabel = Annotated[str, Field(min_length=1, max_length=64)]
@@ -131,6 +131,7 @@ RuntimeEventType = Literal[
     "world_state_verification_evaluated",
     "capability_authorization_evaluated",
     "confirmation_challenge_evaluated",
+    "action_summary_recorded",
 ]
 
 
@@ -962,6 +963,40 @@ ActionFlowIntent = Literal[
     "confirmation_expired",
 ]
 VerificationMethod = Literal["capability_verification"]
+ActionExecutionStatus = Literal[
+    "not_attempted",
+    "blocked_by_policy",
+    "cancelled_by_user",
+    "executed",
+    "partially_executed",
+    "failed",
+    "unknown",
+]
+ActionVerificationStatus = Literal[
+    "not_supported",
+    "not_required",
+    "passed",
+    "failed",
+    "unknown",
+]
+ActionConfirmationStatus = Literal[
+    "not_required",
+    "required_pending",
+    "accepted",
+    "rejected",
+    "expired",
+    "cancelled",
+    "unknown",
+]
+ActionRequestedBy = Literal["conversation_participant"]
+ActionSummaryIdentifier = Annotated[
+    str,
+    Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+]
+ActionSummaryCode = Annotated[
+    str,
+    Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$"),
+]
 
 
 class ActionConsequenceFlags(BaseModel):
@@ -1123,6 +1158,114 @@ class ActionFlowDecisionResponse(BaseModel):
     surface: str = Field(max_length=64)
     active_persona_id: str = Field(max_length=120)
     result: ActionFlowDecision
+
+
+class ActionSummaryRequest(RuntimeStateResolveRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: ActionSummaryIdentifier
+    owner_id: ActionSummaryIdentifier
+    conversation_id: ActionSummaryIdentifier
+    surface: ActionSummaryIdentifier
+    runtime_session_id: ActionSummaryIdentifier
+    runtime_turn_id: ActionSummaryIdentifier | None = None
+    capability_id: ActionSummaryIdentifier
+    active_persona_id: ActionSummaryIdentifier
+    risk_level: ActionRiskLevel
+    authority_level: ActionAuthorityLevel
+    confirmation_status: ActionConfirmationStatus
+    policy_reason_codes: list[ActionSummaryCode] = Field(
+        default_factory=list, max_length=16
+    )
+    execution_status: ActionExecutionStatus
+    execution_reason_code: ActionSummaryCode | None = None
+    verification_status: ActionVerificationStatus
+    verification_reason_code: ActionSummaryCode | None = None
+    degradation_reason: ActionSummaryCode | None = None
+
+    @model_validator(mode="after")
+    def validate_action_outcomes(self) -> ActionSummaryRequest:
+        attempted = self.execution_status in {
+            "executed",
+            "partially_executed",
+            "failed",
+        }
+        if self.verification_status == "passed" and self.execution_status not in {
+            "executed",
+            "partially_executed",
+        }:
+            raise ValueError("verification_passed_without_execution")
+        if self.execution_status == "not_attempted" and self.verification_status not in {
+            "not_required",
+            "not_supported",
+            "unknown",
+        }:
+            raise ValueError("verification_invalid_without_attempt")
+        if attempted and self.authority_level in {
+            "suggest_only",
+            "prepare_only",
+            "blocked",
+        }:
+            raise ValueError("execution_not_permitted_by_authority")
+        if attempted and self.risk_level == "blocked":
+            raise ValueError("execution_not_permitted_by_risk")
+        if (
+            attempted
+            and self.authority_level == "answer_only"
+            and self.risk_level != "read_only"
+        ):
+            raise ValueError("execution_not_permitted_by_authority")
+        if attempted and self.confirmation_status in {
+            "required_pending",
+            "rejected",
+            "expired",
+            "cancelled",
+            "unknown",
+        }:
+            raise ValueError("execution_without_resolved_confirmation")
+        if (
+            attempted
+            and self.authority_level == "execute_after_confirmation"
+            and self.confirmation_status != "accepted"
+        ):
+            raise ValueError("execution_without_accepted_confirmation")
+        if (
+            attempted
+            and self.risk_level
+            in {"medium_requires_confirmation", "high_requires_confirmation"}
+            and self.confirmation_status != "accepted"
+        ):
+            raise ValueError("execution_without_accepted_confirmation")
+        return self
+
+
+class ActionSummary(BaseModel):
+    action_id: str = Field(max_length=64)
+    capability_id: ActionSummaryIdentifier
+    requested_by: ActionRequestedBy
+    surface_type: ActionSummaryIdentifier
+    active_persona_id: ActionSummaryIdentifier
+    risk_level: ActionRiskLevel
+    authority_level: ActionAuthorityLevel
+    confirmation_status: ActionConfirmationStatus
+    execution_status: ActionExecutionStatus
+    verification_status: ActionVerificationStatus
+    degradation_reason: ActionSummaryCode | None = None
+    policy_reason_codes: list[ActionSummaryCode] = Field(
+        default_factory=list, max_length=16
+    )
+    execution_reason_code: ActionSummaryCode | None = None
+    verification_reason_code: ActionSummaryCode | None = None
+    user_visible_summary: str = Field(max_length=500)
+
+
+class ActionSummaryResponse(BaseModel):
+    request_id: ActionSummaryIdentifier
+    owner_id: ActionSummaryIdentifier
+    conversation_id: ActionSummaryIdentifier
+    runtime_session_id: ActionSummaryIdentifier
+    runtime_turn_id: ActionSummaryIdentifier | None = None
+    result: ActionSummary
 
 
 class CapabilityRelationshipRequirement(BaseModel):

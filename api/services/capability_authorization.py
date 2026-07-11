@@ -17,6 +17,9 @@ from models import (
     ActionFlowDecisionRequest,
     ActionFlowDecisionResponse,
     ActionRiskLevel,
+    ActionSummary,
+    ActionSummaryRequest,
+    ActionSummaryResponse,
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
     CapabilityAuthorizationResult,
@@ -408,7 +411,11 @@ def _confirmation_text(
     return f"Confirm {record.display_name}{target}. This {consequence_text}."
 
 
-def _session_and_turn(body: CapabilityAuthorizationRequest | CapabilityConfirmationRequest) -> None:
+def _session_and_turn(
+    body: CapabilityAuthorizationRequest
+    | CapabilityConfirmationRequest
+    | ActionSummaryRequest,
+) -> None:
     session = runtime_session_by_id(body.runtime_session_id)
     if session is None:
         raise RuntimeError("runtime_session_not_found")
@@ -1491,6 +1498,117 @@ def decide_action_flow(body: ActionFlowDecisionRequest) -> ActionFlowDecisionRes
         surface=body.surface,
         active_persona_id=body.active_persona_id,
         result=decision,
+    )
+
+
+def _action_summary_id(body: ActionSummaryRequest) -> str:
+    material = json.dumps(
+        [
+            body.request_id,
+            body.owner_id,
+            body.conversation_id,
+            body.surface,
+            body.runtime_session_id,
+            body.runtime_turn_id or "",
+            body.capability_id,
+            body.active_persona_id,
+        ],
+        separators=(",", ":"),
+    )
+    return f"act_{sha256(material.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _action_degradation_reason(body: ActionSummaryRequest) -> str | None:
+    if body.degradation_reason is not None:
+        return body.degradation_reason
+    if body.execution_status == "blocked_by_policy":
+        return (
+            body.execution_reason_code
+            or (body.policy_reason_codes[0] if body.policy_reason_codes else None)
+            or "policy_blocked"
+        )
+    if body.execution_status == "partially_executed":
+        return body.execution_reason_code or "partial_execution"
+    if body.execution_status == "failed":
+        return body.execution_reason_code or "execution_failed"
+    if body.execution_status == "unknown":
+        return body.execution_reason_code or "execution_state_unknown"
+    if body.execution_status == "executed" and body.verification_status == "failed":
+        return body.verification_reason_code or "verification_failed"
+    if body.execution_status == "executed" and body.verification_status == "unknown":
+        return body.verification_reason_code or "verification_unknown"
+    return None
+
+
+def _action_user_summary(body: ActionSummaryRequest) -> str:
+    capability = body.capability_id
+    if body.execution_status == "blocked_by_policy":
+        return f"Action {capability} was blocked by policy. No action was taken."
+    if body.execution_status == "cancelled_by_user":
+        return f"Action {capability} was cancelled. No action was taken."
+    if body.execution_status == "not_attempted":
+        return f"Action {capability} was not attempted. No action was taken."
+    if body.execution_status == "partially_executed":
+        return f"Action {capability} was only partially completed. The result is degraded."
+    if body.execution_status == "failed":
+        return f"Action {capability} failed after execution was attempted."
+    if body.execution_status == "unknown":
+        return (
+            f"The execution state for action {capability} could not be confirmed. "
+            "No success is claimed."
+        )
+    if body.verification_status == "passed":
+        return f"Action {capability} was executed and verification passed."
+    if body.verification_status == "failed":
+        return f"Action {capability} was executed, but verification failed."
+    if body.verification_status == "unknown":
+        return (
+            f"Action {capability} was executed, but verification could not be confirmed."
+        )
+    if body.verification_status == "not_supported":
+        return f"Action {capability} was executed. Verification is not supported."
+    return f"Action {capability} was executed. Verification was not required."
+
+
+def compose_action_summary(body: ActionSummaryRequest) -> ActionSummaryResponse:
+    _session_and_turn(body)
+    result = ActionSummary(
+        action_id=_action_summary_id(body),
+        capability_id=body.capability_id,
+        requested_by="conversation_participant",
+        surface_type=body.surface,
+        active_persona_id=body.active_persona_id,
+        risk_level=body.risk_level,
+        authority_level=body.authority_level,
+        confirmation_status=body.confirmation_status,
+        execution_status=body.execution_status,
+        verification_status=body.verification_status,
+        degradation_reason=_action_degradation_reason(body),
+        policy_reason_codes=body.policy_reason_codes,
+        execution_reason_code=body.execution_reason_code,
+        verification_reason_code=body.verification_reason_code,
+        user_visible_summary=_action_user_summary(body),
+    )
+    record_runtime_event(
+        runtime_session_id=body.runtime_session_id,
+        runtime_turn_id=body.runtime_turn_id,
+        event_type="action_summary_recorded",
+        event_payload_json={
+            "request_id": body.request_id,
+            "owner_id": body.owner_id,
+            "conversation_id": body.conversation_id,
+            "runtime_session_id": body.runtime_session_id,
+            "runtime_turn_id": body.runtime_turn_id,
+            **result.model_dump(),
+        },
+    )
+    return ActionSummaryResponse(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        runtime_session_id=body.runtime_session_id,
+        runtime_turn_id=body.runtime_turn_id,
+        result=result,
     )
 
 
