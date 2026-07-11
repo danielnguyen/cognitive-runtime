@@ -6,6 +6,8 @@ from models import (
     ActionAuthorityDecisionResponse,
     ActionFlowDecisionRequest,
     ActionFlowDecisionResponse,
+    ActionSummaryRequest,
+    ActionSummaryResponse,
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
     CapabilityDiscoveryRequest,
@@ -81,6 +83,7 @@ from models import (
 )
 from services.capability_authorization import (
     authorize_capability,
+    compose_action_summary,
     decide_action_authority,
     decide_action_flow,
     discover_registered_capabilities,
@@ -626,6 +629,19 @@ async def capability_flow(
     body: ActionFlowDecisionRequest,
 ) -> ActionFlowDecisionResponse:
     return decide_action_flow(body)
+
+
+@app.post("/v1/capabilities/action-summary", response_model=ActionSummaryResponse)
+async def capability_action_summary(
+    body: ActionSummaryRequest,
+) -> ActionSummaryResponse:
+    try:
+        return compose_action_summary(body)
+    except RuntimeError as exc:
+        http_error = _bounded_http_error(exc, _CAPABILITY_ERROR_STATUS)
+        if http_error is None:
+            raise
+        raise http_error from exc
 
 
 @app.post("/v1/capabilities/confirm", response_model=CapabilityConfirmationResponse)
