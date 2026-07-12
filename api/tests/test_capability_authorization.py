@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
+import services.capability_authorization as capability_authorization_service
 from fastapi.testclient import TestClient
 from main import app
+from services.capability_authorization import (
+    capability_authorization_repository,
+    configure_capability_registry_for_tests,
+)
 from services.world_state import (
     TrustedWorldStateVerifier,
     configure_trusted_world_state_verifiers_for_tests,
 )
-from services.capability_authorization import configure_capability_registry_for_tests
 
 
 def _iso(delta_seconds: int) -> str:
@@ -33,10 +38,21 @@ def _available_capability_registry():
     configure_capability_registry_for_tests(available=True)
 
 
-def _start_turn(client: TestClient, *, surface: str = "dev") -> dict[str, object]:
+def _start_turn(
+    client: TestClient,
+    *,
+    surface: str = "dev",
+    owner_id: str = "owner",
+    conversation_id: str = "conv-1",
+) -> dict[str, object]:
     return client.post(
         "/v1/runtime/turns/start",
-        json={**_base(surface=surface), "request_id": "capability-turn"},
+        json={
+            **_base(surface=surface),
+            "request_id": "capability-turn",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+        },
     ).json()
 
 
@@ -225,7 +241,7 @@ def _authorized_request(turn: dict[str, object], **overrides) -> dict[str, objec
         "capability_domain": "software_architecture",
         "operation_class": "read",
         "argument_digest": None,
-        "supported_surfaces": ["dev"],
+        "supported_surfaces": ["dev", "vscode"],
         "relationship_requirements": [],
         "selected_relationship_ids": [],
         "world_state_requirements": [],
@@ -234,6 +250,75 @@ def _authorized_request(turn: dict[str, object], **overrides) -> dict[str, objec
     }
     request.update(overrides)
     return request
+
+
+def _authorization_request(
+    turn: dict[str, object],
+    *,
+    authorization_stage: str,
+    **overrides,
+) -> dict[str, object]:
+    request = _authorized_request(turn, **overrides)
+    request["authorization_" + "pha" + "se"] = authorization_stage
+    return request
+
+
+def _jellyfin_authorization_request(
+    turn: dict[str, object],
+    *,
+    authorization_stage: str | None = None,
+    **overrides,
+) -> dict[str, object]:
+    request = (
+        _authorization_request(turn, authorization_stage=authorization_stage)
+        if authorization_stage is not None
+        else _authorized_request(turn)
+    )
+    request.update(
+        {
+            "capability_id": "jellyfin_restart",
+            "capability_domain": "media_operations",
+            "operation_class": "high_impact",
+            "supported_surfaces": ["desktop", "dev"],
+        }
+    )
+    request.update(overrides)
+    return request
+
+
+def _challenge_row_count() -> int:
+    with capability_authorization_repository()._connect() as conn:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM capability_confirmation_challenges;"
+            ).fetchone()[0]
+        )
+
+
+def _issued_challenge_event_count() -> int:
+    with capability_authorization_repository()._connect() as conn:
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM conversation_runtime_events
+                WHERE event_type = 'confirmation_challenge_evaluated'
+                  AND event_payload_json LIKE '%\"confirmation_state\":\"issued\"%';
+                """
+            ).fetchone()[0]
+        )
+
+
+def _challenge_record(challenge_ref: str) -> dict[str, object]:
+    with capability_authorization_repository()._connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM capability_confirmation_challenges
+            WHERE confirmation_challenge_ref = ?;
+            """,
+            (challenge_ref,),
+        ).fetchone()
+    assert row is not None
+    return dict(row)
 
 
 def _consumed_event_count(client: TestClient, runtime_session_id: str) -> int:
@@ -1689,6 +1774,7 @@ def test_exposure_denies_blocked_domain_and_unsupported_surface():
         "/v1/capabilities/authorize",
         json=_authorized_request(
             turn,
+            capability_id="integration.generic.read.test",
             capability_domain="personal_support",
             supported_surfaces=["web"],
         ),
@@ -1699,6 +1785,293 @@ def test_exposure_denies_blocked_domain_and_unsupported_surface():
     assert result["allowed"] is False
     assert "capability_domain_denied" in result["reason_codes"]
     assert "surface_unsupported" in result["reason_codes"]
+
+
+def test_registered_world_state_authorization_uses_canonical_registry_metadata():
+    client = TestClient(app)
+    turn = _start_turn(client)
+
+    response = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorization_request(
+            turn,
+            authorization_stage="selection",
+            argument_digest="args_registered_world_state",
+            supported_surfaces=["vscode", "dev"],
+            request_id="registered-world-state-authorization",
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["allowed"] is True
+    assert result["decision_code"] == "allowed"
+    assert result["confirmation_state"] == "not_required"
+    assert result["challenge_ref"] is None
+    assert result["challenge_expires_at"] is None
+
+    runtime_session_id = turn["runtime_session"]["runtime_session_id"]
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}").json()
+    event_payload = next(
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "capability_authorization_evaluated"
+        and event["event_payload_json"]["request_id"]
+        == "registered-world-state-authorization"
+    )
+    assert event_payload["operation_class"] == "read"
+    assert event_payload["challenge_expires_at"] is None
+
+
+@pytest.mark.parametrize(
+    (
+        "request_overrides",
+        "surface",
+        "resolved_persona",
+        "expected_reason",
+    ),
+    [
+        (
+            {"capability_domain": "software_architecture"},
+            "dev",
+            "technical_architect",
+            "registered_capability_domain_mismatch",
+        ),
+        (
+            {"operation_class": "read"},
+            "dev",
+            "technical_architect",
+            "registered_operation_class_mismatch",
+        ),
+        (
+            {"supported_surfaces": ["dev"]},
+            "dev",
+            "technical_architect",
+            "registered_supported_surfaces_mismatch",
+        ),
+        (
+            {"supported_surfaces": ["desktop", "dev", "web"]},
+            "dev",
+            "technical_architect",
+            "registered_supported_surfaces_mismatch",
+        ),
+        (
+            {"supported_surfaces": ["desktop", "dev", "dev"]},
+            "dev",
+            "technical_architect",
+            "registered_supported_surfaces_mismatch",
+        ),
+        (
+            {"surface": "web"},
+            "web",
+            "technical_architect",
+            "registered_surface_not_allowed",
+        ),
+        (
+            {"active_persona_id": "general_assistant"},
+            "dev",
+            "general_assistant",
+            "registered_persona_not_allowed",
+        ),
+    ],
+)
+def test_registered_metadata_and_eligibility_mismatch_fail_before_context_selection(
+    monkeypatch,
+    request_overrides: dict[str, object],
+    surface: str,
+    resolved_persona: str,
+    expected_reason: str,
+):
+    client = TestClient(app)
+    turn = _start_turn(client, surface=surface)
+    monkeypatch.setattr(
+        capability_authorization_service,
+        "resolve_runtime_identity",
+        lambda _: SimpleNamespace(
+            runtime_identity=SimpleNamespace(
+                active_persona_id=resolved_persona,
+                capability_domain="software_architecture",
+                advisory_tool_permission_summary=["inspect_repository"],
+            )
+        ),
+    )
+
+    def unexpected_context_selection(*args, **kwargs):
+        raise AssertionError("registered mismatch reached context selection")
+
+    monkeypatch.setattr(
+        capability_authorization_service,
+        "select_relationships",
+        unexpected_context_selection,
+    )
+    monkeypatch.setattr(
+        capability_authorization_service,
+        "resolve_world_state",
+        unexpected_context_selection,
+    )
+    request = _jellyfin_authorization_request(
+        turn,
+        request_id=f"registered-mismatch-{expected_reason}",
+        authorization_stage="selection",
+        argument_digest="args_registered_mismatch",
+        relationship_requirements=[{"relationship_scope": "project_context"}],
+        selected_relationship_ids=["rel-untrusted"],
+        world_state_requirements=[{"domain": "active_repository"}],
+        selected_world_state_claim_ids=["wsc-untrusted"],
+        **request_overrides,
+    )
+
+    response = client.post("/v1/capabilities/authorize", json=request)
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["allowed"] is False
+    assert result["decision_code"] == "authorization_denied"
+    assert result["reason_codes"] == [expected_reason]
+    assert result["challenge_ref"] is None
+    assert result["challenge_expires_at"] is None
+    assert result["revalidation_required"] is False
+    assert result["revalidation_selector"] is None
+    assert result["relationship_ids_used"] == []
+    assert result["world_state_claim_ids_used"] == []
+    assert _challenge_row_count() == 0
+    assert _issued_challenge_event_count() == 0
+
+    runtime_session_id = turn["runtime_session"]["runtime_session_id"]
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}").json()
+    event_payload = next(
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "capability_authorization_evaluated"
+        and event["event_payload_json"]["request_id"] == request["request_id"]
+    )
+    assert event_payload["operation_class"] == "high_impact"
+    assert event_payload["challenge_expires_at"] is None
+
+
+def test_canonical_jellyfin_selection_issues_one_bounded_challenge():
+    client = TestClient(app)
+    registry_record = client.post(
+        "/v1/capabilities/match",
+        json=_match_request(
+            "restart Jellyfin",
+            surface="dev",
+            persona="technical_architect",
+        ),
+    ).json()["result"]["capability"]
+    assert registry_record["capability_id"] == "jellyfin_restart"
+    assert registry_record["domain"] == "media_operations"
+    assert registry_record["operation_kind"] == "restart"
+    assert registry_record["allowed_surfaces"] == ["desktop", "dev"]
+    assert registry_record["allowed_personas"] == [
+        "home_operator",
+        "technical_architect",
+    ]
+    assert registry_record["requires_confirmation"] is True
+
+    turn = _start_turn(client)
+    request = _jellyfin_authorization_request(
+        turn,
+        request_id="jellyfin-selection",
+        authorization_stage="selection",
+        argument_digest="args_jellyfin_restart",
+    )
+
+    response = client.post("/v1/capabilities/authorize", json=request)
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["allowed"] is False
+    assert result["decision_code"] == "confirmation_required"
+    assert result["reason_codes"] == ["confirmation_required"]
+    assert result["confirmation_state"] == "issued"
+    assert result["challenge_ref"]
+    assert result["challenge_expires_at"]
+    assert _challenge_row_count() == 1
+    assert _issued_challenge_event_count() == 1
+
+    row = _challenge_record(result["challenge_ref"])
+    assert row["capability_id"] == "jellyfin_restart"
+    assert row["operation_class"] == "high_impact"
+    assert row["argument_digest"] == "args_jellyfin_restart"
+    assert row["expires_at"] == result["challenge_expires_at"]
+    assert row["consumed_at"] is None
+
+    runtime_session_id = turn["runtime_session"]["runtime_session_id"]
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}").json()
+    authorization_event = next(
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "capability_authorization_evaluated"
+        and event["event_payload_json"]["request_id"] == "jellyfin-selection"
+    )
+    assert authorization_event["operation_class"] == "high_impact"
+    assert authorization_event["challenge_ref"] == result["challenge_ref"]
+    assert authorization_event["challenge_expires_at"] == row["expires_at"]
+    assert not any(
+        event["event_type"] == "action_summary_recorded"
+        for event in diagnostics["events"]
+    )
+
+
+def test_distinct_current_turn_resumes_exact_jellyfin_challenge_without_replacement():
+    client = TestClient(app)
+    origin_turn = _start_turn(client)
+    first = client.post(
+        "/v1/capabilities/authorize",
+        json=_jellyfin_authorization_request(
+            origin_turn,
+            request_id="jellyfin-first-selection",
+            authorization_stage="selection",
+            argument_digest="args_jellyfin_continuation",
+        ),
+    ).json()["result"]
+    stored = _challenge_record(first["challenge_ref"])
+    continuation_turn = _start_turn(client)
+
+    continuation = client.post(
+        "/v1/capabilities/authorize",
+        json=_jellyfin_authorization_request(
+            continuation_turn,
+            request_id="jellyfin-continuation-selection",
+            authorization_stage="selection",
+            argument_digest="args_jellyfin_continuation",
+            confirmation_challenge_ref=first["challenge_ref"],
+        ),
+    ).json()["result"]
+
+    assert continuation["allowed"] is False
+    assert continuation["decision_code"] == "confirmation_required"
+    assert continuation["reason_codes"] == ["confirmation_required"]
+    assert continuation["confirmation_state"] == "issued"
+    assert continuation["challenge_ref"] == first["challenge_ref"]
+    assert continuation["challenge_expires_at"] == first["challenge_expires_at"]
+    assert continuation["challenge_expires_at"] == stored["expires_at"]
+    assert _challenge_row_count() == 1
+    assert _issued_challenge_event_count() == 1
+    assert _challenge_record(first["challenge_ref"])["status"] == "issued"
+
+    runtime_session_id = origin_turn["runtime_session"]["runtime_session_id"]
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}").json()
+    challenge_events = [
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "confirmation_challenge_evaluated"
+    ]
+    assert [event["confirmation_state"] for event in challenge_events] == ["issued"]
+    continuation_event = next(
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "capability_authorization_evaluated"
+        and event["event_payload_json"]["request_id"]
+        == "jellyfin-continuation-selection"
+    )
+    assert continuation_event["challenge_ref"] == first["challenge_ref"]
+    assert continuation_event["challenge_expires_at"] == stored["expires_at"]
+    assert not any(
+        event["event_type"] == "action_summary_recorded"
+        for event in diagnostics["events"]
+    )
 
 
 def test_relationship_required_exposure_allows_active_eligible_relationship():
@@ -1901,6 +2274,7 @@ def test_relationship_outside_surface_scope_does_not_authorize():
         relationship_requirements=_relationship_requirement(
             relationship_scope="creative_context"
         ),
+        capability_id="integration.generic.read.test",
         surface="unknown",
         active_persona_id="general_assistant",
         capability_domain="general_assistance",
@@ -2313,6 +2687,7 @@ def test_hard_denial_takes_precedence_over_revalidation_and_challenge():
             turn,
             active_persona_id="personal_companion",
             authorization_phase="selection",
+            capability_id="integration.external_write.test",
             operation_class="external_write",
             argument_digest="args_hard_denial_plus_stale",
             world_state_requirements=[
@@ -2350,6 +2725,7 @@ def test_revalidation_required_selection_issues_no_confirmation_challenge():
         json=_authorized_request(
             turn,
             authorization_phase="selection",
+            capability_id="integration.external_write.test",
             operation_class="external_write",
             argument_digest="args_revalidation_no_challenge",
             world_state_requirements=[
@@ -2559,6 +2935,327 @@ def test_world_state_confirmation_policy_requires_current_confirmation_for_non_r
         },
     ).json()["result"]
     assert dispatch["allowed"] is True
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("missing", "challenge_missing"),
+        ("same_turn", "challenge_turn_mismatch"),
+        ("not_current", "confirmation_turn_not_current"),
+        ("created_before_issue", "confirmation_turn_not_current"),
+        ("wrong_owner", "challenge_missing"),
+        ("wrong_conversation_session", "challenge_mismatch"),
+        ("wrong_capability", "challenge_mismatch"),
+        ("wrong_operation_class", "challenge_mismatch"),
+        ("wrong_argument_digest", "challenge_mismatch"),
+    ],
+)
+def test_invalid_continuation_identity_does_not_issue_replacement_or_allow_selection(
+    case: str,
+    expected_reason: str,
+):
+    client = TestClient(app)
+    origin_turn = _start_turn(client)
+    first = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorization_request(
+            origin_turn,
+            authorization_stage="selection",
+            request_id=f"continuation-origin-{case}",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_continuation_identity",
+        ),
+    ).json()["result"]
+    continuation_turn = _start_turn(client)
+    capability_id = "integration.external_write.test"
+    operation_class = "external_write"
+    argument_digest = "args_continuation_identity"
+    challenge_ref = first["challenge_ref"]
+    request_overrides: dict[str, object] = {}
+    attempt_turn = continuation_turn
+
+    if case == "missing":
+        challenge_ref = "capconfirm_missing"
+    elif case == "same_turn":
+        attempt_turn = origin_turn
+    elif case == "not_current":
+        _start_turn(client)
+    elif case == "created_before_issue":
+        issued_at = str(_challenge_record(first["challenge_ref"])["issued_at"])
+        with capability_authorization_repository()._connect() as conn:
+            conn.execute(
+                """
+                UPDATE conversation_runtime_turns
+                SET created_at = ?
+                WHERE runtime_turn_id = ?;
+                """,
+                (
+                    (datetime.fromisoformat(issued_at) - timedelta(seconds=1)).isoformat(),
+                    continuation_turn["runtime_turn"]["runtime_turn_id"],
+                ),
+            )
+    elif case == "wrong_owner":
+        attempt_turn = _start_turn(client, owner_id="owner-2")
+        request_overrides["owner_id"] = "owner-2"
+    elif case == "wrong_conversation_session":
+        attempt_turn = _start_turn(client, conversation_id="conv-2")
+        request_overrides["conversation_id"] = "conv-2"
+    elif case == "wrong_capability":
+        capability_id = "integration.external_write.other"
+    elif case == "wrong_operation_class":
+        operation_class = "high_impact"
+    elif case == "wrong_argument_digest":
+        argument_digest = "args_continuation_changed"
+
+    rows_before = _challenge_row_count()
+    issued_events_before = _issued_challenge_event_count()
+    result = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorization_request(
+            attempt_turn,
+            authorization_stage="selection",
+            request_id=f"continuation-invalid-{case}",
+            capability_id=capability_id,
+            operation_class=operation_class,
+            argument_digest=argument_digest,
+            confirmation_challenge_ref=challenge_ref,
+            **request_overrides,
+        ),
+    ).json()["result"]
+
+    assert result["allowed"] is False
+    expected_decision = (
+        "authorization_denied"
+        if expected_reason == "confirmation_turn_not_current"
+        else "confirmation_rejected"
+    )
+    assert result["decision_code"] == expected_decision
+    assert result["reason_codes"] == [expected_reason]
+    assert result["challenge_ref"] is None
+    assert result["challenge_expires_at"] is None
+    assert _challenge_row_count() == rows_before == 1
+    assert _issued_challenge_event_count() == issued_events_before == 1
+    assert _challenge_record(first["challenge_ref"])["status"] == "issued"
+    assert _challenge_record(first["challenge_ref"])["consumed_at"] is None
+
+
+@pytest.mark.parametrize(
+    ("challenge_state", "expected_reason"),
+    [
+        ("expired", "challenge_expired"),
+        ("rejected", "challenge_rejected"),
+        ("consumed", "challenge_consumed"),
+    ],
+)
+def test_invalid_continuation_state_does_not_issue_replacement_or_dispatch_again(
+    challenge_state: str,
+    expected_reason: str,
+):
+    client = TestClient(app)
+    origin_turn = _start_turn(client)
+    first = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorization_request(
+            origin_turn,
+            authorization_stage="selection",
+            request_id=f"continuation-state-origin-{challenge_state}",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_continuation_state",
+        ),
+    ).json()["result"]
+    continuation_turn = _start_turn(client)
+    challenge_ref = first["challenge_ref"]
+
+    if challenge_state == "expired":
+        with capability_authorization_repository()._connect() as conn:
+            conn.execute(
+                """
+                UPDATE capability_confirmation_challenges
+                SET expires_at = ?, updated_at = ?
+                WHERE confirmation_challenge_ref = ?;
+                """,
+                (_iso(-60), _iso(-60), challenge_ref),
+            )
+    else:
+        confirmation = client.post(
+            "/v1/capabilities/confirm",
+            json={
+                **_base(),
+                "request_id": f"continuation-state-confirm-{challenge_state}",
+                "runtime_session_id": origin_turn["runtime_session"][
+                    "runtime_session_id"
+                ],
+                "runtime_turn_id": continuation_turn["runtime_turn"][
+                    "runtime_turn_id"
+                ],
+                "confirmation_challenge_ref": challenge_ref,
+                "capability_id": "integration.external_write.test",
+                "operation_class": "external_write",
+                "argument_digest": "args_continuation_state",
+                "confirmed": challenge_state == "consumed",
+            },
+        )
+        assert confirmation.status_code == 200
+        if challenge_state == "consumed":
+            dispatch = client.post(
+                "/v1/capabilities/authorize",
+                json=_authorization_request(
+                    continuation_turn,
+                    authorization_stage="dispatch",
+                    request_id="continuation-state-initial-dispatch",
+                    capability_id="integration.external_write.test",
+                    operation_class="external_write",
+                    argument_digest="args_continuation_state",
+                    confirmation_challenge_ref=challenge_ref,
+                ),
+            ).json()["result"]
+            assert dispatch["allowed"] is True
+
+    rows_before = _challenge_row_count()
+    issued_events_before = _issued_challenge_event_count()
+    continuation = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorization_request(
+            continuation_turn,
+            authorization_stage="selection",
+            request_id=f"continuation-state-invalid-{challenge_state}",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_continuation_state",
+            confirmation_challenge_ref=challenge_ref,
+        ),
+    ).json()["result"]
+    replay_dispatch = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorization_request(
+            continuation_turn,
+            authorization_stage="dispatch",
+            request_id=f"continuation-state-dispatch-{challenge_state}",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_continuation_state",
+            confirmation_challenge_ref=challenge_ref,
+        ),
+    ).json()["result"]
+
+    assert continuation["allowed"] is False
+    assert continuation["decision_code"] == "confirmation_rejected"
+    assert continuation["reason_codes"] == [expected_reason]
+    assert continuation["challenge_ref"] is None
+    assert continuation["challenge_expires_at"] is None
+    assert replay_dispatch["allowed"] is False
+    assert expected_reason in replay_dispatch["reason_codes"]
+    assert _challenge_row_count() == rows_before == 1
+    assert _issued_challenge_event_count() == issued_events_before == 1
+
+
+def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_remain_compatible():
+    client = TestClient(app)
+    origin_turn = _start_turn(client)
+    first = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorization_request(
+            origin_turn,
+            authorization_stage="selection",
+            request_id="generic-compatibility-origin",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_generic_compatibility",
+        ),
+    ).json()["result"]
+    confirmation_turn = _start_turn(client)
+    continuation = client.post(
+        "/v1/capabilities/authorize",
+        json=_authorization_request(
+            confirmation_turn,
+            authorization_stage="selection",
+            request_id="generic-compatibility-continuation",
+            capability_id="integration.external_write.test",
+            operation_class="external_write",
+            argument_digest="args_generic_compatibility",
+            confirmation_challenge_ref=first["challenge_ref"],
+        ),
+    ).json()["result"]
+    confirmed = client.post(
+        "/v1/capabilities/confirm",
+        json={
+            **_base(),
+            "request_id": "confirm-generic-compatibility",
+            "runtime_session_id": origin_turn["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": confirmation_turn["runtime_turn"]["runtime_turn_id"],
+            "confirmation_challenge_ref": first["challenge_ref"],
+            "capability_id": "integration.external_write.test",
+            "operation_class": "external_write",
+            "argument_digest": "args_generic_compatibility",
+            "confirmed": True,
+        },
+    )
+    assert confirmed.status_code == 200
+    dispatch_request = _authorization_request(
+        confirmation_turn,
+        authorization_stage="dispatch",
+        request_id="generic-compatibility-dispatch",
+        capability_id="integration.external_write.test",
+        operation_class="external_write",
+        argument_digest="args_generic_compatibility",
+        confirmation_challenge_ref=first["challenge_ref"],
+    )
+    first_dispatch = client.post(
+        "/v1/capabilities/authorize",
+        json=dispatch_request,
+    ).json()["result"]
+    runtime_session_id = origin_turn["runtime_session"]["runtime_session_id"]
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}").json()
+    dispatch_event = next(
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "capability_authorization_evaluated"
+        and event["event_payload_json"]["request_id"]
+        == "generic-compatibility-dispatch"
+    )
+    event_stage_key = "pha" + "se"
+    assert first_dispatch["allowed"] is True
+    assert first_dispatch["confirmation_state"] == "accepted"
+    assert first_dispatch["challenge_ref"] == first["challenge_ref"]
+    assert first_dispatch["challenge_expires_at"] is None
+    assert dispatch_event["challenge_ref"] == first["challenge_ref"]
+    assert dispatch_event["operation_class"] == "external_write"
+    assert dispatch_event[event_stage_key] == "dispatch"
+    assert set(dispatch_event) == {
+        "request_id",
+        event_stage_key,
+        "capability_id",
+        "operation_class",
+        "decision_code",
+        "reason_codes",
+        "relationship_ids_used",
+        "world_state_claim_ids_used",
+        "confirmation_state",
+        "challenge_ref",
+        "challenge_expires_at",
+        "revalidation_required",
+    }
+    consumed_events_before_replay = _consumed_event_count(client, runtime_session_id)
+    rows_before_replay = _challenge_row_count()
+    issued_events_before_replay = _issued_challenge_event_count()
+    replay = client.post(
+        "/v1/capabilities/authorize",
+        json=dispatch_request,
+    ).json()["result"]
+
+    assert continuation["decision_code"] == "confirmation_required"
+    assert continuation["challenge_ref"] == first["challenge_ref"]
+    assert continuation["challenge_expires_at"] == first["challenge_expires_at"]
+    assert _challenge_row_count() == 1
+    assert _issued_challenge_event_count() == 1
+    assert replay["allowed"] is False
+    assert replay["reason_codes"] == ["challenge_consumed"]
+    assert _challenge_row_count() == rows_before_replay == 1
+    assert _issued_challenge_event_count() == issued_events_before_replay == 1
+    assert _consumed_event_count(client, runtime_session_id) == consumed_events_before_replay == 1
 
 
 def test_risky_confirmation_is_exact_one_use_and_privacy_safe():

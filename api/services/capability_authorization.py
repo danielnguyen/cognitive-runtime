@@ -23,6 +23,8 @@ from models import (
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
     CapabilityAuthorizationResult,
+    CapabilityConfirmationRequest,
+    CapabilityConfirmationResponse,
     CapabilityDiscoveryExample,
     CapabilityDiscoveryRequest,
     CapabilityDiscoveryResponse,
@@ -30,8 +32,8 @@ from models import (
     CapabilityMatchRequest,
     CapabilityMatchResponse,
     CapabilityMatchResult,
-    CapabilityConfirmationRequest,
-    CapabilityConfirmationResponse,
+    CapabilityOperationClass,
+    CapabilityOperationKind,
     CapabilityRegistryRecord,
     CapabilityRevalidationSelector,
     DryRunEffect,
@@ -74,6 +76,14 @@ _FRESHNESS_ORDER = {
     "conflicted": 6,
 }
 _HIGH_IMPACT_OPERATION_CLASSES = {"external_write", "destructive", "high_impact"}
+_OPERATION_CLASS_BY_KIND: dict[CapabilityOperationKind, CapabilityOperationClass] = {
+    "read_only": "read",
+    "draft_or_prepare": "draft",
+    "state_change": "external_write",
+    "notification": "external_write",
+    "restart": "high_impact",
+    "blocked_external_action": "high_impact",
+}
 
 
 @dataclass(frozen=True)
@@ -283,6 +293,37 @@ def _registered_capability_by_id(capability_id: str) -> RegisteredCapability | N
     return None
 
 
+def _registered_operation_class(
+    capability: CapabilityRegistryRecord,
+) -> CapabilityOperationClass:
+    return _OPERATION_CLASS_BY_KIND[capability.operation_kind]
+
+
+def _registered_authorization_reasons(
+    body: CapabilityAuthorizationRequest,
+    capability: CapabilityRegistryRecord,
+    *,
+    active_persona_id: str,
+    operation_class: CapabilityOperationClass,
+) -> list[str]:
+    reasons: list[str] = []
+    if body.capability_domain != capability.domain:
+        reasons.append("registered_capability_domain_mismatch")
+    if body.operation_class != operation_class:
+        reasons.append("registered_operation_class_mismatch")
+    supported_surfaces = body.supported_surfaces
+    if (
+        len(supported_surfaces) != len(set(supported_surfaces))
+        or set(supported_surfaces) != set(capability.allowed_surfaces)
+    ):
+        reasons.append("registered_supported_surfaces_mismatch")
+    if body.surface not in capability.allowed_surfaces:
+        reasons.append("registered_surface_not_allowed")
+    if active_persona_id not in capability.allowed_personas:
+        reasons.append("registered_persona_not_allowed")
+    return reasons
+
+
 def _risk_from_registry(capability: CapabilityRegistryRecord) -> ActionRiskLevel:
     risk = capability.risk_level
     if capability.operation_kind == "read_only" or risk == "low_read_only":
@@ -483,45 +524,73 @@ class CapabilityAuthorizationRepository:
                 runtime_session_id=body.runtime_session_id,
             )
         )
+        active_persona_id = identity.runtime_identity.active_persona_id
+        registered_capability = _registered_capability_by_id(body.capability_id)
+        operation_class: CapabilityOperationClass = body.operation_class
+        binding = companion_contracts_repository().surface_binding(body.surface)
         reason_codes: list[str] = []
+        registered_reasons: list[str] = []
+        if registered_capability is not None:
+            operation_class = _registered_operation_class(registered_capability.record)
+            if binding is None:
+                registered_reasons.append("unknown_surface")
+            if body.active_persona_id != active_persona_id:
+                registered_reasons.append("persona_mismatch")
+            registered_reasons.extend(
+                _registered_authorization_reasons(
+                    body,
+                    registered_capability.record,
+                    active_persona_id=active_persona_id,
+                    operation_class=operation_class,
+                )
+            )
+            reason_codes.extend(registered_reasons)
+
         relationship_ids_used: list[str] = []
         world_state_claim_ids_used: list[str] = []
         revalidation_selector: CapabilityRevalidationSelector | None = None
         world_state_confirmation_required = False
 
-        binding = companion_contracts_repository().surface_binding(body.surface)
-        if binding is None:
-            reason_codes.append("unknown_surface")
-        if body.active_persona_id != identity.runtime_identity.active_persona_id:
-            reason_codes.append("persona_mismatch")
-        persona_domains = {
-            identity.runtime_identity.capability_domain,
-            *identity.runtime_identity.advisory_tool_permission_summary,
-        }
-        if body.capability_domain not in persona_domains:
-            reason_codes.append("capability_domain_denied")
-        if body.supported_surfaces and body.surface not in body.supported_surfaces:
-            reason_codes.append("surface_unsupported")
+        if registered_capability is None:
+            if binding is None:
+                reason_codes.append("unknown_surface")
+            if body.active_persona_id != active_persona_id:
+                reason_codes.append("persona_mismatch")
+            persona_domains = {
+                identity.runtime_identity.capability_domain,
+                *identity.runtime_identity.advisory_tool_permission_summary,
+            }
+            if body.capability_domain not in persona_domains:
+                reason_codes.append("capability_domain_denied")
+            if body.supported_surfaces and body.surface not in body.supported_surfaces:
+                reason_codes.append("surface_unsupported")
         if body.authorization_phase in {"selection", "dispatch"} and not body.argument_digest:
             reason_codes.append("argument_digest_required")
 
-        active_persona_id = identity.runtime_identity.active_persona_id
+        if not registered_reasons:
+            relationship_reasons = self._relationship_reasons(body, active_persona_id)
+            reason_codes.extend(relationship_reasons[0])
+            relationship_ids_used = relationship_reasons[1]
 
-        relationship_reasons = self._relationship_reasons(body, active_persona_id)
-        reason_codes.extend(relationship_reasons[0])
-        relationship_ids_used = relationship_reasons[1]
-
-        world_reasons = self._world_state_reasons(body, active_persona_id)
-        reason_codes.extend(world_reasons[0])
-        world_state_claim_ids_used = world_reasons[1]
-        revalidation_selector = world_reasons[2]
-        world_state_confirmation_required = world_reasons[3]
+            world_reasons = self._world_state_reasons(body, active_persona_id)
+            reason_codes.extend(world_reasons[0])
+            world_state_claim_ids_used = world_reasons[1]
+            revalidation_selector = world_reasons[2]
+            world_state_confirmation_required = world_reasons[3]
 
         challenge_ref: str | None = body.confirmation_challenge_ref
+        challenge_expires_at: str | None = None
         confirmation_state = "not_required"
         confirmation_needed = (
-            body.operation_class in _RISKY_OPERATION_CLASSES
-            or world_state_confirmation_required
+            not registered_reasons
+            and (
+                (
+                    registered_capability.record.requires_confirmation
+                    if registered_capability is not None
+                    else operation_class in _RISKY_OPERATION_CLASSES
+                )
+                or world_state_confirmation_required
+            )
         )
         challenge_reasons: list[str] = []
         if confirmation_needed:
@@ -530,9 +599,21 @@ class CapabilityAuthorizationRepository:
                     confirmation_state = "required"
                     reason_codes.append("originating_turn_required")
                 elif body.argument_digest and not reason_codes and revalidation_selector is None:
-                    challenge_ref = self._issue_challenge(body)
-                    confirmation_state = "issued"
-                    reason_codes.append("confirmation_required")
+                    if body.confirmation_challenge_ref:
+                        challenge_reasons, challenge_expires_at = (
+                            self._resume_selection_challenge(body)
+                        )
+                        reason_codes.extend(challenge_reasons)
+                        if not challenge_reasons:
+                            confirmation_state = "issued"
+                            reason_codes.append("confirmation_required")
+                        else:
+                            challenge_ref = None
+                            confirmation_state = "required"
+                    else:
+                        challenge_ref, challenge_expires_at = self._issue_challenge(body)
+                        confirmation_state = "issued"
+                        reason_codes.append("confirmation_required")
                 else:
                     confirmation_state = "required"
             elif body.authorization_phase == "dispatch":
@@ -584,6 +665,7 @@ class CapabilityAuthorizationRepository:
             reason_codes=reason_codes or ["allowed"],
             confirmation_state=confirmation_state,
             challenge_ref=challenge_ref,
+            challenge_expires_at=challenge_expires_at,
             revalidation_required=revalidation_selector is not None,
             revalidation_selector=revalidation_selector,
             relationship_ids_used=relationship_ids_used,
@@ -597,13 +679,14 @@ class CapabilityAuthorizationRepository:
                 "request_id": body.request_id,
                 "phase": body.authorization_phase,
                 "capability_id": body.capability_id,
-                "operation_class": body.operation_class,
+                "operation_class": operation_class,
                 "decision_code": result.decision_code,
                 "reason_codes": result.reason_codes,
                 "relationship_ids_used": relationship_ids_used,
                 "world_state_claim_ids_used": world_state_claim_ids_used,
                 "confirmation_state": confirmation_state,
                 "challenge_ref": challenge_ref,
+                "challenge_expires_at": challenge_expires_at,
                 "revalidation_required": result.revalidation_required,
             },
         )
@@ -883,7 +966,10 @@ class CapabilityAuthorizationRepository:
             )
         return sorted(set(reasons)), sorted(set(used)), selector, confirmation_required
 
-    def _issue_challenge(self, body: CapabilityAuthorizationRequest) -> str:
+    def _issue_challenge(
+        self,
+        body: CapabilityAuthorizationRequest,
+    ) -> tuple[str, str]:
         assert body.argument_digest is not None
         assert body.runtime_turn_id is not None
         issued_at = _now()
@@ -939,7 +1025,40 @@ class CapabilityAuthorizationRepository:
                 "expires_at": expires_at,
             },
         )
-        return challenge_ref
+        return challenge_ref, expires_at
+
+    def _resume_selection_challenge(
+        self,
+        body: CapabilityAuthorizationRequest,
+    ) -> tuple[list[str], str | None]:
+        assert body.confirmation_challenge_ref is not None
+        if not body.runtime_turn_id:
+            return ["confirmation_turn_not_current"], None
+        with self._connect() as conn:
+            row = self._challenge_row(
+                conn,
+                body.owner_id,
+                body.confirmation_challenge_ref,
+            )
+            if row is None:
+                return ["challenge_missing"], None
+            mismatch = self._challenge_base_mismatch(row, body)
+            if mismatch:
+                return [mismatch], None
+            if row["consumed_at"]:
+                return ["challenge_consumed"], None
+            if _parse_ts(row["expires_at"]) <= datetime.now(UTC):
+                return ["challenge_expired"], None
+            if row["status"] == "rejected":
+                return ["challenge_rejected"], None
+            if row["status"] != "issued":
+                return ["challenge_mismatch"], None
+            if body.runtime_turn_id == row["originating_runtime_turn_id"]:
+                return ["challenge_turn_mismatch"], None
+            turn_current_reason = self._dispatch_turn_current_reason(conn, row, body)
+            if turn_current_reason is not None:
+                return [turn_current_reason], None
+            return [], row["expires_at"]
 
     def _consume_dispatch_challenge_atomic(self, body: CapabilityAuthorizationRequest) -> list[str]:
         if not body.runtime_turn_id:
