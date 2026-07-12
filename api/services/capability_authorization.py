@@ -528,9 +528,10 @@ class CapabilityAuthorizationRepository:
         registered_capability = _registered_capability_by_id(body.capability_id)
         operation_class: CapabilityOperationClass = body.operation_class
         binding = companion_contracts_repository().surface_binding(body.surface)
+        reason_codes: list[str] = []
+        registered_reasons: list[str] = []
         if registered_capability is not None:
             operation_class = _registered_operation_class(registered_capability.record)
-            registered_reasons: list[str] = []
             if binding is None:
                 registered_reasons.append("unknown_surface")
             if body.active_persona_id != active_persona_id:
@@ -543,54 +544,18 @@ class CapabilityAuthorizationRepository:
                     operation_class=operation_class,
                 )
             )
-            if registered_reasons:
-                result = CapabilityAuthorizationResult(
-                    phase=body.authorization_phase,
-                    allowed=False,
-                    decision_code="authorization_denied",
-                    reason_codes=registered_reasons,
-                    confirmation_state="not_required",
-                )
-                record_runtime_event(
-                    runtime_session_id=body.runtime_session_id,
-                    runtime_turn_id=body.runtime_turn_id,
-                    event_type="capability_authorization_evaluated",
-                    event_payload_json={
-                        "request_id": body.request_id,
-                        "phase": body.authorization_phase,
-                        "capability_id": body.capability_id,
-                        "operation_class": operation_class,
-                        "decision_code": result.decision_code,
-                        "reason_codes": result.reason_codes,
-                        "relationship_ids_used": [],
-                        "world_state_claim_ids_used": [],
-                        "confirmation_state": result.confirmation_state,
-                        "challenge_ref": None,
-                        "challenge_expires_at": None,
-                        "revalidation_required": False,
-                    },
-                )
-                return CapabilityAuthorizationResponse(
-                    request_id=body.request_id,
-                    owner_id=body.owner_id,
-                    conversation_id=body.conversation_id,
-                    runtime_session_id=body.runtime_session_id,
-                    runtime_turn_id=body.runtime_turn_id,
-                    capability_id=body.capability_id,
-                    result=result,
-                )
+            reason_codes.extend(registered_reasons)
 
-        reason_codes: list[str] = []
         relationship_ids_used: list[str] = []
         world_state_claim_ids_used: list[str] = []
         revalidation_selector: CapabilityRevalidationSelector | None = None
         world_state_confirmation_required = False
 
-        if binding is None:
-            reason_codes.append("unknown_surface")
-        if body.active_persona_id != identity.runtime_identity.active_persona_id:
-            reason_codes.append("persona_mismatch")
         if registered_capability is None:
+            if binding is None:
+                reason_codes.append("unknown_surface")
+            if body.active_persona_id != active_persona_id:
+                reason_codes.append("persona_mismatch")
             persona_domains = {
                 identity.runtime_identity.capability_domain,
                 *identity.runtime_identity.advisory_tool_permission_summary,
@@ -602,26 +567,30 @@ class CapabilityAuthorizationRepository:
         if body.authorization_phase in {"selection", "dispatch"} and not body.argument_digest:
             reason_codes.append("argument_digest_required")
 
-        relationship_reasons = self._relationship_reasons(body, active_persona_id)
-        reason_codes.extend(relationship_reasons[0])
-        relationship_ids_used = relationship_reasons[1]
+        if not registered_reasons:
+            relationship_reasons = self._relationship_reasons(body, active_persona_id)
+            reason_codes.extend(relationship_reasons[0])
+            relationship_ids_used = relationship_reasons[1]
 
-        world_reasons = self._world_state_reasons(body, active_persona_id)
-        reason_codes.extend(world_reasons[0])
-        world_state_claim_ids_used = world_reasons[1]
-        revalidation_selector = world_reasons[2]
-        world_state_confirmation_required = world_reasons[3]
+            world_reasons = self._world_state_reasons(body, active_persona_id)
+            reason_codes.extend(world_reasons[0])
+            world_state_claim_ids_used = world_reasons[1]
+            revalidation_selector = world_reasons[2]
+            world_state_confirmation_required = world_reasons[3]
 
-        challenge_ref: str | None = None
+        challenge_ref: str | None = body.confirmation_challenge_ref
         challenge_expires_at: str | None = None
         confirmation_state = "not_required"
         confirmation_needed = (
-            (
-                registered_capability.record.requires_confirmation
-                if registered_capability is not None
-                else operation_class in _RISKY_OPERATION_CLASSES
+            not registered_reasons
+            and (
+                (
+                    registered_capability.record.requires_confirmation
+                    if registered_capability is not None
+                    else operation_class in _RISKY_OPERATION_CLASSES
+                )
+                or world_state_confirmation_required
             )
-            or world_state_confirmation_required
         )
         challenge_reasons: list[str] = []
         if confirmation_needed:
@@ -636,10 +605,10 @@ class CapabilityAuthorizationRepository:
                         )
                         reason_codes.extend(challenge_reasons)
                         if not challenge_reasons:
-                            challenge_ref = body.confirmation_challenge_ref
                             confirmation_state = "issued"
                             reason_codes.append("confirmation_required")
                         else:
+                            challenge_ref = None
                             confirmation_state = "required"
                     else:
                         challenge_ref, challenge_expires_at = self._issue_challenge(body)

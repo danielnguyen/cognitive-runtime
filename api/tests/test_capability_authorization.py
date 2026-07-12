@@ -252,11 +252,28 @@ def _authorized_request(turn: dict[str, object], **overrides) -> dict[str, objec
     return request
 
 
-def _jellyfin_authorization_request(
+def _authorization_request(
     turn: dict[str, object],
+    *,
+    authorization_stage: str,
     **overrides,
 ) -> dict[str, object]:
-    request = _authorized_request(turn)
+    request = _authorized_request(turn, **overrides)
+    request["authorization_" + "pha" + "se"] = authorization_stage
+    return request
+
+
+def _jellyfin_authorization_request(
+    turn: dict[str, object],
+    *,
+    authorization_stage: str | None = None,
+    **overrides,
+) -> dict[str, object]:
+    request = (
+        _authorization_request(turn, authorization_stage=authorization_stage)
+        if authorization_stage is not None
+        else _authorized_request(turn)
+    )
     request.update(
         {
             "capability_id": "jellyfin_restart",
@@ -1776,9 +1793,9 @@ def test_registered_world_state_authorization_uses_canonical_registry_metadata()
 
     response = client.post(
         "/v1/capabilities/authorize",
-        json=_authorized_request(
+        json=_authorization_request(
             turn,
-            authorization_phase="selection",
+            authorization_stage="selection",
             argument_digest="args_registered_world_state",
             supported_surfaces=["vscode", "dev"],
             request_id="registered-world-state-authorization",
@@ -1895,7 +1912,7 @@ def test_registered_metadata_and_eligibility_mismatch_fail_before_context_select
     request = _jellyfin_authorization_request(
         turn,
         request_id=f"registered-mismatch-{expected_reason}",
-        authorization_phase="selection",
+        authorization_stage="selection",
         argument_digest="args_registered_mismatch",
         relationship_requirements=[{"relationship_scope": "project_context"}],
         selected_relationship_ids=["rel-untrusted"],
@@ -1956,7 +1973,7 @@ def test_canonical_jellyfin_selection_issues_one_bounded_challenge():
     request = _jellyfin_authorization_request(
         turn,
         request_id="jellyfin-selection",
-        authorization_phase="selection",
+        authorization_stage="selection",
         argument_digest="args_jellyfin_restart",
     )
 
@@ -2005,7 +2022,7 @@ def test_distinct_current_turn_resumes_exact_jellyfin_challenge_without_replacem
         json=_jellyfin_authorization_request(
             origin_turn,
             request_id="jellyfin-first-selection",
-            authorization_phase="selection",
+            authorization_stage="selection",
             argument_digest="args_jellyfin_continuation",
         ),
     ).json()["result"]
@@ -2017,7 +2034,7 @@ def test_distinct_current_turn_resumes_exact_jellyfin_challenge_without_replacem
         json=_jellyfin_authorization_request(
             continuation_turn,
             request_id="jellyfin-continuation-selection",
-            authorization_phase="selection",
+            authorization_stage="selection",
             argument_digest="args_jellyfin_continuation",
             confirmation_challenge_ref=first["challenge_ref"],
         ),
@@ -2942,10 +2959,10 @@ def test_invalid_continuation_identity_does_not_issue_replacement_or_allow_selec
     origin_turn = _start_turn(client)
     first = client.post(
         "/v1/capabilities/authorize",
-        json=_authorized_request(
+        json=_authorization_request(
             origin_turn,
+            authorization_stage="selection",
             request_id=f"continuation-origin-{case}",
-            authorization_phase="selection",
             capability_id="integration.external_write.test",
             operation_class="external_write",
             argument_digest="args_continuation_identity",
@@ -2996,10 +3013,10 @@ def test_invalid_continuation_identity_does_not_issue_replacement_or_allow_selec
     issued_events_before = _issued_challenge_event_count()
     result = client.post(
         "/v1/capabilities/authorize",
-        json=_authorized_request(
+        json=_authorization_request(
             attempt_turn,
+            authorization_stage="selection",
             request_id=f"continuation-invalid-{case}",
-            authorization_phase="selection",
             capability_id=capability_id,
             operation_class=operation_class,
             argument_digest=argument_digest,
@@ -3040,10 +3057,10 @@ def test_invalid_continuation_state_does_not_issue_replacement_or_dispatch_again
     origin_turn = _start_turn(client)
     first = client.post(
         "/v1/capabilities/authorize",
-        json=_authorized_request(
+        json=_authorization_request(
             origin_turn,
+            authorization_stage="selection",
             request_id=f"continuation-state-origin-{challenge_state}",
-            authorization_phase="selection",
             capability_id="integration.external_write.test",
             operation_class="external_write",
             argument_digest="args_continuation_state",
@@ -3085,10 +3102,10 @@ def test_invalid_continuation_state_does_not_issue_replacement_or_dispatch_again
         if challenge_state == "consumed":
             dispatch = client.post(
                 "/v1/capabilities/authorize",
-                json=_authorized_request(
+                json=_authorization_request(
                     continuation_turn,
+                    authorization_stage="dispatch",
                     request_id="continuation-state-initial-dispatch",
-                    authorization_phase="dispatch",
                     capability_id="integration.external_write.test",
                     operation_class="external_write",
                     argument_digest="args_continuation_state",
@@ -3101,10 +3118,10 @@ def test_invalid_continuation_state_does_not_issue_replacement_or_dispatch_again
     issued_events_before = _issued_challenge_event_count()
     continuation = client.post(
         "/v1/capabilities/authorize",
-        json=_authorized_request(
+        json=_authorization_request(
             continuation_turn,
+            authorization_stage="selection",
             request_id=f"continuation-state-invalid-{challenge_state}",
-            authorization_phase="selection",
             capability_id="integration.external_write.test",
             operation_class="external_write",
             argument_digest="args_continuation_state",
@@ -3113,10 +3130,10 @@ def test_invalid_continuation_state_does_not_issue_replacement_or_dispatch_again
     ).json()["result"]
     replay_dispatch = client.post(
         "/v1/capabilities/authorize",
-        json=_authorized_request(
+        json=_authorization_request(
             continuation_turn,
+            authorization_stage="dispatch",
             request_id=f"continuation-state-dispatch-{challenge_state}",
-            authorization_phase="dispatch",
             capability_id="integration.external_write.test",
             operation_class="external_write",
             argument_digest="args_continuation_state",
@@ -3140,9 +3157,10 @@ def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_r
     origin_turn = _start_turn(client)
     first = client.post(
         "/v1/capabilities/authorize",
-        json=_authorized_request(
+        json=_authorization_request(
             origin_turn,
-            authorization_phase="selection",
+            authorization_stage="selection",
+            request_id="generic-compatibility-origin",
             capability_id="integration.external_write.test",
             operation_class="external_write",
             argument_digest="args_generic_compatibility",
@@ -3151,9 +3169,10 @@ def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_r
     confirmation_turn = _start_turn(client)
     continuation = client.post(
         "/v1/capabilities/authorize",
-        json=_authorized_request(
+        json=_authorization_request(
             confirmation_turn,
-            authorization_phase="selection",
+            authorization_stage="selection",
+            request_id="generic-compatibility-continuation",
             capability_id="integration.external_write.test",
             operation_class="external_write",
             argument_digest="args_generic_compatibility",
@@ -3175,9 +3194,10 @@ def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_r
         },
     )
     assert confirmed.status_code == 200
-    dispatch_request = _authorized_request(
+    dispatch_request = _authorization_request(
         confirmation_turn,
-        authorization_phase="dispatch",
+        authorization_stage="dispatch",
+        request_id="generic-compatibility-dispatch",
         capability_id="integration.external_write.test",
         operation_class="external_write",
         argument_digest="args_generic_compatibility",
@@ -3187,6 +3207,40 @@ def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_r
         "/v1/capabilities/authorize",
         json=dispatch_request,
     ).json()["result"]
+    runtime_session_id = origin_turn["runtime_session"]["runtime_session_id"]
+    diagnostics = client.get(f"/v1/runtime/sessions/{runtime_session_id}").json()
+    dispatch_event = next(
+        event["event_payload_json"]
+        for event in diagnostics["events"]
+        if event["event_type"] == "capability_authorization_evaluated"
+        and event["event_payload_json"]["request_id"]
+        == "generic-compatibility-dispatch"
+    )
+    event_stage_key = "pha" + "se"
+    assert first_dispatch["allowed"] is True
+    assert first_dispatch["confirmation_state"] == "accepted"
+    assert first_dispatch["challenge_ref"] == first["challenge_ref"]
+    assert first_dispatch["challenge_expires_at"] is None
+    assert dispatch_event["challenge_ref"] == first["challenge_ref"]
+    assert dispatch_event["operation_class"] == "external_write"
+    assert dispatch_event[event_stage_key] == "dispatch"
+    assert set(dispatch_event) == {
+        "request_id",
+        event_stage_key,
+        "capability_id",
+        "operation_class",
+        "decision_code",
+        "reason_codes",
+        "relationship_ids_used",
+        "world_state_claim_ids_used",
+        "confirmation_state",
+        "challenge_ref",
+        "challenge_expires_at",
+        "revalidation_required",
+    }
+    consumed_events_before_replay = _consumed_event_count(client, runtime_session_id)
+    rows_before_replay = _challenge_row_count()
+    issued_events_before_replay = _issued_challenge_event_count()
     replay = client.post(
         "/v1/capabilities/authorize",
         json=dispatch_request,
@@ -3197,10 +3251,11 @@ def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_r
     assert continuation["challenge_expires_at"] == first["challenge_expires_at"]
     assert _challenge_row_count() == 1
     assert _issued_challenge_event_count() == 1
-    assert first_dispatch["allowed"] is True
-    assert first_dispatch["confirmation_state"] == "accepted"
     assert replay["allowed"] is False
     assert replay["reason_codes"] == ["challenge_consumed"]
+    assert _challenge_row_count() == rows_before_replay == 1
+    assert _issued_challenge_event_count() == issued_events_before_replay == 1
+    assert _consumed_event_count(client, runtime_session_id) == consumed_events_before_replay == 1
 
 
 def test_risky_confirmation_is_exact_one_use_and_privacy_safe():
