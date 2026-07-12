@@ -888,6 +888,11 @@ CapabilityDecisionCode = Literal[
 ]
 CapabilityReasonCode = Literal[
     "allowed",
+    "registered_capability_domain_mismatch",
+    "registered_operation_class_mismatch",
+    "registered_supported_surfaces_mismatch",
+    "registered_surface_not_allowed",
+    "registered_persona_not_allowed",
     "runtime_session_mismatch",
     "runtime_turn_mismatch",
     "unknown_persona",
@@ -1321,6 +1326,7 @@ class CapabilityAuthorizationResult(BaseModel):
     reason_codes: list[CapabilityReasonCode] = Field(default_factory=list, max_length=16)
     confirmation_state: CapabilityConfirmationState
     challenge_ref: str | None = Field(default=None, max_length=120)
+    challenge_expires_at: str | None = Field(default=None, max_length=64)
     revalidation_required: bool = False
     revalidation_selector: CapabilityRevalidationSelector | None = None
     relationship_ids_used: list[str] = Field(default_factory=list, max_length=64)
