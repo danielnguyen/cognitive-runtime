@@ -10,12 +10,14 @@ from models import (
     ActionSummaryResponse,
     CapabilityAuthorizationRequest,
     CapabilityAuthorizationResponse,
+    CapabilityConfirmationRequest,
+    CapabilityConfirmationResponse,
     CapabilityDiscoveryRequest,
     CapabilityDiscoveryResponse,
     CapabilityMatchRequest,
     CapabilityMatchResponse,
-    CapabilityConfirmationRequest,
-    CapabilityConfirmationResponse,
+    ClaimCalibrationEvaluateRequest,
+    ClaimCalibrationEvaluateResponse,
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
     CompanionProfileActiveResponse,
@@ -90,6 +92,7 @@ from services.capability_authorization import (
     match_registered_capability,
     record_capability_confirmation,
 )
+from services.claim_calibration import evaluate_claim_calibration
 from services.companion_contracts import companion_contracts_repository
 from services.companion_policy import (
     active_profile,
@@ -207,6 +210,13 @@ _CAPABILITY_ERROR_STATUS = {
     "confirmation_challenge_not_found": 404,
     "confirmation_challenge_expired": 409,
     "confirmation_challenge_consumed": 409,
+}
+
+_CLAIM_CALIBRATION_ERROR_STATUS = {
+    "runtime_session_mismatch": 400,
+    "runtime_turn_session_mismatch": 400,
+    "runtime_session_not_found": 404,
+    "runtime_turn_not_found": 404,
 }
 
 
@@ -380,6 +390,22 @@ async def runtime_memory_hygiene(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/v1/runtime/claim-calibration/evaluate",
+    response_model=ClaimCalibrationEvaluateResponse,
+)
+async def runtime_claim_calibration_evaluate(
+    body: ClaimCalibrationEvaluateRequest,
+) -> ClaimCalibrationEvaluateResponse:
+    try:
+        return evaluate_claim_calibration(body)
+    except RuntimeError as exc:
+        error = _bounded_http_error(exc, _CLAIM_CALIBRATION_ERROR_STATUS)
+        if error is not None:
+            raise error from exc
+        raise
 
 
 @app.post(

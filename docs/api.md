@@ -37,11 +37,20 @@ state and overlays are operational context, not canonical durable memory.
 | Restraint | `POST /v1/runtime/restraint/evaluate` |
 | Privacy context | `POST /v1/runtime/privacy-context/evaluate` |
 | Memory hygiene | `POST /v1/runtime/memory-hygiene/evaluate` |
+| Claim calibration | `POST /v1/runtime/claim-calibration/evaluate` |
 | Runtime identity | `POST /v1/runtime/identity/resolve` |
 
 These evaluators return typed, bounded decisions for the current context. When
 an active runtime session is supplied, supported evaluators may also record a
 summarized runtime event.
+
+Claim calibration evaluates one caller-selected factual claim against only the
+bounded evidence references attributed to that claim. It derives a deterministic
+claim classification, evidence strength, confidence, freshness summary,
+uncertainty requirement, and safe explanation summary. The evaluator does not
+select evidence from a retrieval bundle, verify that referenced records physically
+exist, persist a durable claim record, call a model provider, or execute an
+external action.
 
 ## Relationships and context
 
