@@ -132,6 +132,7 @@ RuntimeEventType = Literal[
     "capability_authorization_evaluated",
     "confirmation_challenge_evaluated",
     "action_summary_recorded",
+    "claim_calibration_evaluated",
 ]
 
 
@@ -337,6 +338,160 @@ class MemoryHygieneEvaluateResponse(BaseModel):
     runtime_session_id: str = Field(max_length=120)
     runtime_turn_id: str | None = Field(default=None, max_length=120)
     result: MemoryHygieneResult
+
+
+ClaimCalibrationIdentifier = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
+ClaimEvidenceRefType = Literal[
+    "message",
+    "derived_text",
+    "artifact",
+    "external_source",
+    "world_state_claim",
+    "tool_output",
+    "integration_event",
+]
+ClaimEvidenceSupportKind = Literal[
+    "direct",
+    "corroborating",
+    "contextual",
+    "contradictory",
+]
+ClaimEvidenceAuthority = Literal[
+    "peer_reviewed_evidence",
+    "clinical_guidance",
+    "manufacturer_guidance",
+    "tool_output",
+    "trusted_integration",
+    "user_report",
+    "runtime_inference",
+    "speculation",
+    "unknown",
+]
+ClaimEvidenceFreshnessState = Literal[
+    "active",
+    "stale",
+    "superseded",
+    "corrected",
+    "unknown_freshness",
+    "not_applicable",
+]
+ClaimClass = Literal[
+    "verified_fact",
+    "source_backed_fact",
+    "manufacturer_guidance",
+    "expert_consensus",
+    "runtime_inference",
+    "speculation",
+    "unknown",
+]
+ClaimCalibrationStatus = Literal["supported", "limited", "unsupported"]
+ClaimEvidenceStrength = Literal["strong", "moderate", "weak", "none"]
+ClaimConfidence = Literal["high", "medium", "low", "unknown"]
+ClaimFreshnessSummary = Literal["current", "mixed", "stale", "unknown", "not_applicable"]
+ClaimLimitationCode = Literal[
+    "no_supporting_evidence",
+    "context_only",
+    "low_authority_evidence",
+    "stale_evidence",
+    "unknown_freshness",
+    "superseded_or_corrected_evidence",
+    "contradictory_evidence",
+    "single_source",
+    "inference_dominant",
+    "speculation_only",
+]
+
+
+class ClaimEvidenceReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref_type: ClaimEvidenceRefType
+    ref_id: ClaimCalibrationIdentifier
+    owner_id: ClaimCalibrationIdentifier
+    conversation_id: ClaimCalibrationIdentifier | None = None
+    support_kind: ClaimEvidenceSupportKind
+    authority: ClaimEvidenceAuthority
+    freshness_state: ClaimEvidenceFreshnessState
+
+
+class ClaimCalibrationEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: ClaimCalibrationIdentifier
+    owner_id: ClaimCalibrationIdentifier
+    conversation_id: ClaimCalibrationIdentifier
+    surface: Annotated[str, Field(min_length=1, max_length=64)]
+    runtime_session_id: ClaimCalibrationIdentifier
+    runtime_turn_id: ClaimCalibrationIdentifier
+    claim_anchor: Annotated[str, Field(min_length=1, max_length=500)]
+    evidence_references: list[ClaimEvidenceReference] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+    @field_validator("claim_anchor", mode="before")
+    @classmethod
+    def normalize_claim_anchor(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return " ".join(value.split())
+
+    @model_validator(mode="after")
+    def validate_evidence_scope(self) -> ClaimCalibrationEvaluateRequest:
+        seen: set[tuple[str, str]] = set()
+        for reference in self.evidence_references:
+            if reference.owner_id != self.owner_id:
+                raise ValueError("evidence_owner_mismatch")
+            if (
+                reference.conversation_id is not None
+                and reference.conversation_id != self.conversation_id
+            ):
+                raise ValueError("evidence_conversation_mismatch")
+            identity = (reference.ref_type, reference.ref_id)
+            if identity in seen:
+                raise ValueError("duplicate_evidence_reference")
+            seen.add(identity)
+        return self
+
+
+class ClaimCalibrationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: ClaimCalibrationIdentifier
+    claim_anchor: Annotated[str, Field(min_length=1, max_length=500)]
+    claim_anchor_digest: Annotated[str, Field(min_length=71, max_length=71)]
+    claim_class: ClaimClass
+    calibration_status: ClaimCalibrationStatus
+    evidence_strength: ClaimEvidenceStrength
+    confidence: ClaimConfidence
+    strongest_authority: ClaimEvidenceAuthority
+    freshness_summary: ClaimFreshnessSummary
+    uncertainty_disclosure_required: bool
+    validated_evidence_references: list[ClaimEvidenceReference] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    limitation_codes: list[ClaimLimitationCode] = Field(default_factory=list, max_length=10)
+    user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class ClaimCalibrationEvaluateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: ClaimCalibrationIdentifier
+    owner_id: ClaimCalibrationIdentifier
+    conversation_id: ClaimCalibrationIdentifier
+    surface: Annotated[str, Field(min_length=1, max_length=64)]
+    runtime_session_id: ClaimCalibrationIdentifier
+    runtime_turn_id: ClaimCalibrationIdentifier
+    result: ClaimCalibrationResult
 
 
 PrivacySurfaceCategory = Literal[
