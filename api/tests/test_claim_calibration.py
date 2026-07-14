@@ -208,6 +208,7 @@ def test_contextual_only_evidence_does_not_count_as_support():
     assert result["calibration_status"] == "unsupported"
     assert result["evidence_strength"] == "none"
     assert result["confidence"] == "unknown"
+    assert result["strongest_authority"] == "unknown"
     assert result["limitation_codes"][:2] == ["no_supporting_evidence", "context_only"]
 
 
@@ -251,6 +252,66 @@ def test_contradictory_evidence_prevents_strong_calibration():
     assert result["confidence"] == "low"
     assert result["claim_class"] != "verified_fact"
     assert "contradictory_evidence" in result["limitation_codes"]
+
+
+def test_contradictory_only_evidence_has_no_supporting_authority():
+    scope = _start_runtime()
+    response = _evaluate(
+        scope,
+        [_reference("contradiction-only-1", support_kind="contradictory")],
+    )
+
+    result = response.json()["result"]
+    assert result["evidence_strength"] == "none"
+    assert result["strongest_authority"] == "unknown"
+    assert "contradictory_evidence" in result["limitation_codes"]
+
+
+def test_contradiction_cannot_replace_manufacturer_supporting_authority():
+    scope = _start_runtime()
+    response = _evaluate(
+        scope,
+        [
+            _reference(
+                "manufacturer-support-1",
+                authority="manufacturer_guidance",
+            ),
+            _reference(
+                "peer-contradiction-1",
+                support_kind="contradictory",
+                authority="peer_reviewed_evidence",
+            ),
+        ],
+    )
+
+    result = response.json()["result"]
+    assert result["strongest_authority"] == "manufacturer_guidance"
+    assert result["evidence_strength"] == "weak"
+    assert "contradictory_evidence" in result["limitation_codes"]
+
+
+def test_context_cannot_replace_user_report_supporting_authority():
+    scope = _start_runtime()
+    response = _evaluate(
+        scope,
+        [
+            _reference(
+                "user-support-1",
+                ref_type="message",
+                authority="user_report",
+            ),
+            _reference(
+                "peer-context-1",
+                support_kind="contextual",
+                authority="peer_reviewed_evidence",
+            ),
+        ],
+    )
+
+    result = response.json()["result"]
+    assert result["strongest_authority"] == "user_report"
+    assert result["evidence_strength"] == "weak"
+    assert len(result["validated_evidence_references"]) == 2
 
 
 def test_cross_owner_evidence_is_rejected():
@@ -379,6 +440,7 @@ def test_superseded_or_corrected_evidence_is_not_positive_support(
     assert result["claim_class"] == "unknown"
     assert result["evidence_strength"] == "none"
     assert result["confidence"] == "unknown"
+    assert result["strongest_authority"] == "unknown"
     assert result["freshness_summary"] == "stale"
     assert "superseded_or_corrected_evidence" in result["limitation_codes"]
 

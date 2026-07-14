@@ -76,12 +76,12 @@ def _positive_references(
 
 
 def _strongest_authority(
-    references: list[ClaimEvidenceReference],
+    positive: list[ClaimEvidenceReference],
 ) -> ClaimEvidenceAuthority:
-    if not references:
+    if not positive:
         return "unknown"
     return max(
-        (reference.authority for reference in references),
+        (reference.authority for reference in positive),
         key=lambda authority: _AUTHORITY_RANK[authority],
     )
 
@@ -303,7 +303,7 @@ def evaluate_claim_calibration(
         }[strength],
         evidence_strength=strength,
         confidence=confidence,
-        strongest_authority=_strongest_authority(references),
+        strongest_authority=_strongest_authority(positive),
         freshness_summary=_freshness_summary(references),
         uncertainty_disclosure_required=strength != "strong",
         validated_evidence_references=references,
