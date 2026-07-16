@@ -201,6 +201,87 @@ def test_playful_and_expressive_interactions_ignore_passive_source_context():
         _assert_not_applicable(result)
 
 
+@pytest.mark.parametrize(
+    "task_text",
+    [
+        "What is a report?",
+        "Explain what a repository is.",
+        "What are requirements?",
+        "What options do I have?",
+    ],
+)
+def test_evidence_adjacent_discussion_remains_ordinary_chat(task_text: str):
+    result = _derive(_start_runtime(), task_text=task_text).json()["result"]
+
+    _assert_not_applicable(result)
+
+
+@pytest.mark.parametrize(
+    ("task_text", "interaction_kind", "task_context"),
+    [
+        ("Check my grammar.", "command", _context()),
+        (
+            "Check out this joke.",
+            "joke_or_playful",
+            _context(evidence_input_kinds=["artifact"]),
+        ),
+    ],
+)
+def test_non_evidentiary_direct_operator_uses_remain_not_applicable(
+    task_text: str,
+    interaction_kind: str,
+    task_context: dict[str, object],
+):
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        interaction_kind=interaction_kind,
+        task_context=task_context,
+    ).json()["result"]
+
+    _assert_not_applicable(result)
+
+
+@pytest.mark.parametrize(
+    "task_text",
+    [
+        "Verify the record.",
+        "What does this document say about the deadline?",
+        "Summarize this report.",
+    ],
+)
+def test_genuine_bounded_evidence_queries_derive_targeted_lookup(task_text: str):
+    result = _derive(_start_runtime(), task_text=task_text).json()["result"]
+
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "targeted_lookup"
+    assert result["evidence_scope_material"] is True
+
+
+def test_bounded_alternative_comparison_remains_evidence_material():
+    result = _derive(
+        _start_runtime(),
+        task_text="Compare these versions.",
+    ).json()["result"]
+
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "cross_source_comparison"
+
+
+def test_expressive_text_with_distinct_evidence_request_derives_lookup():
+    result = _derive(
+        _start_runtime(),
+        task_text=(
+            "I am frustrated, but verify what this report says about the deadline."
+        ),
+        interaction_kind="vent_or_expression",
+    ).json()["result"]
+
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "targeted_lookup"
+    assert result["evidence_scope_material"] is True
+
+
 def test_targeted_lookup_requires_material_evidence_scope():
     plain = _derive(
         _start_runtime(),

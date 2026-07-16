@@ -18,19 +18,36 @@ from services.runtime_state import (
     validate_runtime_turn_session,
 )
 
-_EVIDENCE_NOUNS = re.compile(
+_EVIDENCE_OBJECTS = re.compile(
     r"\b(?:evidence|sources?|records?|files?|documents?|reports?|logs?|data|"
     r"checklists?|requirements?|repositories?|artifacts?|tool outputs?|"
-    r"integration records?|world state|candidates?|options?|alternatives?|versions?)\b",
+    r"integration records?|world state)\b",
+    re.IGNORECASE,
+)
+_ALTERNATIVE_OBJECTS = re.compile(
+    r"\b(?:candidates?|options?|alternatives?|versions?)\b",
     re.IGNORECASE,
 )
 _DIRECT_EVIDENCE_OPERATORS = re.compile(
-    r"\b(?:check|verify|inspect|audit|research|search|look\s+up|trace|ground)\b",
+    r"\b(?:check(?!\s+out\b)|verify|inspect|audit|research|search|look\s+up|"
+    r"trace|ground)\b",
     re.IGNORECASE,
 )
-_REQUEST_FRAMING = re.compile(
-    r"\b(?:what|which|where|when|how|does|do|did|is|are|find|show|tell|"
-    r"explain|summarize|review|examine)\b|\?",
+_BOUNDED_EVIDENCE_REFERENCE = re.compile(
+    r"\b(?:this|that|these|those|the|my|our|your|their|its|available|declared|"
+    r"current|specific|given)\b(?:\s+[a-z][a-z-]*){0,4}\s+"
+    r"(?:evidence|sources?|records?|files?|documents?|reports?|logs?|data|"
+    r"checklists?|requirements?|repositories?|artifacts?|tool outputs?|"
+    r"integration records?|world state)\b",
+    re.IGNORECASE,
+)
+_BOUNDED_CONTENT_QUERY = re.compile(
+    r"\b(?:summarize|review|examine)\b|"
+    r"\bwhat\s+(?:does|do)\b.{0,120}\b(?:say|state|show|contain|report)\b|"
+    r"\bwhat\s+(?:is|are|was|were)\b.{0,120}\b"
+    r"(?:recorded|listed|documented|reported|shown|contained)\b|"
+    r"\bwhich\b.{0,120}\b(?:is|are|was|were)\b.{0,80}\b"
+    r"(?:recorded|listed|documented|reported|shown|contained)\b",
     re.IGNORECASE,
 )
 _CREATIVE_OR_CASUAL = re.compile(
@@ -99,18 +116,26 @@ _COMPATIBLE_COMBINATIONS: dict[frozenset[EvidenceTaskShape], EvidenceTaskShape] 
 }
 
 
-def _explicit_evidence_language(text: str) -> bool:
-    if _DIRECT_EVIDENCE_OPERATORS.search(text):
+def _explicit_evidence_language(
+    text: str,
+    *,
+    specialized: set[EvidenceTaskShape],
+) -> bool:
+    has_evidence_object = bool(_EVIDENCE_OBJECTS.search(text))
+    if _DIRECT_EVIDENCE_OPERATORS.search(text) and has_evidence_object:
         return True
-    if not _EVIDENCE_NOUNS.search(text):
+    if (
+        has_evidence_object
+        and _BOUNDED_EVIDENCE_REFERENCE.search(text)
+        and _BOUNDED_CONTENT_QUERY.search(text)
+    ):
+        return True
+    if not specialized:
         return False
     return bool(
-        _REQUEST_FRAMING.search(text)
-        or _COMPARISON.search(text)
-        or _CONTRADICTION.search(text)
-        or _ABSENCE.search(text)
-        or _HISTORICAL.search(text)
-        or _DECISION.search(text)
+        has_evidence_object
+        or _ALTERNATIVE_OBJECTS.search(text)
+        or _BOUNDED_COLLECTION.search(text)
     )
 
 
@@ -238,12 +263,12 @@ def _build_result(
 
 
 def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
-    explicit_evidence = _explicit_evidence_language(body.task_text)
     specialized = _specialized_shapes(body.task_text)
-    distinct_evidence_request = bool(
-        _DIRECT_EVIDENCE_OPERATORS.search(body.task_text)
-        or (specialized and _EVIDENCE_NOUNS.search(body.task_text))
+    explicit_evidence = _explicit_evidence_language(
+        body.task_text,
+        specialized=specialized,
     )
+    distinct_evidence_request = explicit_evidence
     context = body.task_context
     reasons = _materiality_reasons(body, explicit_evidence=explicit_evidence)
     context_material = bool(
