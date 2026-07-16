@@ -363,6 +363,8 @@ def _material_plan_supported(
             return False
         if not authoritative:
             return False
+        if "authoritative_source_unavailable" in limitations:
+            return False
         if "declared_source_missing_from_inventory" in limitations:
             return False
     if task_shape in {"cross_source_comparison", "recommendation_or_decision_support"}:
@@ -509,6 +511,11 @@ def compile_evidence_plan(
             strategy=strategy,
         )
     )
+    if (
+        body.task_shape == "absence_or_coverage_check"
+        and "authoritative_source_unavailable" in limitations
+    ):
+        limitations.add("absence_scope_not_enumerable")
     material_supported = _material_plan_supported(
         task_shape=body.task_shape,
         scope=scope,
@@ -518,19 +525,26 @@ def compile_evidence_plan(
         limitations=limitations,
     )
     status = _plan_status(material_supported, limitations)
+    optional_scope_limitations = {
+        "optional_source_unavailable",
+        "source_inventory_partial",
+        "source_inventory_unknown",
+        "source_inventory_unavailable",
+    }
+    if body.task_shape not in _COMPLETE_INVENTORY_SHAPES:
+        optional_scope_limitations.add("authoritative_source_unavailable")
     optional_scope_incomplete = material_supported and bool(
-        limitations
-        & {
-            "optional_source_unavailable",
-            "source_inventory_partial",
-            "source_inventory_unknown",
-            "source_inventory_unavailable",
-        }
+        limitations & optional_scope_limitations
+    )
+    exact_authoritative_fetch = any(
+        source.authority_role == "authoritative"
+        and "exact_fetch" in source.capabilities
+        for source in eligible
     )
     requirements = _declared_requirements(
         task_shape=body.task_shape,
         strategy=strategy,
-        exact_authoritative_fetch=bool(authoritative),
+        exact_authoritative_fetch=exact_authoritative_fetch,
         optional_scope_incomplete=optional_scope_incomplete,
     )
     selected_strategies = sorted([strategy] if strategy is not None else [])

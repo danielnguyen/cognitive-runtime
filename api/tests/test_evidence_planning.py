@@ -299,6 +299,37 @@ def test_capability_union_does_not_upgrade_each_source_to_exhaustive_support():
     assert "required_capability_unavailable" in result["limitation_codes"]
 
 
+@pytest.mark.parametrize("availability", ["unavailable", "disabled", "unknown"])
+def test_exhaustive_plan_rejects_unavailable_authoritative_declared_source(
+    availability: str,
+):
+    result = _compile(
+        _start_runtime(),
+        task_shape="bounded_exhaustive_review",
+        declared_scope=_scope(source_ids=["source-a", "source-b"]),
+        source_inventory=[
+            _source("source-a", capabilities=["structured_query"]),
+            _source(
+                "source-b",
+                capabilities=["structured_query"],
+                availability=availability,
+            ),
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "unsupported"
+    assert result["plan_status"] not in {"ready", "ready_with_limitations"}
+    assert result["selected_strategies"] == ["structured_query"]
+    assert "authoritative_source_unavailable" in result["limitation_codes"]
+    assert {
+        "authoritative_inventory",
+        "complete_scope_coverage",
+        "contradiction_search",
+        "context_delivery",
+        "no_material_truncation",
+    } <= _requirement_kinds(result)
+
+
 @pytest.mark.parametrize("inventory_status", ["partial", "unknown", "unavailable"])
 def test_absence_plan_requires_complete_inventory(inventory_status: str):
     response = _compile(
@@ -315,6 +346,40 @@ def test_absence_plan_requires_complete_inventory(inventory_status: str):
     assert result["plan_status"] == "unsupported"
     assert "absence_scope_not_enumerable" in result["limitation_codes"]
     assert f"source_inventory_{inventory_status}" in result["limitation_codes"]
+
+
+@pytest.mark.parametrize("availability", ["unavailable", "disabled", "unknown"])
+def test_absence_plan_rejects_unavailable_authoritative_declared_source(
+    availability: str,
+):
+    result = _compile(
+        _start_runtime(),
+        task_shape="absence_or_coverage_check",
+        declared_scope=_scope(source_ids=["source-a", "source-b"]),
+        source_inventory=[
+            _source("source-a", capabilities=["structured_query"]),
+            _source(
+                "source-b",
+                capabilities=["structured_query"],
+                availability=availability,
+            ),
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "unsupported"
+    assert result["plan_status"] not in {"ready", "ready_with_limitations"}
+    assert result["selected_strategies"] == ["structured_query"]
+    assert {
+        "authoritative_source_unavailable",
+        "absence_scope_not_enumerable",
+    } <= set(result["limitation_codes"])
+    assert {
+        "authoritative_inventory",
+        "complete_scope_coverage",
+        "structured_absence_check",
+        "context_delivery",
+        "no_material_truncation",
+    } <= _requirement_kinds(result)
 
 
 def test_absence_plan_requires_authority_and_enumeration_capability():
@@ -594,6 +659,84 @@ def test_compiled_optional_requirement_produces_sufficient_with_limitations():
         "sufficient_with_limitations"
     )
     assert response.json()["result"]["additional_acquisition_required"] is False
+
+
+def test_authoritative_unavailability_is_preserved_in_sufficiency_evaluation():
+    runtime = _start_runtime()
+    plan = _compile(
+        runtime,
+        declared_scope=_scope(source_ids=["source-a", "source-b"]),
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["exact_fetch"],
+                availability="unavailable",
+            ),
+            _source(
+                "source-b",
+                capabilities=["exact_fetch"],
+                authority_role="supplemental",
+            ),
+        ],
+    ).json()["result"]
+
+    assert plan["plan_status"] == "ready_with_limitations"
+    assert "authoritative_source_unavailable" in plan["limitation_codes"]
+    optional = [
+        requirement
+        for requirement in plan["declared_requirements"]
+        if requirement["criticality"] == "optional"
+    ]
+    assert optional == [
+        {
+            "requirement_id": "optional-selected-source-coverage",
+            "requirement_kind": "selected_source_coverage",
+            "criticality": "optional",
+        }
+    ]
+    facts = [
+        {
+            "requirement_id": requirement["requirement_id"],
+            "outcome": (
+                "unavailable"
+                if requirement["criticality"] == "optional"
+                else "satisfied"
+            ),
+        }
+        for requirement in plan["declared_requirements"]
+    ]
+    response = _evaluate_compiled_requirements(runtime, plan, facts)
+
+    assert response.status_code == 200
+    assert response.json()["result"]["sufficiency_status"] == (
+        "sufficient_with_limitations"
+    )
+    assert response.json()["result"]["sufficiency_status"] != (
+        "sufficient_for_declared_scope"
+    )
+
+
+def test_exact_authoritative_fetch_requires_one_source_with_both_properties():
+    result = _compile(
+        _start_runtime(),
+        declared_scope=_scope(source_ids=["source-a", "source-b"]),
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["targeted_retrieval"],
+            ),
+            _source(
+                "source-b",
+                capabilities=["exact_fetch"],
+                authority_role="supplemental",
+            ),
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == ["exact_fetch"]
+    assert "exact_authoritative_fetch" not in _requirement_kinds(result)
+    assert {"targeted_evidence", "context_delivery"} <= _requirement_kinds(result)
 
 
 def test_equivalent_reordered_inputs_produce_identical_complete_results():
