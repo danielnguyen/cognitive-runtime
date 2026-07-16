@@ -38,6 +38,7 @@ state and overlays are operational context, not canonical durable memory.
 | Privacy context | `POST /v1/runtime/privacy-context/evaluate` |
 | Memory hygiene | `POST /v1/runtime/memory-hygiene/evaluate` |
 | Claim calibration | `POST /v1/runtime/claim-calibration/evaluate` |
+| Evidence planning | `POST /v1/runtime/evidence-plans/compile` |
 | Evidence sufficiency | `POST /v1/runtime/evidence-sufficiency/evaluate` |
 | Runtime identity | `POST /v1/runtime/identity/resolve` |
 
@@ -52,6 +53,15 @@ uncertainty requirement, and safe explanation summary. The evaluator does not
 select evidence from a retrieval bundle, verify that referenced records physically
 exist, persist a durable claim record, call a model provider, or execute an
 external action.
+
+Evidence planning accepts an already-resolved broad task shape, a bounded
+declared scope, and a normalized governed source inventory. It declares bounded
+evidence requirements, derives completeness and contradiction expectations, and
+selects a deterministic capability-aware acquisition strategy. The compiler does
+not derive task shape from user text, call Basic Memory Store or Data Source
+Aggregator, execute retrieval, persist a plan or acquisition manifest, assess
+actual acquired evidence, call a model provider, or generate or enforce the final
+answer.
 
 Evidence sufficiency compares caller-declared evidence requirements with
 caller-supplied acquisition facts. It deterministically reports whether those
