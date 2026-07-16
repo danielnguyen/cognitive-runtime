@@ -133,6 +133,7 @@ RuntimeEventType = Literal[
     "confirmation_challenge_evaluated",
     "action_summary_recorded",
     "claim_calibration_evaluated",
+    "evidence_plan_compiled",
     "evidence_sufficiency_evaluated",
 ]
 
@@ -663,6 +664,167 @@ class EvidenceSufficiencyEvaluateResponse(BaseModel):
     evidence_plan_id: EvidenceSufficiencyIdentifier
     acquisition_manifest_id: EvidenceSufficiencyIdentifier
     result: EvidenceSufficiencyResult
+
+
+EvidenceInventoryStatus = Literal[
+    "complete_for_declared_scope",
+    "partial",
+    "unknown",
+    "unavailable",
+]
+EvidenceSourceCapability = Literal[
+    "targeted_retrieval",
+    "exact_fetch",
+    "bounded_full_context",
+    "structured_query",
+    "context_expansion",
+]
+EvidenceSourceAvailability = Literal[
+    "available",
+    "unavailable",
+    "disabled",
+    "unknown",
+]
+EvidenceSourceAuthorityRole = Literal["authoritative", "supplemental", "unknown"]
+EvidenceAcquisitionStrategy = Literal[
+    "targeted_retrieval",
+    "exact_fetch",
+    "bounded_full_context",
+    "structured_query",
+    "hybrid",
+]
+EvidencePlanStatus = Literal["ready", "ready_with_limitations", "unsupported"]
+EvidenceCompletenessExpectation = Literal[
+    "targeted_scope",
+    "complete_for_declared_scope",
+    "complete_for_selected_sources",
+    "complete_for_time_window",
+    "bounded_decision_support",
+]
+EvidencePlanLimitationCode = Literal[
+    "declared_source_missing_from_inventory",
+    "declared_category_not_available",
+    "source_inventory_partial",
+    "source_inventory_unknown",
+    "source_inventory_unavailable",
+    "authoritative_source_missing",
+    "authoritative_source_unavailable",
+    "required_capability_unavailable",
+    "targeted_only_not_exhaustive",
+    "absence_scope_not_enumerable",
+    "insufficient_comparison_scope",
+    "contradiction_search_not_supported",
+    "historical_time_scope_missing",
+    "historical_sequence_not_supported",
+    "decision_support_scope_insufficient",
+    "optional_source_unavailable",
+]
+
+
+class EvidenceDeclaredScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_ids: list[EvidenceSufficiencyIdentifier] = Field(
+        default_factory=list,
+        max_length=32,
+    )
+    source_categories: list[EvidenceSufficiencyIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    inventory_status: EvidenceInventoryStatus
+    time_scope_ref: EvidenceSufficiencyIdentifier | None = None
+    version_scope_ref: EvidenceSufficiencyIdentifier | None = None
+    domain_scope_ref: EvidenceSufficiencyIdentifier | None = None
+    project_scope_ref: EvidenceSufficiencyIdentifier | None = None
+
+    @model_validator(mode="after")
+    def validate_unique_scope_values(self) -> EvidenceDeclaredScope:
+        if len(set(self.source_ids)) != len(self.source_ids):
+            raise ValueError("duplicate_declared_source_id")
+        if len(set(self.source_categories)) != len(self.source_categories):
+            raise ValueError("duplicate_declared_source_category")
+        return self
+
+
+class EvidenceSourceDescriptor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: EvidenceSufficiencyIdentifier
+    source_categories: list[EvidenceSufficiencyIdentifier] = Field(max_length=8)
+    capabilities: list[EvidenceSourceCapability] = Field(max_length=5)
+    availability: EvidenceSourceAvailability
+    authority_role: EvidenceSourceAuthorityRole
+
+    @model_validator(mode="after")
+    def validate_unique_source_values(self) -> EvidenceSourceDescriptor:
+        if len(set(self.source_categories)) != len(self.source_categories):
+            raise ValueError("duplicate_source_category")
+        if len(set(self.capabilities)) != len(self.capabilities):
+            raise ValueError("duplicate_source_capability")
+        return self
+
+
+class EvidencePlanCompileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: EvidenceSufficiencyIdentifier
+    owner_id: EvidenceSufficiencyIdentifier
+    conversation_id: EvidenceSufficiencyIdentifier
+    surface: EvidenceSufficiencySurface
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    question_anchor: Annotated[str, Field(min_length=1, max_length=500)]
+    task_shape: EvidenceTaskShape
+    declared_scope: EvidenceDeclaredScope
+    source_inventory: list[EvidenceSourceDescriptor] = Field(max_length=32)
+
+    @field_validator("question_anchor", mode="before")
+    @classmethod
+    def normalize_question_anchor(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return " ".join(value.split())
+
+    @model_validator(mode="after")
+    def validate_unique_source_ids(self) -> EvidencePlanCompileRequest:
+        source_ids = [source.source_id for source in self.source_inventory]
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("duplicate_source_descriptor")
+        return self
+
+
+class EvidencePlanResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: EvidenceSufficiencyIdentifier
+    question_anchor: Annotated[str, Field(min_length=1, max_length=500)]
+    question_anchor_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ]
+    task_shape: EvidenceTaskShape
+    plan_status: EvidencePlanStatus
+    completeness_expectation: EvidenceCompletenessExpectation
+    contradiction_search_required: bool
+    eligible_source_ids: list[EvidenceSufficiencyIdentifier] = Field(max_length=32)
+    authoritative_source_ids: list[EvidenceSufficiencyIdentifier] = Field(max_length=32)
+    selected_strategies: list[EvidenceAcquisitionStrategy] = Field(max_length=5)
+    declared_requirements: list[EvidenceRequirement] = Field(min_length=1, max_length=32)
+    limitation_codes: list[EvidencePlanLimitationCode] = Field(max_length=16)
+    user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class EvidencePlanCompileResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: EvidenceSufficiencyIdentifier
+    owner_id: EvidenceSufficiencyIdentifier
+    conversation_id: EvidenceSufficiencyIdentifier
+    surface: EvidenceSufficiencySurface
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    result: EvidencePlanResult
 
 
 PrivacySurfaceCategory = Literal[
