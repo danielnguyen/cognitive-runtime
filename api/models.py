@@ -133,6 +133,7 @@ RuntimeEventType = Literal[
     "confirmation_challenge_evaluated",
     "action_summary_recorded",
     "claim_calibration_evaluated",
+    "evidence_sufficiency_evaluated",
 ]
 
 
@@ -492,6 +493,176 @@ class ClaimCalibrationEvaluateResponse(BaseModel):
     runtime_session_id: ClaimCalibrationIdentifier
     runtime_turn_id: ClaimCalibrationIdentifier
     result: ClaimCalibrationResult
+
+
+EvidenceSufficiencyIdentifier = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
+EvidenceSufficiencySurface = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
+EvidenceTaskShape = Literal[
+    "targeted_lookup",
+    "bounded_exhaustive_review",
+    "cross_source_comparison",
+    "contradiction_review",
+    "absence_or_coverage_check",
+    "historical_reconstruction",
+    "recommendation_or_decision_support",
+]
+EvidenceRequirementCriticality = Literal["material", "optional"]
+EvidenceAcquisitionOutcome = Literal[
+    "satisfied",
+    "partial",
+    "not_attempted",
+    "unavailable",
+    "unsupported",
+    "failed",
+    "excluded",
+    "filtered",
+    "truncated",
+    "unresolved_contradiction",
+    "unknown",
+]
+EvidenceRequirementEffectiveOutcome = Literal[
+    "satisfied",
+    "partial",
+    "not_attempted",
+    "unavailable",
+    "unsupported",
+    "failed",
+    "excluded",
+    "filtered",
+    "truncated",
+    "unresolved_contradiction",
+    "unknown",
+    "missing",
+]
+EvidenceSufficiencyStatus = Literal[
+    "sufficient_for_declared_scope",
+    "sufficient_with_limitations",
+    "insufficient",
+    "unknown",
+]
+EvidenceAnswerConstraint = Literal[
+    "qualify_conclusion",
+    "disclose_limitations",
+    "identify_unexamined_scope",
+    "additional_acquisition_or_clarification_required",
+    "withhold_unqualified_conclusion",
+    "withhold_exhaustive_conclusion",
+    "withhold_absence_conclusion",
+    "withhold_contradiction_sensitive_conclusion",
+]
+EvidenceSufficiencyReasonCode = Literal[
+    "all_declared_requirements_satisfied",
+    "optional_requirement_incomplete",
+    "material_requirement_not_satisfied",
+    "material_requirement_unknown",
+    "material_requirement_missing",
+    "unresolved_material_contradiction",
+    "exhaustive_scope_incomplete",
+    "absence_scope_unproven",
+    "contradiction_sensitive_scope_unresolved",
+]
+
+
+class EvidenceRequirement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requirement_id: EvidenceSufficiencyIdentifier
+    requirement_kind: EvidenceSufficiencyIdentifier
+    criticality: EvidenceRequirementCriticality
+
+
+class EvidenceAcquisitionFact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requirement_id: EvidenceSufficiencyIdentifier
+    outcome: EvidenceAcquisitionOutcome
+
+
+class EvidenceRequirementEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requirement_id: EvidenceSufficiencyIdentifier
+    requirement_kind: EvidenceSufficiencyIdentifier
+    criticality: EvidenceRequirementCriticality
+    effective_outcome: EvidenceRequirementEffectiveOutcome
+
+
+class EvidenceSufficiencyEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: EvidenceSufficiencyIdentifier
+    owner_id: EvidenceSufficiencyIdentifier
+    conversation_id: EvidenceSufficiencyIdentifier
+    surface: EvidenceSufficiencySurface
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    evidence_plan_id: EvidenceSufficiencyIdentifier
+    acquisition_manifest_id: EvidenceSufficiencyIdentifier
+    task_shape: EvidenceTaskShape
+    declared_requirements: list[EvidenceRequirement] = Field(min_length=1, max_length=32)
+    acquisition_facts: list[EvidenceAcquisitionFact] = Field(
+        default_factory=list,
+        max_length=32,
+    )
+
+    @model_validator(mode="after")
+    def validate_requirement_facts(self) -> EvidenceSufficiencyEvaluateRequest:
+        requirement_ids: set[str] = set()
+        for requirement in self.declared_requirements:
+            if requirement.requirement_id in requirement_ids:
+                raise ValueError("duplicate_evidence_requirement")
+            requirement_ids.add(requirement.requirement_id)
+
+        fact_ids: set[str] = set()
+        for fact in self.acquisition_facts:
+            if fact.requirement_id in fact_ids:
+                raise ValueError("duplicate_acquisition_fact")
+            if fact.requirement_id not in requirement_ids:
+                raise ValueError("undeclared_evidence_requirement")
+            fact_ids.add(fact.requirement_id)
+        return self
+
+
+class EvidenceSufficiencyResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evaluation_id: EvidenceSufficiencyIdentifier
+    task_shape: EvidenceTaskShape
+    sufficiency_status: EvidenceSufficiencyStatus
+    evaluated_requirements: list[EvidenceRequirementEvaluation] = Field(max_length=32)
+    reason_codes: list[EvidenceSufficiencyReasonCode] = Field(max_length=9)
+    answer_constraints: list[EvidenceAnswerConstraint] = Field(max_length=8)
+    qualification_required: bool
+    additional_acquisition_required: bool
+    user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class EvidenceSufficiencyEvaluateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: EvidenceSufficiencyIdentifier
+    owner_id: EvidenceSufficiencyIdentifier
+    conversation_id: EvidenceSufficiencyIdentifier
+    surface: EvidenceSufficiencySurface
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    evidence_plan_id: EvidenceSufficiencyIdentifier
+    acquisition_manifest_id: EvidenceSufficiencyIdentifier
+    result: EvidenceSufficiencyResult
 
 
 PrivacySurfaceCategory = Literal[

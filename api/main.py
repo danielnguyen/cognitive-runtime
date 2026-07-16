@@ -21,6 +21,8 @@ from models import (
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
     CompanionProfileActiveResponse,
+    EvidenceSufficiencyEvaluateRequest,
+    EvidenceSufficiencyEvaluateResponse,
     HumanCompatibilityDiagnosticsRequest,
     HumanCompatibilityDiagnosticsResponse,
     HumanCompatibilityReviewRequest,
@@ -100,6 +102,7 @@ from services.companion_policy import (
     resolve_interaction_contract,
     resolve_scene,
 )
+from services.evidence_sufficiency import evaluate_evidence_sufficiency
 from services.human_compatibility import (
     get_human_compatibility_diagnostics,
     submit_human_compatibility_review,
@@ -213,6 +216,13 @@ _CAPABILITY_ERROR_STATUS = {
 }
 
 _CLAIM_CALIBRATION_ERROR_STATUS = {
+    "runtime_session_mismatch": 400,
+    "runtime_turn_session_mismatch": 400,
+    "runtime_session_not_found": 404,
+    "runtime_turn_not_found": 404,
+}
+
+_EVIDENCE_SUFFICIENCY_ERROR_STATUS = {
     "runtime_session_mismatch": 400,
     "runtime_turn_session_mismatch": 400,
     "runtime_session_not_found": 404,
@@ -403,6 +413,22 @@ async def runtime_claim_calibration_evaluate(
         return evaluate_claim_calibration(body)
     except RuntimeError as exc:
         error = _bounded_http_error(exc, _CLAIM_CALIBRATION_ERROR_STATUS)
+        if error is not None:
+            raise error from exc
+        raise
+
+
+@app.post(
+    "/v1/runtime/evidence-sufficiency/evaluate",
+    response_model=EvidenceSufficiencyEvaluateResponse,
+)
+async def runtime_evidence_sufficiency_evaluate(
+    body: EvidenceSufficiencyEvaluateRequest,
+) -> EvidenceSufficiencyEvaluateResponse:
+    try:
+        return evaluate_evidence_sufficiency(body)
+    except RuntimeError as exc:
+        error = _bounded_http_error(exc, _EVIDENCE_SUFFICIENCY_ERROR_STATUS)
         if error is not None:
             raise error from exc
         raise

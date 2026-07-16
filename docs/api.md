@@ -38,6 +38,7 @@ state and overlays are operational context, not canonical durable memory.
 | Privacy context | `POST /v1/runtime/privacy-context/evaluate` |
 | Memory hygiene | `POST /v1/runtime/memory-hygiene/evaluate` |
 | Claim calibration | `POST /v1/runtime/claim-calibration/evaluate` |
+| Evidence sufficiency | `POST /v1/runtime/evidence-sufficiency/evaluate` |
 | Runtime identity | `POST /v1/runtime/identity/resolve` |
 
 These evaluators return typed, bounded decisions for the current context. When
@@ -51,6 +52,14 @@ uncertainty requirement, and safe explanation summary. The evaluator does not
 select evidence from a retrieval bundle, verify that referenced records physically
 exist, persist a durable claim record, call a model provider, or execute an
 external action.
+
+Evidence sufficiency compares caller-declared evidence requirements with
+caller-supplied acquisition facts. It deterministically reports whether those
+facts satisfy the declared scope and returns bounded answer constraints when
+the scope is limited, insufficient, or unknown. It does not derive the evidence
+plan, perform retrieval, verify source records, persist an acquisition manifest,
+call a model provider, generate the final answer, or enforce the constraints in
+the final answer path.
 
 ## Relationships and context
 
