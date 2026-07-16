@@ -38,6 +38,7 @@ state and overlays are operational context, not canonical durable memory.
 | Privacy context | `POST /v1/runtime/privacy-context/evaluate` |
 | Memory hygiene | `POST /v1/runtime/memory-hygiene/evaluate` |
 | Claim calibration | `POST /v1/runtime/claim-calibration/evaluate` |
+| Evidence shape derivation | `POST /v1/runtime/evidence-shapes/derive` |
 | Evidence planning | `POST /v1/runtime/evidence-plans/compile` |
 | Evidence sufficiency | `POST /v1/runtime/evidence-sufficiency/evaluate` |
 | Runtime identity | `POST /v1/runtime/identity/resolve` |
@@ -53,6 +54,14 @@ uncertainty requirement, and safe explanation summary. The evaluator does not
 select evidence from a retrieval bundle, verify that referenced records physically
 exist, persist a durable claim record, call a model provider, or execute an
 external action.
+
+Evidence shape derivation consumes the existing interaction classification, a
+bounded current task statement, and structural evidence-materiality context. It
+derives only a broad evidence acquisition shape, or reports that evidence-scope
+planning is not applicable or remains ambiguous. It does not create a
+product-specific intent catalog, call a model provider, inspect source
+inventories, compile an evidence plan, retrieve evidence, persist a plan or
+acquisition manifest, or generate or enforce the final answer.
 
 Evidence planning accepts an already-resolved broad task shape, a bounded
 declared scope, and a normalized governed source inventory. It declares bounded

@@ -133,6 +133,7 @@ RuntimeEventType = Literal[
     "confirmation_challenge_evaluated",
     "action_summary_recorded",
     "claim_calibration_evaluated",
+    "evidence_shape_derived",
     "evidence_plan_compiled",
     "evidence_sufficiency_evaluated",
 ]
@@ -521,6 +522,127 @@ EvidenceTaskShape = Literal[
     "historical_reconstruction",
     "recommendation_or_decision_support",
 ]
+EvidenceInputKind = Literal[
+    "memory",
+    "artifact",
+    "external_source",
+    "tool_output",
+    "integration_record",
+    "world_state",
+]
+EvidenceShapeDerivationStatus = Literal["derived", "not_applicable", "ambiguous"]
+EvidenceShapeReasonCode = Literal[
+    "source_context_present",
+    "external_verification_required",
+    "freshness_sensitive",
+    "high_stakes_accuracy_required",
+    "explicit_evidence_language",
+    "targeted_lookup_derived",
+    "exhaustive_scope_requested",
+    "comparison_requested",
+    "contradiction_requested",
+    "absence_scope_requested",
+    "historical_reconstruction_requested",
+    "decision_support_requested",
+    "prior_shape_inherited",
+    "ordinary_chat_without_material_evidence_scope",
+    "non_evidence_interaction",
+    "ambiguous_interaction_without_shape_signal",
+    "multiple_incompatible_shapes",
+]
+
+
+class EvidenceShapeContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_input_kinds: list[EvidenceInputKind] = Field(max_length=6)
+    external_verification_required: bool
+    freshness_sensitive: bool
+    high_stakes_accuracy_required: bool
+    continuation_of_prior_evidence_task: bool
+    prior_task_shape: EvidenceTaskShape | None = None
+
+    @model_validator(mode="after")
+    def validate_continuation_context(self) -> EvidenceShapeContext:
+        if len(set(self.evidence_input_kinds)) != len(self.evidence_input_kinds):
+            raise ValueError("duplicate_evidence_input_kind")
+        if self.continuation_of_prior_evidence_task and self.prior_task_shape is None:
+            raise ValueError("prior_task_shape_required")
+        if not self.continuation_of_prior_evidence_task and self.prior_task_shape is not None:
+            raise ValueError("prior_task_shape_not_allowed")
+        return self
+
+
+class EvidenceShapeDeriveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: EvidenceSufficiencyIdentifier
+    owner_id: EvidenceSufficiencyIdentifier
+    conversation_id: EvidenceSufficiencyIdentifier
+    surface: EvidenceSufficiencySurface
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    task_text: Annotated[str, Field(min_length=1, max_length=500)]
+    interaction_kind: InteractionGovernanceKind
+    task_context: EvidenceShapeContext
+
+    @field_validator("task_text", mode="before")
+    @classmethod
+    def normalize_task_text(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return " ".join(value.split())
+
+
+class EvidenceShapeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    derivation_id: EvidenceSufficiencyIdentifier
+    question_anchor: Annotated[str, Field(min_length=1, max_length=500)]
+    question_anchor_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ]
+    derivation_status: EvidenceShapeDerivationStatus
+    task_shape: EvidenceTaskShape | None = None
+    candidate_task_shapes: list[EvidenceTaskShape] = Field(max_length=7)
+    evidence_scope_material: bool
+    clarification_required: bool
+    reason_codes: list[EvidenceShapeReasonCode] = Field(max_length=17)
+    user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+
+    @model_validator(mode="after")
+    def validate_derivation_outcome(self) -> EvidenceShapeResult:
+        if self.derivation_status == "derived":
+            if self.task_shape is None or self.candidate_task_shapes != [self.task_shape]:
+                raise ValueError("invalid_derived_shape_outcome")
+            if not self.evidence_scope_material or self.clarification_required:
+                raise ValueError("invalid_derived_shape_flags")
+        elif self.derivation_status == "not_applicable":
+            if self.task_shape is not None or self.candidate_task_shapes:
+                raise ValueError("invalid_not_applicable_shape_outcome")
+            if self.evidence_scope_material or self.clarification_required:
+                raise ValueError("invalid_not_applicable_shape_flags")
+        else:
+            if self.task_shape is not None:
+                raise ValueError("invalid_ambiguous_shape_outcome")
+            if not self.evidence_scope_material or not self.clarification_required:
+                raise ValueError("invalid_ambiguous_shape_flags")
+        return self
+
+
+class EvidenceShapeDeriveResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: EvidenceSufficiencyIdentifier
+    owner_id: EvidenceSufficiencyIdentifier
+    conversation_id: EvidenceSufficiencyIdentifier
+    surface: EvidenceSufficiencySurface
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    result: EvidenceShapeResult
+
+
 EvidenceRequirementCriticality = Literal["material", "optional"]
 EvidenceAcquisitionOutcome = Literal[
     "satisfied",
