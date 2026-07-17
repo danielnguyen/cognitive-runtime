@@ -843,6 +843,22 @@ EvidencePlanLimitationCode = Literal[
 ]
 
 
+class EvidenceExactSourceReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_ref: Annotated[str, Field(min_length=1, max_length=240)]
+    source_id: EvidenceSufficiencyIdentifier
+
+    @field_validator("source_ref")
+    @classmethod
+    def validate_source_ref(cls, value: str) -> str:
+        if re.search(r"\s", value):
+            raise ValueError("exact_source_ref_contains_whitespace")
+        if "://" in value or "?" in value:
+            raise ValueError("unsafe_exact_source_ref")
+        return value
+
+
 class EvidenceDeclaredScope(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -851,6 +867,10 @@ class EvidenceDeclaredScope(BaseModel):
         max_length=32,
     )
     source_categories: list[EvidenceSufficiencyIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    exact_source_refs: list[EvidenceExactSourceReference] = Field(
         default_factory=list,
         max_length=16,
     )
@@ -866,6 +886,14 @@ class EvidenceDeclaredScope(BaseModel):
             raise ValueError("duplicate_declared_source_id")
         if len(set(self.source_categories)) != len(self.source_categories):
             raise ValueError("duplicate_declared_source_category")
+        source_refs = [reference.source_ref for reference in self.exact_source_refs]
+        if len(set(source_refs)) != len(source_refs):
+            raise ValueError("duplicate_exact_source_ref")
+        if self.source_ids and any(
+            reference.source_id not in self.source_ids
+            for reference in self.exact_source_refs
+        ):
+            raise ValueError("exact_source_ref_outside_declared_source_ids")
         return self
 
 

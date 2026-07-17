@@ -613,7 +613,7 @@ def _source(
         (
             "Verify the record for the current value.",
             _context(),
-            [_source("source-a", ["exact_fetch"])],
+            [_source("source-a", ["targeted_retrieval"])],
             None,
             "targeted_lookup",
         ),

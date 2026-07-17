@@ -45,14 +45,23 @@ def _scope(
     *,
     source_ids: list[str] | None = None,
     source_categories: list[str] | None = None,
+    exact_source_refs: list[dict[str, str]] | None = None,
     inventory_status: str = "complete_for_declared_scope",
     time_scope_ref: str | None = None,
 ) -> dict[str, object]:
     return {
         "source_ids": source_ids or [],
         "source_categories": source_categories or [],
+        "exact_source_refs": exact_source_refs or [],
         "inventory_status": inventory_status,
         "time_scope_ref": time_scope_ref,
+    }
+
+
+def _exact_ref(source_id: str, native_ref: str) -> dict[str, str]:
+    return {
+        "source_id": source_id,
+        "source_ref": f"connector:{source_id}:{native_ref}",
     }
 
 
@@ -130,7 +139,10 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
     [
         (
             "targeted_lookup",
-            _scope(source_ids=["source-a"]),
+            _scope(
+                source_ids=["source-a"],
+                exact_source_refs=[_exact_ref("source-a", "item-123")],
+            ),
             [_source("source-a", capabilities=["exact_fetch"])],
             "targeted_scope",
             False,
@@ -243,10 +255,13 @@ def test_each_task_shape_produces_a_distinct_ready_plan(
     assert "context_delivery" in _requirement_kinds(result)
 
 
-def test_question_anchor_is_normalized_and_exact_authoritative_fetch_is_preferred():
+def test_question_anchor_is_normalized_and_explicit_exact_fetch_is_preferred():
     response = _compile(
         _start_runtime(),
-        declared_scope=_scope(source_ids=["source-a"]),
+        declared_scope=_scope(
+            source_ids=["source-a"],
+            exact_source_refs=[_exact_ref("source-a", "item-123")],
+        ),
         source_inventory=[
             _source(
                 "source-a",
@@ -265,6 +280,223 @@ def test_question_anchor_is_normalized_and_exact_authoritative_fetch_is_preferre
     assert result["eligible_source_ids"] == ["source-a"]
     assert result["authoritative_source_ids"] == ["source-a"]
     assert "exact_authoritative_fetch" in _requirement_kinds(result)
+
+
+def test_source_id_with_search_and_fetch_selects_targeted_retrieval():
+    result = _compile(
+        _start_runtime(),
+        declared_scope=_scope(source_ids=["source-a"]),
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["targeted_retrieval", "exact_fetch"],
+            )
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == ["targeted_retrieval"]
+    assert result["eligible_source_ids"] == ["source-a"]
+    assert {"targeted_evidence", "context_delivery"} <= _requirement_kinds(result)
+    assert "exact_authoritative_fetch" not in _requirement_kinds(result)
+
+
+def test_source_id_with_exact_fetch_only_is_unsupported():
+    result = _compile(
+        _start_runtime(),
+        declared_scope=_scope(source_ids=["source-a"]),
+        source_inventory=[_source("source-a", capabilities=["exact_fetch"])],
+    ).json()["result"]
+
+    assert result["plan_status"] == "unsupported"
+    assert result["selected_strategies"] == []
+    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert "exact_authoritative_fetch" not in _requirement_kinds(result)
+
+
+def test_multiple_exact_references_to_one_source_select_exact_fetch():
+    result = _compile(
+        _start_runtime(),
+        declared_scope=_scope(
+            exact_source_refs=[
+                _exact_ref("source-a", "item-2"),
+                _exact_ref("source-a", "item-1"),
+            ]
+        ),
+        source_inventory=[_source("source-a", capabilities=["exact_fetch"])],
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == ["exact_fetch"]
+    assert result["eligible_source_ids"] == ["source-a"]
+
+
+def test_exact_references_spanning_fetch_capable_sources_select_exact_fetch():
+    result = _compile(
+        _start_runtime(),
+        declared_scope=_scope(
+            exact_source_refs=[
+                _exact_ref("source-a", "item-a"),
+                _exact_ref("source-b", "item-b"),
+            ]
+        ),
+        source_inventory=[
+            _source("source-a", capabilities=["exact_fetch"]),
+            _source(
+                "source-b",
+                capabilities=["exact_fetch"],
+                authority_role="supplemental",
+            ),
+            _source("source-unrelated", capabilities=["exact_fetch"]),
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == ["exact_fetch"]
+    assert result["eligible_source_ids"] == ["source-a", "source-b"]
+    assert "source-unrelated" not in result["eligible_source_ids"]
+    assert "exact_authoritative_fetch" in _requirement_kinds(result)
+
+
+@pytest.mark.parametrize(
+    ("inventory", "expected_limitation"),
+    [
+        ([], "declared_source_missing_from_inventory"),
+        (
+            [
+                _source(
+                    "source-a",
+                    capabilities=["exact_fetch"],
+                    availability="unavailable",
+                )
+            ],
+            "required_capability_unavailable",
+        ),
+        (
+            [
+                _source(
+                    "source-a",
+                    capabilities=["exact_fetch"],
+                    availability="disabled",
+                )
+            ],
+            "required_capability_unavailable",
+        ),
+        (
+            [
+                _source(
+                    "source-a",
+                    capabilities=["exact_fetch"],
+                    availability="unknown",
+                )
+            ],
+            "required_capability_unavailable",
+        ),
+        (
+            [_source("source-a", capabilities=["targeted_retrieval"])],
+            "required_capability_unavailable",
+        ),
+    ],
+    ids=[
+        "missing",
+        "unavailable",
+        "disabled",
+        "unknown",
+        "not-fetch-capable",
+    ],
+)
+def test_exact_reference_failures_do_not_fall_back_to_search(
+    inventory: list[dict[str, object]],
+    expected_limitation: str,
+):
+    result = _compile(
+        _start_runtime(),
+        declared_scope=_scope(
+            exact_source_refs=[_exact_ref("source-a", "item-123")]
+        ),
+        source_inventory=inventory,
+    ).json()["result"]
+
+    assert result["plan_status"] == "unsupported"
+    assert result["selected_strategies"] == []
+    assert expected_limitation in result["limitation_codes"]
+    assert {"targeted_evidence", "context_delivery"} <= _requirement_kinds(result)
+
+
+def test_exact_reference_source_and_category_boundaries_intersect():
+    positive = _compile(
+        _start_runtime(),
+        declared_scope=_scope(
+            source_ids=["source-a", "source-b"],
+            source_categories=["records"],
+            exact_source_refs=[_exact_ref("source-a", "item-123")],
+        ),
+        source_inventory=[
+            _source(
+                "source-a",
+                categories=["records"],
+                capabilities=["exact_fetch"],
+            ),
+            _source(
+                "source-b",
+                categories=["records"],
+                capabilities=["exact_fetch"],
+            ),
+        ],
+    ).json()["result"]
+    category_mismatch = _compile(
+        _start_runtime(),
+        declared_scope=_scope(
+            source_categories=["other"],
+            exact_source_refs=[_exact_ref("source-a", "item-123")],
+        ),
+        source_inventory=[
+            _source(
+                "source-a",
+                categories=["records"],
+                capabilities=["exact_fetch"],
+            )
+        ],
+    ).json()["result"]
+
+    assert positive["plan_status"] == "ready"
+    assert positive["eligible_source_ids"] == ["source-a"]
+    assert category_mismatch["plan_status"] == "unsupported"
+    assert category_mismatch["eligible_source_ids"] == []
+    assert category_mismatch["selected_strategies"] == []
+
+
+@pytest.mark.parametrize(
+    ("authority_role", "has_authoritative_requirement"),
+    [
+        ("authoritative", True),
+        ("supplemental", False),
+        ("unknown", False),
+    ],
+)
+def test_exact_authoritative_requirement_uses_referenced_source_authority(
+    authority_role: str,
+    has_authoritative_requirement: bool,
+):
+    result = _compile(
+        _start_runtime(),
+        declared_scope=_scope(
+            exact_source_refs=[_exact_ref("source-a", "item-123")]
+        ),
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["exact_fetch"],
+                authority_role=authority_role,
+            )
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == ["exact_fetch"]
+    assert (
+        "exact_authoritative_fetch" in _requirement_kinds(result)
+    ) is has_authoritative_requirement
 
 
 def test_targeted_only_inventory_is_not_an_exhaustive_plan():
@@ -604,7 +836,7 @@ def test_compiled_requirements_submit_unchanged_to_sufficiency_evaluator():
     plan = _compile(
         runtime,
         declared_scope=_scope(source_ids=["source-a"]),
-        source_inventory=[_source("source-a", capabilities=["exact_fetch"])],
+        source_inventory=[_source("source-a", capabilities=["targeted_retrieval"])],
     ).json()["result"]
     facts = [
         {"requirement_id": requirement["requirement_id"], "outcome": "satisfied"}
@@ -632,7 +864,7 @@ def test_compiled_optional_requirement_produces_sufficient_with_limitations():
             source_ids=["source-a"],
             inventory_status="partial",
         ),
-        source_inventory=[_source("source-a", capabilities=["exact_fetch"])],
+        source_inventory=[_source("source-a", capabilities=["targeted_retrieval"])],
     ).json()["result"]
     assert plan["plan_status"] == "ready_with_limitations"
     optional = [
@@ -669,12 +901,12 @@ def test_authoritative_unavailability_is_preserved_in_sufficiency_evaluation():
         source_inventory=[
             _source(
                 "source-a",
-                capabilities=["exact_fetch"],
+                capabilities=["targeted_retrieval"],
                 availability="unavailable",
             ),
             _source(
                 "source-b",
-                capabilities=["exact_fetch"],
+                capabilities=["targeted_retrieval"],
                 authority_role="supplemental",
             ),
         ],
@@ -719,7 +951,10 @@ def test_authoritative_unavailability_is_preserved_in_sufficiency_evaluation():
 def test_exact_authoritative_fetch_requires_one_source_with_both_properties():
     result = _compile(
         _start_runtime(),
-        declared_scope=_scope(source_ids=["source-a", "source-b"]),
+        declared_scope=_scope(
+            source_ids=["source-a", "source-b"],
+            exact_source_refs=[_exact_ref("source-b", "item-123")],
+        ),
         source_inventory=[
             _source(
                 "source-a",
@@ -781,6 +1016,33 @@ def test_equivalent_reordered_inputs_produce_identical_complete_results():
         task_shape="cross_source_comparison",
         declared_scope=second_scope,
         source_inventory=second_inventory,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["result"] == second.json()["result"]
+
+
+def test_equivalent_reordered_exact_references_produce_identical_complete_results():
+    runtime = _start_runtime()
+    exact_references = [
+        _exact_ref("source-b", "item-2"),
+        _exact_ref("source-a", "item-1"),
+        _exact_ref("source-a", "item-3"),
+    ]
+    inventory = [
+        _source("source-b", capabilities=["exact_fetch"]),
+        _source("source-a", capabilities=["exact_fetch"]),
+    ]
+    first = _compile(
+        runtime,
+        declared_scope=_scope(exact_source_refs=exact_references),
+        source_inventory=inventory,
+    )
+    second = _compile(
+        runtime,
+        declared_scope=_scope(exact_source_refs=list(reversed(exact_references))),
+        source_inventory=list(reversed(inventory)),
     )
 
     assert first.status_code == 200
@@ -883,6 +1145,66 @@ def test_duplicate_and_over_limit_inventory_values_are_rejected():
     assert all(response.status_code == 422 for response in responses)
 
 
+def test_duplicate_mismatched_and_over_limit_exact_references_are_rejected():
+    runtime = _start_runtime()
+    duplicate_reference = _exact_ref("source-a", "item-1")
+    responses = [
+        _compile(
+            runtime,
+            declared_scope=_scope(
+                exact_source_refs=[duplicate_reference, duplicate_reference]
+            ),
+        ),
+        _compile(
+            runtime,
+            declared_scope=_scope(
+                source_ids=["source-a"],
+                exact_source_refs=[_exact_ref("source-b", "item-1")],
+            ),
+        ),
+        _compile(
+            runtime,
+            declared_scope=_scope(
+                exact_source_refs=[
+                    _exact_ref("source-a", f"item-{index}") for index in range(17)
+                ]
+            ),
+        ),
+    ]
+
+    assert all(response.status_code == 422 for response in responses)
+
+
+@pytest.mark.parametrize(
+    "exact_reference",
+    [
+        {"source_id": "source-a", "source_ref": "connector:source-a:item 1"},
+        {
+            "source_id": "source-a",
+            "source_ref": "https://example.invalid/item-1",
+        },
+        {"source_id": "source-a", "source_ref": "connector:source-a:item?token=x"},
+        {"source_id": "source-a", "source_ref": ""},
+        {"source_id": "source-a", "source_ref": "x" * 241},
+        {
+            "source_id": "source-a",
+            "source_ref": "connector:source-a:item-1",
+            "metadata": {"private": True},
+        },
+    ],
+    ids=["whitespace", "url", "query", "blank", "overlong", "extra-field"],
+)
+def test_unsafe_or_unrestricted_exact_references_are_rejected(
+    exact_reference: dict[str, object],
+):
+    response = _compile(
+        _start_runtime(),
+        declared_scope=_scope(exact_source_refs=[exact_reference]),
+    )
+
+    assert response.status_code == 422
+
+
 def test_identifier_question_and_nested_scope_bounds_are_enforced():
     runtime = _start_runtime()
     unsafe_source = _source("https://example.invalid/source?token=private")
@@ -953,6 +1275,12 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
         declared_scope=_scope(
             source_ids=["private-source"],
             source_categories=["private-category"],
+            exact_source_refs=[
+                {
+                    "source_id": "private-source",
+                    "source_ref": "private-connector:private-source:PRIVATE-NATIVE-LOCATOR",
+                }
+            ],
         ),
         source_inventory=[
             _source(
@@ -1004,6 +1332,7 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
         "completeness_expectation",
         "contradiction_search_required",
         "source_inventory_count",
+        "exact_source_reference_count",
         "eligible_source_count",
         "authoritative_source_count",
         "material_requirement_count",
@@ -1023,6 +1352,7 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
     ):
         assert payload[field] == result[field]
     assert payload["source_inventory_count"] == 1
+    assert payload["exact_source_reference_count"] == 1
     assert payload["eligible_source_count"] == 1
     assert payload["authoritative_source_count"] == 1
     assert payload["material_requirement_count"] == len(
@@ -1035,10 +1365,13 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
         "private question content",
         "private-source",
         "private-category",
+        "private-native-locator",
         "question_anchor\"",
         '"source_inventory":',
         '"source_ids":',
         '"source_categories":',
+        '"exact_source_refs":',
+        '"source_ref":',
         "requirement_id",
         "requirement_kind",
         "connector",
