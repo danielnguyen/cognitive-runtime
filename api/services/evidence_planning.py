@@ -92,6 +92,10 @@ def _normalized_scope(scope: EvidenceDeclaredScope) -> EvidenceDeclaredScope:
         update={
             "source_ids": sorted(scope.source_ids),
             "source_categories": sorted(scope.source_categories),
+            "exact_source_refs": sorted(
+                scope.exact_source_refs,
+                key=lambda reference: (reference.source_ref, reference.source_id),
+            ),
         }
     )
 
@@ -115,6 +119,15 @@ def _within_declared_universe(
     source: EvidenceSourceDescriptor,
     scope: EvidenceDeclaredScope,
 ) -> bool:
+    if scope.exact_source_refs:
+        referenced_source_ids = {
+            reference.source_id for reference in scope.exact_source_refs
+        }
+        if source.source_id not in referenced_source_ids:
+            return False
+        if scope.source_categories:
+            return bool(set(source.source_categories) & set(scope.source_categories))
+        return True
     if scope.source_ids:
         return source.source_id in scope.source_ids
     if scope.source_categories:
@@ -175,8 +188,17 @@ def _select_strategy(
     eligible: list[EvidenceSourceDescriptor],
 ) -> EvidenceAcquisitionStrategy | None:
     if task_shape == "targeted_lookup":
-        if scope.source_ids and _has_capability(eligible, "exact_fetch"):
-            return "exact_fetch"
+        if scope.exact_source_refs:
+            referenced_source_ids = {
+                reference.source_id for reference in scope.exact_source_refs
+            }
+            eligible_source_ids = {source.source_id for source in eligible}
+            if (
+                eligible_source_ids == referenced_source_ids
+                and _all_have_capability(eligible, "exact_fetch")
+            ):
+                return "exact_fetch"
+            return None
         if _has_capability(eligible, "targeted_retrieval"):
             return "targeted_retrieval"
         if _has_capability(eligible, "bounded_full_context"):
@@ -267,7 +289,12 @@ def _base_limitations(
 ) -> set[EvidencePlanLimitationCode]:
     limitations: set[EvidencePlanLimitationCode] = set()
     inventory_ids = {source.source_id for source in inventory}
-    if any(source_id not in inventory_ids for source_id in scope.source_ids):
+    declared_source_ids = (
+        {reference.source_id for reference in scope.exact_source_refs}
+        if scope.exact_source_refs
+        else set(scope.source_ids)
+    )
+    if any(source_id not in inventory_ids for source_id in declared_source_ids):
         limitations.add("declared_source_missing_from_inventory")
 
     if scope.source_categories and not any(
@@ -537,7 +564,8 @@ def compile_evidence_plan(
         limitations & optional_scope_limitations
     )
     exact_authoritative_fetch = any(
-        source.authority_role == "authoritative"
+        strategy == "exact_fetch"
+        and source.authority_role == "authoritative"
         and "exact_fetch" in source.capabilities
         for source in eligible
     )
@@ -600,6 +628,7 @@ def compile_evidence_plan(
             "completeness_expectation": result.completeness_expectation,
             "contradiction_search_required": result.contradiction_search_required,
             "source_inventory_count": len(inventory),
+            "exact_source_reference_count": len(scope.exact_source_refs),
             "eligible_source_count": len(result.eligible_source_ids),
             "authoritative_source_count": len(result.authoritative_source_ids),
             "material_requirement_count": sum(

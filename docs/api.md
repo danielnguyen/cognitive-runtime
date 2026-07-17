@@ -67,10 +67,14 @@ Evidence planning accepts an already-resolved broad task shape, a bounded
 declared scope, and a normalized governed source inventory. It declares bounded
 evidence requirements, derives completeness and contradiction expectations, and
 selects a deterministic capability-aware acquisition strategy. The compiler does
-not derive task shape from user text, call Basic Memory Store or Data Source
-Aggregator, execute retrieval, persist a plan or acquisition manifest, assess
-actual acquired evidence, call a model provider, or generate or enforce the final
-answer.
+not treat a source registry ID as an individual record: source IDs narrow the
+eligible source registries, while an exact fetch requires explicit opaque exact
+source references associated with those registries. Exact references are bounded
+data, not URLs or source content, and source IDs alone never select exact fetch.
+The compiler does not derive task shape from user text, call Basic Memory Store
+or Data Source Aggregator, execute the planned retrieval or fetch, persist a plan
+or acquisition manifest, assess actual acquired evidence, call a model provider,
+or generate or enforce the final answer.
 
 Evidence sufficiency compares caller-declared evidence requirements with
 caller-supplied acquisition facts. It deterministically reports whether those
