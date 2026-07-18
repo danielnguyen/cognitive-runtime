@@ -135,6 +135,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
         "contradiction_required",
         "strategy",
         "required_kinds",
+        "expected_status",
     ),
     [
         (
@@ -148,6 +149,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             False,
             "exact_fetch",
             {"exact_authoritative_fetch", "context_delivery"},
+            "ready",
         ),
         (
             "bounded_exhaustive_review",
@@ -157,6 +159,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             True,
             "structured_query",
             {"authoritative_inventory", "complete_scope_coverage"},
+            "unsupported",
         ),
         (
             "cross_source_comparison",
@@ -172,6 +175,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             False,
             "hybrid",
             {"selected_source_coverage", "cross_source_comparison"},
+            "unsupported",
         ),
         (
             "contradiction_review",
@@ -190,6 +194,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             True,
             "hybrid",
             {"contradiction_search", "counterevidence_coverage"},
+            "unsupported",
         ),
         (
             "absence_or_coverage_check",
@@ -199,6 +204,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             False,
             "structured_query",
             {"authoritative_inventory", "structured_absence_check"},
+            "unsupported",
         ),
         (
             "historical_reconstruction",
@@ -208,6 +214,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             False,
             "structured_query",
             {"historical_scope", "historical_sequence_coverage"},
+            "unsupported",
         ),
         (
             "recommendation_or_decision_support",
@@ -226,10 +233,11 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             True,
             "hybrid",
             {"candidate_evidence_coverage", "counterevidence_coverage"},
+            "unsupported",
         ),
     ],
 )
-def test_each_task_shape_produces_a_distinct_ready_plan(
+def test_each_task_shape_preserves_candidate_strategy_and_requirements(
     task_shape: str,
     declared_scope: dict[str, object],
     inventory: list[dict[str, object]],
@@ -237,6 +245,7 @@ def test_each_task_shape_produces_a_distinct_ready_plan(
     contradiction_required: bool,
     strategy: str,
     required_kinds: set[str],
+    expected_status: str,
 ):
     response = _compile(
         _start_runtime(),
@@ -247,12 +256,111 @@ def test_each_task_shape_produces_a_distinct_ready_plan(
 
     assert response.status_code == 200
     result = response.json()["result"]
-    assert result["plan_status"] == "ready"
+    assert result["plan_status"] == expected_status
     assert result["completeness_expectation"] == completeness
     assert result["contradiction_search_required"] is contradiction_required
     assert result["selected_strategies"] == [strategy]
     assert required_kinds <= _requirement_kinds(result)
     assert "context_delivery" in _requirement_kinds(result)
+    assert (
+        "required_capability_unavailable" in result["limitation_codes"]
+    ) is (expected_status == "unsupported")
+
+
+@pytest.mark.parametrize(
+    ("task_shape", "declared_scope", "inventory", "expected_strategy"),
+    [
+        (
+            "targeted_lookup",
+            _scope(source_ids=["source-a"]),
+            [_source("source-a", capabilities=["targeted_retrieval"])],
+            "targeted_retrieval",
+        ),
+        (
+            "targeted_lookup",
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source("source-a", capabilities=["targeted_retrieval"]),
+                _source("source-b", capabilities=["targeted_retrieval"]),
+            ],
+            "targeted_retrieval",
+        ),
+        (
+            "targeted_lookup",
+            _scope(
+                exact_source_refs=[
+                    _exact_ref("source-a", "item-a"),
+                    _exact_ref("source-b", "item-b"),
+                ]
+            ),
+            [
+                _source("source-a", capabilities=["exact_fetch"]),
+                _source("source-b", capabilities=["exact_fetch"]),
+            ],
+            "exact_fetch",
+        ),
+        (
+            "cross_source_comparison",
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+            ],
+            "hybrid",
+        ),
+        (
+            "cross_source_comparison",
+            _scope(source_ids=[f"source-{index}" for index in range(8)]),
+            [
+                _source(
+                    f"source-{index}",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+                for index in range(8)
+            ],
+            "hybrid",
+        ),
+    ],
+    ids=[
+        "targeted-single-source",
+        "targeted-multiple-sources",
+        "exact-fetch",
+        "hybrid-two-sources",
+        "hybrid-eight-sources",
+    ],
+)
+def test_current_normal_chat_executable_readiness_matrix(
+    task_shape: str,
+    declared_scope: dict[str, object],
+    inventory: list[dict[str, object]],
+    expected_strategy: str,
+):
+    result = _compile(
+        _start_runtime(),
+        task_shape=task_shape,
+        declared_scope=declared_scope,
+        source_inventory=inventory,
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == [expected_strategy]
+    assert "required_capability_unavailable" not in result["limitation_codes"]
+    if task_shape == "cross_source_comparison":
+        assert result["completeness_expectation"] == (
+            "complete_for_selected_sources"
+        )
+        assert result["contradiction_search_required"] is False
+        assert _requirement_kinds(result) == {
+            "selected_source_coverage",
+            "cross_source_comparison",
+            "context_delivery",
+        }
 
 
 def test_question_anchor_is_normalized_and_explicit_exact_fetch_is_preferred():
@@ -299,6 +407,30 @@ def test_source_id_with_search_and_fetch_selects_targeted_retrieval():
     assert result["eligible_source_ids"] == ["source-a"]
     assert {"targeted_evidence", "context_delivery"} <= _requirement_kinds(result)
     assert "exact_authoritative_fetch" not in _requirement_kinds(result)
+
+
+def test_targeted_retrieval_allows_unavailable_optional_supplemental_scope():
+    result = _compile(
+        _start_runtime(),
+        source_inventory=[
+            _source("source-a", capabilities=["targeted_retrieval"]),
+            _source(
+                "source-optional",
+                capabilities=["targeted_retrieval"],
+                availability="unavailable",
+                authority_role="supplemental",
+            ),
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready_with_limitations"
+    assert result["selected_strategies"] == ["targeted_retrieval"]
+    assert "optional_source_unavailable" in result["limitation_codes"]
+    assert {
+        requirement["requirement_kind"]
+        for requirement in result["declared_requirements"]
+        if requirement["criticality"] == "optional"
+    } == {"selected_source_coverage"}
 
 
 def test_source_id_with_exact_fetch_only_is_unsupported():
@@ -680,18 +812,315 @@ def test_comparison_requires_two_sources_and_contradiction_rejects_targeted_only
 
     assert comparison_negative["plan_status"] == "unsupported"
     assert "insufficient_comparison_scope" in comparison_negative["limitation_codes"]
-    assert comparison_positive["plan_status"] == "ready"
+    assert comparison_positive["plan_status"] == "unsupported"
     assert comparison_positive["selected_strategies"] == ["targeted_retrieval"]
-    assert comparison_exact["plan_status"] == "ready"
+    assert "required_capability_unavailable" in comparison_positive[
+        "limitation_codes"
+    ]
+    assert comparison_exact["plan_status"] == "unsupported"
     assert comparison_exact["selected_strategies"] == ["exact_fetch"]
+    assert "required_capability_unavailable" in comparison_exact["limitation_codes"]
     assert contradiction_negative["plan_status"] == "unsupported"
     assert "contradiction_search_not_supported" in contradiction_negative[
         "limitation_codes"
     ]
-    assert contradiction_positive["plan_status"] == "ready"
+    assert contradiction_positive["plan_status"] == "unsupported"
     assert contradiction_positive["selected_strategies"] == [
         "bounded_full_context"
     ]
+    assert "required_capability_unavailable" in contradiction_positive[
+        "limitation_codes"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("declared_scope", "inventory", "expected_strategy"),
+    [
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source("source-a", capabilities=["targeted_retrieval"]),
+                _source("source-b", capabilities=["bounded_full_context"]),
+            ],
+            "targeted_retrieval",
+        ),
+        (
+            _scope(source_ids=["source-a"]),
+            [_source("source-a", capabilities=["bounded_full_context"])],
+            "bounded_full_context",
+        ),
+        (
+            _scope(
+                exact_source_refs=[
+                    _exact_ref("source-a", "item-a"),
+                    _exact_ref("source-b", "item-b"),
+                ]
+            ),
+            [
+                _source("source-a", capabilities=["exact_fetch"]),
+                _source("source-b", capabilities=["targeted_retrieval"]),
+            ],
+            None,
+        ),
+        (
+            _scope(
+                exact_source_refs=[
+                    _exact_ref("source-a", "item-a"),
+                    _exact_ref("source-b", "item-b"),
+                ]
+            ),
+            [
+                _source("source-a", capabilities=["exact_fetch"]),
+                _source(
+                    "source-b",
+                    capabilities=["exact_fetch"],
+                    availability="unavailable",
+                ),
+            ],
+            None,
+        ),
+    ],
+    ids=[
+        "partial-targeted-capability",
+        "bounded-full-context-candidate",
+        "referenced-source-lacks-fetch",
+        "reference-universe-exceeds-eligible-sources",
+    ],
+)
+def test_targeted_execution_mismatches_are_unsupported(
+    declared_scope: dict[str, object],
+    inventory: list[dict[str, object]],
+    expected_strategy: str | None,
+):
+    result = _compile(
+        _start_runtime(),
+        declared_scope=declared_scope,
+        source_inventory=inventory,
+    ).json()["result"]
+
+    assert result["plan_status"] == "unsupported"
+    assert result["selected_strategies"] == (
+        [expected_strategy] if expected_strategy is not None else []
+    )
+    assert "required_capability_unavailable" in result["limitation_codes"]
+
+
+@pytest.mark.parametrize(
+    ("declared_scope", "inventory", "expected_strategy"),
+    [
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source("source-b", capabilities=["targeted_retrieval"]),
+            ],
+            "hybrid",
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source("source-a", capabilities=["targeted_retrieval"]),
+                _source("source-b", capabilities=["targeted_retrieval"]),
+            ],
+            "targeted_retrieval",
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "exact_fetch"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "exact_fetch"],
+                ),
+            ],
+            "hybrid",
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "bounded_full_context"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "bounded_full_context"],
+                ),
+            ],
+            "hybrid",
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "exact_fetch"],
+                ),
+            ],
+            "hybrid",
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source("source-b", capabilities=["context_expansion"]),
+            ],
+            None,
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                    availability="unavailable",
+                ),
+            ],
+            None,
+        ),
+        (
+            _scope(source_ids=["source-a"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+            ],
+            None,
+        ),
+        (
+            _scope(source_ids=[f"source-{index}" for index in range(9)]),
+            [
+                _source(
+                    f"source-{index}",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+                for index in range(9)
+            ],
+            "hybrid",
+        ),
+        (
+            _scope(
+                exact_source_refs=[
+                    _exact_ref("source-a", "item-a"),
+                    _exact_ref("source-b", "item-b"),
+                ]
+            ),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+            ],
+            "hybrid",
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source("source-a", capabilities=["exact_fetch"]),
+                _source("source-b", capabilities=["exact_fetch"]),
+            ],
+            "exact_fetch",
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source("source-a", capabilities=["structured_query"]),
+                _source("source-b", capabilities=["structured_query"]),
+            ],
+            "structured_query",
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source("source-a", capabilities=["bounded_full_context"]),
+                _source("source-b", capabilities=["bounded_full_context"]),
+            ],
+            "bounded_full_context",
+        ),
+    ],
+    ids=[
+        "partial-context-expansion",
+        "targeted-only-fallback",
+        "exact-fetch-expansion-composition",
+        "bounded-full-context-expansion-composition",
+        "mixed-context-and-exact-composition",
+        "missing-targeted-retrieval",
+        "unavailable-planned-source",
+        "one-source-only",
+        "nine-sources",
+        "exact-references-present",
+        "exact-fetch-fallback",
+        "structured-query-fallback",
+        "bounded-full-context-fallback",
+    ],
+)
+def test_cross_source_execution_compositions_are_unsupported(
+    declared_scope: dict[str, object],
+    inventory: list[dict[str, object]],
+    expected_strategy: str | None,
+):
+    result = _compile(
+        _start_runtime(),
+        task_shape="cross_source_comparison",
+        declared_scope=declared_scope,
+        source_inventory=inventory,
+    ).json()["result"]
+
+    assert result["plan_status"] == "unsupported"
+    assert result["selected_strategies"] == (
+        [expected_strategy] if expected_strategy is not None else []
+    )
+    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert result["completeness_expectation"] == "complete_for_selected_sources"
+    assert {
+        "selected_source_coverage",
+        "cross_source_comparison",
+        "context_delivery",
+    } <= _requirement_kinds(result)
+
+
+def test_execution_incompatibility_cannot_become_ready_with_limitations():
+    result = _compile(
+        _start_runtime(),
+        declared_scope=_scope(inventory_status="partial"),
+        source_inventory=[
+            _source("source-a", capabilities=["bounded_full_context"]),
+            _source(
+                "source-optional",
+                capabilities=["bounded_full_context"],
+                availability="unavailable",
+                authority_role="supplemental",
+            ),
+        ],
+    ).json()["result"]
+
+    assert result["selected_strategies"] == ["bounded_full_context"]
+    assert result["plan_status"] == "unsupported"
+    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert "optional_source_unavailable" in result["limitation_codes"]
+    assert "source_inventory_partial" in result["limitation_codes"]
 
 
 def test_historical_and_decision_support_prerequisites_are_enforced():
@@ -1021,6 +1450,49 @@ def test_equivalent_reordered_inputs_produce_identical_complete_results():
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["result"] == second.json()["result"]
+
+
+def test_execution_readiness_changes_plan_identity_truthfully():
+    runtime = _start_runtime()
+    scope = _scope(source_ids=["source-a", "source-b"])
+    ready = _compile(
+        runtime,
+        task_shape="cross_source_comparison",
+        declared_scope=scope,
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["targeted_retrieval", "context_expansion"],
+            ),
+            _source(
+                "source-b",
+                capabilities=["targeted_retrieval", "context_expansion"],
+            ),
+        ],
+    ).json()["result"]
+    unsupported = _compile(
+        runtime,
+        task_shape="cross_source_comparison",
+        declared_scope=scope,
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["targeted_retrieval", "context_expansion"],
+            ),
+            _source(
+                "source-b",
+                capabilities=["targeted_retrieval", "exact_fetch"],
+            ),
+        ],
+    ).json()["result"]
+
+    assert ready["selected_strategies"] == unsupported["selected_strategies"] == [
+        "hybrid"
+    ]
+    assert ready["plan_status"] == "ready"
+    assert unsupported["plan_status"] == "unsupported"
+    assert "required_capability_unavailable" in unsupported["limitation_codes"]
+    assert ready["plan_id"] != unsupported["plan_id"]
 
 
 def test_equivalent_reordered_exact_references_produce_identical_complete_results():

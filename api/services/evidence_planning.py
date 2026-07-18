@@ -281,6 +281,42 @@ def _select_strategy(
     return None
 
 
+def _normal_chat_execution_supported(
+    *,
+    task_shape: str,
+    scope: EvidenceDeclaredScope,
+    eligible: list[EvidenceSourceDescriptor],
+    strategy: EvidenceAcquisitionStrategy | None,
+) -> bool:
+    if task_shape == "targeted_lookup":
+        if scope.exact_source_refs:
+            referenced_source_ids = {
+                reference.source_id for reference in scope.exact_source_refs
+            }
+            eligible_source_ids = {source.source_id for source in eligible}
+            return (
+                strategy == "exact_fetch"
+                and bool(eligible)
+                and referenced_source_ids == eligible_source_ids
+                and _all_have_capability(eligible, "exact_fetch")
+            )
+        return (
+            strategy == "targeted_retrieval"
+            and _all_have_capability(eligible, "targeted_retrieval")
+        )
+
+    if task_shape == "cross_source_comparison":
+        return (
+            strategy == "hybrid"
+            and not scope.exact_source_refs
+            and 2 <= len(eligible) <= 8
+            and _all_have_capability(eligible, "targeted_retrieval")
+            and _all_have_capability(eligible, "context_expansion")
+        )
+
+    return False
+
+
 def _base_limitations(
     *,
     scope: EvidenceDeclaredScope,
@@ -543,7 +579,7 @@ def compile_evidence_plan(
         and "authoritative_source_unavailable" in limitations
     ):
         limitations.add("absence_scope_not_enumerable")
-    material_supported = _material_plan_supported(
+    source_material_supported = _material_plan_supported(
         task_shape=body.task_shape,
         scope=scope,
         eligible=eligible,
@@ -551,6 +587,15 @@ def compile_evidence_plan(
         strategy=strategy,
         limitations=limitations,
     )
+    execution_supported = _normal_chat_execution_supported(
+        task_shape=body.task_shape,
+        scope=scope,
+        eligible=eligible,
+        strategy=strategy,
+    )
+    if strategy is not None and not execution_supported:
+        limitations.add("required_capability_unavailable")
+    material_supported = source_material_supported and execution_supported
     status = _plan_status(material_supported, limitations)
     optional_scope_limitations = {
         "optional_source_unavailable",
