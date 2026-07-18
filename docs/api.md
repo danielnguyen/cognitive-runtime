@@ -71,6 +71,14 @@ not treat a source registry ID as an individual record: source IDs narrow the
 eligible source registries, while an exact fetch requires explicit opaque exact
 source references associated with those registries. Exact references are bounded
 data, not URLs or source content, and source IDs alone never select exact fetch.
+Source capability is necessary but not sufficient for a plan to be `ready`.
+Readiness also means the selected task shape, strategy, source composition, and
+reference boundary are supported by the current governed normal-chat execution
+path. An `unsupported` plan still retains its task-shape requirements and may
+retain the deterministic source-supported candidate strategy; this status does
+not make that strategy class permanently invalid. Cognitive Runtime does not
+execute acquisition, so a newly executable composition must be reflected in
+this readiness policy before plans for it can be marked `ready`.
 The compiler does not derive task shape from user text, call Basic Memory Store
 or Data Source Aggregator, execute the planned retrieval or fetch, persist a plan
 or acquisition manifest, assess actual acquired evidence, call a model provider,

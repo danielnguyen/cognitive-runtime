@@ -608,7 +608,19 @@ def _source(
 
 
 @pytest.mark.parametrize(
-    ("task_text", "task_context", "inventory", "time_scope_ref", "expected_shape"),
+    (
+        "task_text",
+        "task_context",
+        "inventory",
+        "time_scope_ref",
+        "expected_shape",
+        "expected_status",
+        "expected_strategy",
+        "expected_completeness",
+        "expected_contradiction_required",
+        "expected_requirement_kinds",
+        "expected_capability_limitation",
+    ),
     [
         (
             "Verify the record for the current value.",
@@ -616,6 +628,12 @@ def _source(
             [_source("source-a", ["targeted_retrieval"])],
             None,
             "targeted_lookup",
+            "ready",
+            "targeted_retrieval",
+            "targeted_scope",
+            False,
+            {"targeted_evidence", "context_delivery"},
+            False,
         ),
         (
             "Check every requirement in the complete checklist.",
@@ -623,6 +641,18 @@ def _source(
             [_source("source-a", ["structured_query"])],
             None,
             "bounded_exhaustive_review",
+            "unsupported",
+            "structured_query",
+            "complete_for_declared_scope",
+            True,
+            {
+                "authoritative_inventory",
+                "complete_scope_coverage",
+                "contradiction_search",
+                "context_delivery",
+                "no_material_truncation",
+            },
+            True,
         ),
         (
             "Check whether there is no record in the declared logs.",
@@ -630,6 +660,18 @@ def _source(
             [_source("source-a", ["structured_query"])],
             None,
             "absence_or_coverage_check",
+            "unsupported",
+            "structured_query",
+            "complete_for_declared_scope",
+            False,
+            {
+                "authoritative_inventory",
+                "complete_scope_coverage",
+                "structured_absence_check",
+                "context_delivery",
+                "no_material_truncation",
+            },
+            True,
         ),
         (
             "Compare the reports and decide between these options.",
@@ -640,6 +682,19 @@ def _source(
             ],
             None,
             "recommendation_or_decision_support",
+            "unsupported",
+            "hybrid",
+            "bounded_decision_support",
+            True,
+            {
+                "candidate_evidence_coverage",
+                "cross_source_comparison",
+                "contradiction_search",
+                "counterevidence_coverage",
+                "context_delivery",
+                "no_material_truncation",
+            },
+            True,
         ),
     ],
 )
@@ -649,6 +704,12 @@ def test_derived_shape_and_anchor_submit_unchanged_to_plan_compiler(
     inventory: list[dict[str, object]],
     time_scope_ref: str | None,
     expected_shape: str,
+    expected_status: str,
+    expected_strategy: str,
+    expected_completeness: str,
+    expected_contradiction_required: bool,
+    expected_requirement_kinds: set[str],
+    expected_capability_limitation: bool,
 ):
     runtime = _start_runtime()
     derived = _derive(
@@ -676,9 +737,24 @@ def test_derived_shape_and_anchor_submit_unchanged_to_plan_compiler(
 
     assert derived["task_shape"] == expected_shape
     assert compiled.status_code == 200
-    assert compiled.json()["result"]["task_shape"] == expected_shape
-    assert compiled.json()["result"]["question_anchor"] == derived["question_anchor"]
-    assert compiled.json()["result"]["plan_status"] == "ready"
+    result = compiled.json()["result"]
+    assert result["task_shape"] == expected_shape
+    assert result["question_anchor"] == derived["question_anchor"]
+    assert result["plan_status"] == expected_status
+    assert result["selected_strategies"] == [expected_strategy]
+    assert result["completeness_expectation"] == expected_completeness
+    assert (
+        result["contradiction_search_required"]
+        is expected_contradiction_required
+    )
+    assert {
+        requirement["requirement_kind"]
+        for requirement in result["declared_requirements"]
+        if requirement["criticality"] == "material"
+    } == expected_requirement_kinds
+    assert (
+        "required_capability_unavailable" in result["limitation_codes"]
+    ) is expected_capability_limitation
 
 
 def test_non_derived_results_cannot_be_submitted_as_valid_plans():
