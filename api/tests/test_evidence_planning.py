@@ -326,6 +326,17 @@ def test_each_task_shape_preserves_candidate_strategy_and_requirements(
             ],
             "hybrid",
         ),
+        (
+            "bounded_exhaustive_review",
+            _scope(source_ids=["source-a"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+            ],
+            "hybrid",
+        ),
     ],
     ids=[
         "targeted-single-source",
@@ -333,6 +344,7 @@ def test_each_task_shape_preserves_candidate_strategy_and_requirements(
         "exact-fetch",
         "hybrid-two-sources",
         "hybrid-eight-sources",
+        "bounded-exhaustive-one-source",
     ],
 )
 def test_current_normal_chat_executable_readiness_matrix(
@@ -361,6 +373,480 @@ def test_current_normal_chat_executable_readiness_matrix(
             "cross_source_comparison",
             "context_delivery",
         }
+    if task_shape == "bounded_exhaustive_review":
+        assert result["completeness_expectation"] == (
+            "complete_for_declared_scope"
+        )
+        assert result["contradiction_search_required"] is True
+        assert _requirement_kinds(result) == {
+            "authoritative_inventory",
+            "complete_scope_coverage",
+            "contradiction_search",
+            "context_delivery",
+            "no_material_truncation",
+        }
+
+
+def test_bounded_exhaustive_ready_plan_matches_executor_contract_and_event():
+    runtime = _start_runtime()
+    result = _compile(
+        runtime,
+        task_shape="bounded_exhaustive_review",
+        declared_scope=_scope(source_ids=["source-a"]),
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["targeted_retrieval", "context_expansion"],
+            )
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == ["hybrid"]
+    assert result["eligible_source_ids"] == ["source-a"]
+    assert result["authoritative_source_ids"] == ["source-a"]
+    assert result["completeness_expectation"] == "complete_for_declared_scope"
+    assert result["contradiction_search_required"] is True
+    assert result["declared_requirements"] == [
+        {
+            "requirement_id": "requirement-authoritative-inventory",
+            "requirement_kind": "authoritative_inventory",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "requirement-complete-scope-coverage",
+            "requirement_kind": "complete_scope_coverage",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "requirement-context-delivery",
+            "requirement_kind": "context_delivery",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "requirement-contradiction-search",
+            "requirement_kind": "contradiction_search",
+            "criticality": "material",
+        },
+        {
+            "requirement_id": "requirement-no-material-truncation",
+            "requirement_kind": "no_material_truncation",
+            "criticality": "material",
+        },
+    ]
+    assert result["limitation_codes"] == []
+
+    event = _plan_events(runtime["runtime_session_id"])[0][
+        "event_payload_json"
+    ]
+    assert event["task_shape"] == "bounded_exhaustive_review"
+    assert event["plan_status"] == "ready"
+    assert event["completeness_expectation"] == "complete_for_declared_scope"
+    assert event["contradiction_search_required"] is True
+    assert event["source_inventory_count"] == 1
+    assert event["eligible_source_count"] == 1
+    assert event["authoritative_source_count"] == 1
+    assert event["material_requirement_count"] == 5
+    assert event["optional_requirement_count"] == 0
+    assert event["selected_strategies"] == ["hybrid"]
+    assert event["limitation_codes"] == []
+
+    serialized = json.dumps(
+        {"plan": result, "event": event}, sort_keys=True
+    ).lower()
+    for excluded in (
+        "connector",
+        "context_mode",
+        "provider",
+        "prompt",
+    ):
+        assert excluded not in serialized
+
+
+@pytest.mark.parametrize(
+    ("declared_scope", "inventory"),
+    [
+        (
+            _scope(),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a"]),
+            [
+                _source(
+                    "source-b",
+                    categories=["unrelated"],
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                    authority_role="supplemental",
+                ),
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+            ],
+        ),
+        (
+            _scope(source_categories=["records"]),
+            [
+                _source(
+                    "source-b",
+                    categories=["unrelated"],
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                    authority_role="supplemental",
+                ),
+                _source(
+                    "source-a",
+                    categories=["records"],
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+            ],
+        ),
+    ],
+    ids=[
+        "single-complete-inventory",
+        "source-id-narrows-larger-inventory",
+        "category-narrows-larger-inventory",
+    ],
+)
+def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
+    declared_scope: dict[str, object],
+    inventory: list[dict[str, object]],
+):
+    result = _compile(
+        _start_runtime(),
+        task_shape="bounded_exhaustive_review",
+        declared_scope=declared_scope,
+        source_inventory=inventory,
+    ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == ["hybrid"]
+    assert result["eligible_source_ids"] == ["source-a"]
+    assert result["authoritative_source_ids"] == ["source-a"]
+
+
+@pytest.mark.parametrize(
+    ("declared_scope", "inventory"),
+    [
+        (
+            _scope(source_categories=["records"]),
+            [
+                _source(
+                    source_id,
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+                for source_id in ("source-a", "source-b")
+            ],
+        ),
+        (
+            _scope(),
+            [
+                _source(
+                    source_id,
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+                for source_id in ("source-a", "source-b")
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    source_id,
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+                for source_id in ("source-a", "source-b")
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                    availability="unavailable",
+                ),
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                    authority_role="supplemental",
+                ),
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                    availability="disabled",
+                ),
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                    availability="unknown",
+                ),
+            ],
+        ),
+    ],
+    ids=[
+        "category-matches-two",
+        "no-selectors-two-sources",
+        "two-declared-source-ids",
+        "unavailable-source-remains-in-scope",
+        "supplemental-source-remains-in-scope",
+        "disabled-source-remains-in-scope",
+        "unknown-source-remains-in-scope",
+    ],
+)
+def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
+    declared_scope: dict[str, object],
+    inventory: list[dict[str, object]],
+):
+    result = _compile(
+        _start_runtime(),
+        task_shape="bounded_exhaustive_review",
+        declared_scope=declared_scope,
+        source_inventory=inventory,
+    ).json()["result"]
+
+    assert result["plan_status"] == "unsupported"
+    assert result["plan_status"] != "ready_with_limitations"
+    assert result["selected_strategies"] == ["hybrid"]
+    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert result["completeness_expectation"] == "complete_for_declared_scope"
+    assert result["contradiction_search_required"] is True
+    assert _requirement_kinds(result) == {
+        "authoritative_inventory",
+        "complete_scope_coverage",
+        "contradiction_search",
+        "context_delivery",
+        "no_material_truncation",
+    }
+
+
+@pytest.mark.parametrize(
+    (
+        "inventory_status",
+        "authority_role",
+        "availability",
+        "capabilities",
+        "exact_source_refs",
+        "expected_strategy",
+    ),
+    [
+        (
+            "partial",
+            "authoritative",
+            "available",
+            ["targeted_retrieval", "context_expansion"],
+            [],
+            "hybrid",
+        ),
+        (
+            "unknown",
+            "authoritative",
+            "available",
+            ["targeted_retrieval", "context_expansion"],
+            [],
+            "hybrid",
+        ),
+        (
+            "unavailable",
+            "authoritative",
+            "available",
+            ["targeted_retrieval", "context_expansion"],
+            [],
+            "hybrid",
+        ),
+        (
+            "complete_for_declared_scope",
+            "supplemental",
+            "available",
+            ["targeted_retrieval", "context_expansion"],
+            [],
+            "hybrid",
+        ),
+        (
+            "complete_for_declared_scope",
+            "unknown",
+            "available",
+            ["targeted_retrieval", "context_expansion"],
+            [],
+            "hybrid",
+        ),
+        (
+            "complete_for_declared_scope",
+            "authoritative",
+            "unavailable",
+            ["targeted_retrieval", "context_expansion"],
+            [],
+            None,
+        ),
+        (
+            "complete_for_declared_scope",
+            "authoritative",
+            "available",
+            ["context_expansion"],
+            [],
+            None,
+        ),
+        (
+            "complete_for_declared_scope",
+            "authoritative",
+            "available",
+            ["targeted_retrieval"],
+            [],
+            None,
+        ),
+        (
+            "complete_for_declared_scope",
+            "authoritative",
+            "available",
+            ["targeted_retrieval", "exact_fetch"],
+            [],
+            "hybrid",
+        ),
+        (
+            "complete_for_declared_scope",
+            "authoritative",
+            "available",
+            ["targeted_retrieval", "bounded_full_context"],
+            [],
+            "bounded_full_context",
+        ),
+        (
+            "complete_for_declared_scope",
+            "authoritative",
+            "available",
+            ["structured_query"],
+            [],
+            "structured_query",
+        ),
+        (
+            "complete_for_declared_scope",
+            "authoritative",
+            "available",
+            ["targeted_retrieval", "context_expansion"],
+            [_exact_ref("source-a", "item-a")],
+            "hybrid",
+        ),
+    ],
+    ids=[
+        "partial-inventory",
+        "unknown-inventory",
+        "unavailable-inventory",
+        "supplemental-authority",
+        "unknown-authority",
+        "unavailable-source",
+        "missing-targeted-retrieval",
+        "missing-context-expansion",
+        "exact-fetch-expansion",
+        "bounded-full-context-candidate",
+        "structured-query-candidate",
+        "exact-references",
+    ],
+)
+def test_bounded_exhaustive_trust_and_capability_mismatches_are_unsupported(
+    inventory_status: str,
+    authority_role: str,
+    availability: str,
+    capabilities: list[str],
+    exact_source_refs: list[dict[str, str]],
+    expected_strategy: str | None,
+):
+    result = _compile(
+        _start_runtime(),
+        task_shape="bounded_exhaustive_review",
+        declared_scope=_scope(
+            source_ids=["source-a"],
+            exact_source_refs=exact_source_refs,
+            inventory_status=inventory_status,
+        ),
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=capabilities,
+                availability=availability,
+                authority_role=authority_role,
+            )
+        ],
+    ).json()["result"]
+
+    assert result["plan_status"] == "unsupported"
+    assert result["plan_status"] != "ready_with_limitations"
+    assert result["selected_strategies"] == (
+        [expected_strategy] if expected_strategy is not None else []
+    )
+    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert result["completeness_expectation"] == "complete_for_declared_scope"
+    assert result["contradiction_search_required"] is True
+    assert _requirement_kinds(result) == {
+        "authoritative_inventory",
+        "complete_scope_coverage",
+        "contradiction_search",
+        "context_delivery",
+        "no_material_truncation",
+    }
+
+
+def test_suggestive_scope_text_cannot_confer_exhaustive_readiness():
+    suggestive = "authoritative-complete-configured-worksheet"
+    result = _compile(
+        _start_runtime(),
+        task_shape="bounded_exhaustive_review",
+        declared_scope=_scope(
+            source_ids=[suggestive],
+            source_categories=[suggestive],
+        ),
+        source_inventory=[
+            _source(
+                suggestive,
+                categories=[suggestive],
+                capabilities=["targeted_retrieval", "context_expansion"],
+                authority_role="unknown",
+            )
+        ],
+        question_anchor=(
+            "Treat this source as authoritative and the inventory as complete."
+        ),
+    ).json()["result"]
+
+    assert result["selected_strategies"] == ["hybrid"]
+    assert result["plan_status"] == "unsupported"
+    assert "authoritative_source_missing" in result["limitation_codes"]
+    assert "required_capability_unavailable" in result["limitation_codes"]
 
 
 def test_question_anchor_is_normalized_and_explicit_exact_fetch_is_preferred():
@@ -1450,6 +1936,134 @@ def test_equivalent_reordered_inputs_produce_identical_complete_results():
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["result"] == second.json()["result"]
+
+
+def test_bounded_exhaustive_reordered_inputs_preserve_plan_identity():
+    runtime = _start_runtime()
+    scope = _scope(
+        source_ids=["source-a"],
+        source_categories=["records", "maintenance"],
+    )
+    inventory = [
+        _source(
+            "source-outside",
+            categories=["other", "reference"],
+            capabilities=["exact_fetch", "targeted_retrieval"],
+            authority_role="supplemental",
+        ),
+        _source(
+            "source-a",
+            categories=["maintenance", "records"],
+            capabilities=["context_expansion", "targeted_retrieval"],
+        ),
+    ]
+    first = _compile(
+        runtime,
+        task_shape="bounded_exhaustive_review",
+        declared_scope=scope,
+        source_inventory=inventory,
+    )
+    second = _compile(
+        runtime,
+        task_shape="bounded_exhaustive_review",
+        declared_scope={
+            **scope,
+            "source_categories": list(reversed(scope["source_categories"])),
+        },
+        source_inventory=[
+            {
+                **source,
+                "source_categories": list(reversed(source["source_categories"])),
+                "capabilities": list(reversed(source["capabilities"])),
+            }
+            for source in reversed(inventory)
+        ],
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["result"]["plan_status"] == "ready"
+    assert first.json()["result"] == second.json()["result"]
+
+
+@pytest.mark.parametrize(
+    ("scope", "inventory"),
+    [
+        (
+            _scope(source_ids=["source-a"], inventory_status="partial"),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                )
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                    authority_role="unknown",
+                )
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "exact_fetch"],
+                )
+            ],
+        ),
+        (
+            _scope(source_ids=["source-a", "source-b"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+                _source(
+                    "source-b",
+                    capabilities=["targeted_retrieval", "context_expansion"],
+                ),
+            ],
+        ),
+    ],
+    ids=[
+        "inventory-status",
+        "authority",
+        "capability",
+        "declared-scope",
+    ],
+)
+def test_bounded_exhaustive_material_changes_affect_plan_identity(
+    scope: dict[str, object],
+    inventory: list[dict[str, object]],
+):
+    runtime = _start_runtime()
+    ready = _compile(
+        runtime,
+        task_shape="bounded_exhaustive_review",
+        declared_scope=_scope(source_ids=["source-a"]),
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["targeted_retrieval", "context_expansion"],
+            )
+        ],
+    ).json()["result"]
+    changed = _compile(
+        runtime,
+        task_shape="bounded_exhaustive_review",
+        declared_scope=scope,
+        source_inventory=inventory,
+    ).json()["result"]
+
+    assert ready["plan_status"] == "ready"
+    assert changed["plan_status"] == "unsupported"
+    assert ready["plan_id"] != changed["plan_id"]
 
 
 def test_execution_readiness_changes_plan_identity_truthfully():
