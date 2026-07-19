@@ -285,6 +285,7 @@ def _normal_chat_execution_supported(
     *,
     task_shape: str,
     scope: EvidenceDeclaredScope,
+    inventory: list[EvidenceSourceDescriptor],
     eligible: list[EvidenceSourceDescriptor],
     strategy: EvidenceAcquisitionStrategy | None,
 ) -> bool:
@@ -312,6 +313,30 @@ def _normal_chat_execution_supported(
             and 2 <= len(eligible) <= 8
             and _all_have_capability(eligible, "targeted_retrieval")
             and _all_have_capability(eligible, "context_expansion")
+        )
+
+    if task_shape == "bounded_exhaustive_review":
+        scoped_inventory = [
+            source
+            for source in inventory
+            if _within_declared_universe(source, scope)
+        ]
+        if (
+            strategy != "hybrid"
+            or bool(scope.exact_source_refs)
+            or scope.inventory_status != "complete_for_declared_scope"
+            or len(scoped_inventory) != 1
+            or len(eligible) != 1
+        ):
+            return False
+        scoped_source = scoped_inventory[0]
+        eligible_source = eligible[0]
+        return bool(
+            scoped_source.source_id == eligible_source.source_id
+            and scoped_source.availability == "available"
+            and scoped_source.authority_role == "authoritative"
+            and "targeted_retrieval" in scoped_source.capabilities
+            and "context_expansion" in scoped_source.capabilities
         )
 
     return False
@@ -590,6 +615,7 @@ def compile_evidence_plan(
     execution_supported = _normal_chat_execution_supported(
         task_shape=body.task_shape,
         scope=scope,
+        inventory=inventory,
         eligible=eligible,
         strategy=strategy,
     )
