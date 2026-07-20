@@ -136,6 +136,7 @@ RuntimeEventType = Literal[
     "evidence_shape_derived",
     "evidence_plan_compiled",
     "evidence_sufficiency_evaluated",
+    "evidence_next_step_selected",
 ]
 
 
@@ -975,6 +976,156 @@ class EvidencePlanCompileResponse(BaseModel):
     runtime_session_id: EvidenceSufficiencyIdentifier
     runtime_turn_id: EvidenceSufficiencyIdentifier
     result: EvidencePlanResult
+
+
+EvidenceNextStep = Literal[
+    "answer_within_declared_scope",
+    "provide_qualified_partial_answer",
+    "perform_additional_acquisition",
+    "ask_narrow_clarification",
+    "disclose_unexamined_scope",
+    "withhold_unsupported_conclusion",
+]
+EvidenceConclusionDisposition = Literal[
+    "bounded_conclusion_allowed",
+    "qualified_partial_only",
+    "requested_conclusion_withheld",
+]
+EvidenceProviderDisposition = Literal["allowed", "blocked"]
+EvidenceReacquisitionGuard = Literal[
+    "not_applicable",
+    "changed_premise_allowed",
+    "unchanged_premise_blocked",
+    "premise_already_attempted",
+]
+EvidenceClarificationTarget = Literal[
+    "question_scope",
+    "source_scope",
+    "exact_reference",
+    "time_scope",
+    "version_scope",
+    "domain_scope",
+    "project_scope",
+]
+EvidenceNextStepReasonCode = Literal[
+    "declared_scope_sufficient",
+    "optional_limitations_remain",
+    "material_uncertainty_requires_clarification",
+    "changed_acquisition_premise_available",
+    "unchanged_acquisition_premise",
+    "acquisition_premise_already_selected",
+    "substantive_partial_evidence_available",
+    "unexamined_material_scope",
+    "unsupported_conclusion_withheld",
+]
+
+
+class EvidenceAcquisitionPremise(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_anchor_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ]
+    task_shape: EvidenceTaskShape
+    declared_scope: EvidenceDeclaredScope
+    source_inventory: list[EvidenceSourceDescriptor] = Field(max_length=32)
+    selected_strategies: list[EvidenceAcquisitionStrategy] = Field(max_length=5)
+
+    @model_validator(mode="after")
+    def validate_unique_premise_values(self) -> EvidenceAcquisitionPremise:
+        source_ids = [source.source_id for source in self.source_inventory]
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("duplicate_source_descriptor")
+        if len(set(self.selected_strategies)) != len(self.selected_strategies):
+            raise ValueError("duplicate_acquisition_strategy")
+        return self
+
+
+class EvidenceNextStepSelectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: EvidenceSufficiencyIdentifier
+    owner_id: EvidenceSufficiencyIdentifier
+    conversation_id: EvidenceSufficiencyIdentifier
+    surface: EvidenceSufficiencySurface
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    evaluation_id: EvidenceSufficiencyIdentifier
+    evidence_plan_id: EvidenceSufficiencyIdentifier
+    acquisition_manifest_id: EvidenceSufficiencyIdentifier
+    evaluated_requirements: list[EvidenceRequirementEvaluation] = Field(
+        min_length=1,
+        max_length=32,
+    )
+    current_premise: EvidenceAcquisitionPremise
+    proposed_acquisition_premise: EvidenceAcquisitionPremise | None = None
+    clarification_target: EvidenceClarificationTarget | None = None
+
+    @model_validator(mode="after")
+    def validate_next_step_inputs(self) -> EvidenceNextStepSelectRequest:
+        requirement_ids = [
+            requirement.requirement_id for requirement in self.evaluated_requirements
+        ]
+        if len(set(requirement_ids)) != len(requirement_ids):
+            raise ValueError("duplicate_evidence_requirement")
+        if (
+            self.proposed_acquisition_premise is not None
+            and self.clarification_target is not None
+        ):
+            raise ValueError("conflicting_next_step_inputs")
+        return self
+
+
+class EvidenceNextStepResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selection_id: EvidenceSufficiencyIdentifier
+    evaluation_id: EvidenceSufficiencyIdentifier
+    evidence_plan_id: EvidenceSufficiencyIdentifier
+    acquisition_manifest_id: EvidenceSufficiencyIdentifier
+    task_shape: EvidenceTaskShape
+    sufficiency_status: EvidenceSufficiencyStatus
+    selected_next_step: EvidenceNextStep
+    conclusion_disposition: EvidenceConclusionDisposition
+    provider_disposition: EvidenceProviderDisposition
+    current_premise_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ]
+    proposed_premise_digest: Annotated[
+        str,
+        Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+    ] | None = None
+    reacquisition_guard: EvidenceReacquisitionGuard
+    clarification_target: EvidenceClarificationTarget | None = None
+    unresolved_material_requirement_ids: list[EvidenceSufficiencyIdentifier] = Field(
+        max_length=32
+    )
+    reason_codes: list[EvidenceNextStepReasonCode] = Field(max_length=4)
+    user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+
+    @model_validator(mode="after")
+    def validate_deterministic_result_lists(self) -> EvidenceNextStepResult:
+        if self.unresolved_material_requirement_ids != sorted(
+            set(self.unresolved_material_requirement_ids)
+        ):
+            raise ValueError("unordered_unresolved_material_requirements")
+        if len(set(self.reason_codes)) != len(self.reason_codes):
+            raise ValueError("duplicate_next_step_reason_code")
+        return self
+
+
+class EvidenceNextStepSelectResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: EvidenceSufficiencyIdentifier
+    owner_id: EvidenceSufficiencyIdentifier
+    conversation_id: EvidenceSufficiencyIdentifier
+    surface: EvidenceSufficiencySurface
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    result: EvidenceNextStepResult
 
 
 PrivacySurfaceCategory = Literal[

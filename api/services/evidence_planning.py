@@ -14,6 +14,7 @@ from models import (
     EvidencePlanStatus,
     EvidenceRequirement,
     EvidenceSourceDescriptor,
+    EvidenceTaskShape,
 )
 from services.runtime_state import (
     record_runtime_event,
@@ -113,6 +114,34 @@ def _normalized_inventory(
         for source in inventory
     ]
     return sorted(normalized, key=lambda source: source.source_id)
+
+
+def evidence_acquisition_premise_digest(
+    *,
+    question_anchor_digest: str,
+    task_shape: EvidenceTaskShape,
+    declared_scope: EvidenceDeclaredScope,
+    source_inventory: list[EvidenceSourceDescriptor],
+    selected_strategies: list[EvidenceAcquisitionStrategy],
+) -> str:
+    scope = _normalized_scope(declared_scope)
+    inventory = _normalized_inventory(source_inventory)
+    material = {
+        "question_anchor_digest": question_anchor_digest,
+        "task_shape": task_shape,
+        "declared_scope": scope.model_dump(mode="json"),
+        "source_inventory": [
+            source.model_dump(mode="json") for source in inventory
+        ],
+        "selected_strategies": sorted(selected_strategies),
+    }
+    encoded = json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return f"sha256:{sha256(encoded.encode('utf-8')).hexdigest()}"
 
 
 def _within_declared_universe(
@@ -683,6 +712,13 @@ def compile_evidence_plan(
         limitation_codes=limitation_codes,
         user_safe_summary=_safe_summary(status),
     )
+    acquisition_premise_digest = evidence_acquisition_premise_digest(
+        question_anchor_digest=result.question_anchor_digest,
+        task_shape=result.task_shape,
+        declared_scope=scope,
+        source_inventory=inventory,
+        selected_strategies=result.selected_strategies,
+    )
 
     record_runtime_event(
         runtime_session_id=body.runtime_session_id,
@@ -694,6 +730,7 @@ def compile_evidence_plan(
             "runtime_turn_id": body.runtime_turn_id,
             "plan_id": result.plan_id,
             "question_anchor_digest": result.question_anchor_digest,
+            "acquisition_premise_digest": acquisition_premise_digest,
             "task_shape": result.task_shape,
             "plan_status": result.plan_status,
             "completeness_expectation": result.completeness_expectation,

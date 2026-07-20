@@ -21,6 +21,8 @@ from models import (
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
     CompanionProfileActiveResponse,
+    EvidenceNextStepSelectRequest,
+    EvidenceNextStepSelectResponse,
     EvidencePlanCompileRequest,
     EvidencePlanCompileResponse,
     EvidenceShapeDeriveRequest,
@@ -106,6 +108,7 @@ from services.companion_policy import (
     resolve_interaction_contract,
     resolve_scene,
 )
+from services.evidence_next_steps import select_evidence_next_step
 from services.evidence_planning import compile_evidence_plan
 from services.evidence_shape import derive_evidence_shape
 from services.evidence_sufficiency import evaluate_evidence_sufficiency
@@ -233,6 +236,18 @@ _EVIDENCE_SUFFICIENCY_ERROR_STATUS = {
     "runtime_turn_session_mismatch": 400,
     "runtime_session_not_found": 404,
     "runtime_turn_not_found": 404,
+}
+
+_EVIDENCE_NEXT_STEP_ERROR_STATUS = {
+    "runtime_session_mismatch": 400,
+    "runtime_turn_session_mismatch": 400,
+    "evidence_sufficiency_association_mismatch": 400,
+    "evidence_sufficiency_event_invalid": 400,
+    "evaluated_requirements_mismatch": 400,
+    "current_acquisition_premise_mismatch": 400,
+    "runtime_session_not_found": 404,
+    "runtime_turn_not_found": 404,
+    "evidence_sufficiency_evaluation_not_found": 404,
 }
 
 _EVIDENCE_PLANNING_ERROR_STATUS = {
@@ -481,6 +496,22 @@ async def runtime_evidence_sufficiency_evaluate(
         return evaluate_evidence_sufficiency(body)
     except RuntimeError as exc:
         error = _bounded_http_error(exc, _EVIDENCE_SUFFICIENCY_ERROR_STATUS)
+        if error is not None:
+            raise error from exc
+        raise
+
+
+@app.post(
+    "/v1/runtime/evidence-next-steps/select",
+    response_model=EvidenceNextStepSelectResponse,
+)
+async def runtime_evidence_next_step_select(
+    body: EvidenceNextStepSelectRequest,
+) -> EvidenceNextStepSelectResponse:
+    try:
+        return select_evidence_next_step(body)
+    except RuntimeError as exc:
+        error = _bounded_http_error(exc, _EVIDENCE_NEXT_STEP_ERROR_STATUS)
         if error is not None:
             raise error from exc
         raise

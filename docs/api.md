@@ -41,6 +41,7 @@ state and overlays are operational context, not canonical durable memory.
 | Evidence shape derivation | `POST /v1/runtime/evidence-shapes/derive` |
 | Evidence planning | `POST /v1/runtime/evidence-plans/compile` |
 | Evidence sufficiency | `POST /v1/runtime/evidence-sufficiency/evaluate` |
+| Evidence next-step selection | `POST /v1/runtime/evidence-next-steps/select` |
 | Runtime identity | `POST /v1/runtime/identity/resolve` |
 
 These evaluators return typed, bounded decisions for the current context. When
@@ -91,6 +92,45 @@ the scope is limited, insufficient, or unknown. It does not derive the evidence
 plan, perform retrieval, verify source records, persist an acquisition manifest,
 call a model provider, generate the final answer, or enforce the constraints in
 the final answer path.
+
+Evidence next-step selection is a separate policy operation over a retained
+sufficiency evaluation. The caller supplies the exact evaluated requirements,
+and the runtime associates their canonical digest with the retained evaluation
+event before using that event's status, task shape, and answer constraints. The
+selector does not accept caller-selected sufficiency status, provider permission,
+conclusion disposition, or next step.
+
+An acquisition premise consists only of the normalized question-anchor digest,
+task shape, declared evidence scope, source inventory, and selected strategies.
+Request, session, turn, plan, manifest, and evaluation identifiers are excluded,
+so equivalent premises remain stable across turns while material question,
+scope, inventory, availability, authority, capability, or strategy changes
+produce a different digest. Evidence planning retains this privacy-safe premise
+digest on the compiled-plan event without adding it to the public planning
+response. Next-step selection requires the caller's current premise to match
+that retained digest, so callers cannot redefine the premise already attempted.
+Only a proposed premise that differs from the actual retained plan premise can
+authorize more acquisition.
+
+Sufficient evidence permits an answer within the declared scope. Optional
+limitations permit a qualified partial answer without requiring more
+acquisition. For insufficient or unknown evidence, a narrow clarification is
+selected only for missing or unknown material facts. Additional acquisition is
+selected only for a structurally changed premise: an unchanged premise is
+blocked immediately, and a changed premise already selected in the same runtime
+session is not selected again. A qualified partial answer requires delivered
+context plus substantive satisfied or partial evidence; administrative
+conditions alone are insufficient. Remaining scope gaps select bounded
+unexamined-scope disclosure, while other unsupported conclusions are withheld.
+
+Selections are deterministic and idempotent. Their retained runtime events
+contain association identifiers, premise digests, bounded dispositions, counts,
+guards, and reason codes, but not source identifiers, exact references, premise
+contents, provider text, or evidence content. Cognitive Runtime selects policy;
+it does not execute acquisition, call a provider, or enforce the result in the
+answer path. The public evidence-planning and evidence-sufficiency response
+shapes remain unchanged; only privacy-safe association digests are added to
+retained events.
 
 ## Relationships and context
 

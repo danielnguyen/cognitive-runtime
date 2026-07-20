@@ -506,6 +506,7 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
         "acquisition_manifest_id",
         "task_shape",
         "sufficiency_status",
+        "evaluated_requirements_digest",
         "total_requirement_count",
         "material_requirement_count",
         "optional_requirement_count",
@@ -533,6 +534,8 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
     assert payload["satisfied_requirement_count"] == 0
     assert payload["missing_requirement_count"] == 0
     assert payload["non_satisfactory_requirement_count"] == 1
+    assert payload["evaluated_requirements_digest"].startswith("sha256:")
+    assert len(payload["evaluated_requirements_digest"]) == 71
 
     serialized = json.dumps(payload, sort_keys=True).lower()
     for excluded in (

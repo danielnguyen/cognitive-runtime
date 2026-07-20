@@ -85,6 +85,27 @@ def _evaluated_requirements(
     ]
 
 
+def evaluated_requirements_digest(
+    evaluations: list[EvidenceRequirementEvaluation],
+) -> str:
+    normalized = sorted(
+        evaluations,
+        key=lambda item: (
+            item.requirement_id,
+            item.requirement_kind,
+            item.criticality,
+            item.effective_outcome,
+        ),
+    )
+    encoded = json.dumps(
+        [evaluation.model_dump(mode="json") for evaluation in normalized],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return f"sha256:{sha256(encoded.encode('utf-8')).hexdigest()}"
+
+
 def _sufficiency_status(
     evaluations: list[EvidenceRequirementEvaluation],
 ) -> EvidenceSufficiencyStatus:
@@ -251,6 +272,7 @@ def evaluate_evidence_sufficiency(
             "acquisition_manifest_id": body.acquisition_manifest_id,
             "task_shape": result.task_shape,
             "sufficiency_status": result.sufficiency_status,
+            "evaluated_requirements_digest": evaluated_requirements_digest(evaluations),
             "total_requirement_count": len(evaluations),
             "material_requirement_count": sum(
                 item.criticality == "material" for item in evaluations
