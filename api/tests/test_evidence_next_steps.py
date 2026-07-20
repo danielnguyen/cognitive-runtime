@@ -9,18 +9,28 @@ import pytest
 from fastapi.testclient import TestClient
 from main import app
 from models import EvidenceAcquisitionPremise
-from services.evidence_next_steps import evidence_acquisition_premise_digest
+from services import evidence_next_steps
+from services.evidence_planning import evidence_acquisition_premise_digest
 
 client = TestClient(app)
 _runtime_counter = count()
+_DEFAULT_QUESTION = "What evidence supports the conclusion?"
 
 
 def _question_digest(value: str) -> str:
     return f"sha256:{sha256(value.encode('utf-8')).hexdigest()}"
 
 
-def _start_runtime() -> dict[str, str]:
+def _start_runtime(
+    *,
+    question_anchor: str = _DEFAULT_QUESTION,
+    premise: dict[str, object] | None = None,
+) -> dict[str, object]:
     ordinal = next(_runtime_counter)
+    planned_premise = copy.deepcopy(premise or _premise(question=question_anchor))
+    assert planned_premise["question_anchor_digest"] == _question_digest(
+        question_anchor
+    )
     response = client.post(
         "/v1/runtime/turns/start",
         json={
@@ -32,16 +42,40 @@ def _start_runtime() -> dict[str, str]:
     )
     assert response.status_code == 200
     body = response.json()
-    return {
+    scope: dict[str, object] = {
         "request_id": f"evaluate-{ordinal}",
         "owner_id": f"owner-{ordinal}",
         "conversation_id": f"conversation-{ordinal}",
         "surface": "web",
         "runtime_session_id": body["runtime_session"]["runtime_session_id"],
         "runtime_turn_id": body["runtime_turn"]["runtime_turn_id"],
-        "evidence_plan_id": f"plan-{ordinal}",
         "acquisition_manifest_id": f"manifest-{ordinal}",
     }
+    plan_response = client.post(
+        "/v1/runtime/evidence-plans/compile",
+        json={
+            "request_id": f"compile-{ordinal}",
+            "owner_id": scope["owner_id"],
+            "conversation_id": scope["conversation_id"],
+            "surface": scope["surface"],
+            "runtime_session_id": scope["runtime_session_id"],
+            "runtime_turn_id": scope["runtime_turn_id"],
+            "question_anchor": question_anchor,
+            "task_shape": planned_premise["task_shape"],
+            "declared_scope": planned_premise["declared_scope"],
+            "source_inventory": planned_premise["source_inventory"],
+        },
+    )
+    assert plan_response.status_code == 200
+    plan_result = plan_response.json()["result"]
+    current_premise = {
+        **planned_premise,
+        "question_anchor_digest": plan_result["question_anchor_digest"],
+        "selected_strategies": plan_result["selected_strategies"],
+    }
+    scope["evidence_plan_id"] = plan_result["plan_id"]
+    scope["_current_premise"] = current_premise
+    return scope
 
 
 def _requirement(
@@ -62,7 +96,7 @@ def _fact(requirement_id: str, outcome: str) -> dict[str, str]:
 
 
 def _evaluate(
-    scope: dict[str, str],
+    scope: dict[str, object],
     requirements: list[dict[str, str]],
     facts: list[dict[str, str]],
     *,
@@ -71,7 +105,19 @@ def _evaluate(
     response = client.post(
         "/v1/runtime/evidence-sufficiency/evaluate",
         json={
-            **scope,
+            **{
+                key: scope[key]
+                for key in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "surface",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                    "evidence_plan_id",
+                    "acquisition_manifest_id",
+                )
+            },
             "task_shape": task_shape,
             "declared_requirements": requirements,
             "acquisition_facts": facts,
@@ -103,7 +149,7 @@ def _source(
 
 def _premise(
     *,
-    question: str = "What evidence supports the conclusion?",
+    question: str = _DEFAULT_QUESTION,
     task_shape: str = "targeted_lookup",
     source_ids: list[str] | None = None,
     source_categories: list[str] | None = None,
@@ -130,8 +176,58 @@ def _premise(
     }
 
 
+def _premise_digest(premise: dict[str, object]) -> str:
+    model = EvidenceAcquisitionPremise.model_validate(premise)
+    return evidence_acquisition_premise_digest(
+        question_anchor_digest=model.question_anchor_digest,
+        task_shape=model.task_shape,
+        declared_scope=model.declared_scope,
+        source_inventory=model.source_inventory,
+        selected_strategies=model.selected_strategies,
+    )
+
+
+def _mutated_premise(
+    premise: dict[str, object],
+    mutation: str,
+) -> dict[str, object]:
+    changed = copy.deepcopy(premise)
+    if mutation == "question":
+        changed["question_anchor_digest"] = _question_digest("Different question")
+    elif mutation == "task_shape":
+        changed["task_shape"] = "cross_source_comparison"
+    elif mutation == "source_ids":
+        changed["declared_scope"]["source_ids"] = ["source-a"]
+    elif mutation == "source_categories":
+        changed["declared_scope"]["source_categories"] = ["other"]
+    elif mutation == "exact_reference":
+        changed["declared_scope"]["exact_source_refs"] = [
+            {"source_ref": "sheet:a:2", "source_id": "source-a"}
+        ]
+    elif mutation == "inventory_status":
+        changed["declared_scope"]["inventory_status"] = "partial"
+    elif mutation in {
+        "time_scope",
+        "version_scope",
+        "domain_scope",
+        "project_scope",
+    }:
+        changed["declared_scope"][f"{mutation}_ref"] = f"{mutation}-ref"
+    elif mutation == "descriptor_categories":
+        changed["source_inventory"][0]["source_categories"] = ["other"]
+    elif mutation == "availability":
+        changed["source_inventory"][0]["availability"] = "unavailable"
+    elif mutation == "authority":
+        changed["source_inventory"][0]["authority_role"] = "supplemental"
+    elif mutation == "capability":
+        changed["source_inventory"][0]["capabilities"] = ["targeted_retrieval"]
+    else:
+        changed["selected_strategies"] = ["hybrid"]
+    return changed
+
+
 def _next_step_payload(
-    scope: dict[str, str],
+    scope: dict[str, object],
     evaluation: dict[str, object],
     *,
     current_premise: dict[str, object] | None = None,
@@ -140,11 +236,24 @@ def _next_step_payload(
     result = evaluation["result"]
     assert isinstance(result, dict)
     payload: dict[str, object] = {
-        **scope,
+        **{
+            key: scope[key]
+            for key in (
+                "request_id",
+                "owner_id",
+                "conversation_id",
+                "surface",
+                "runtime_session_id",
+                "runtime_turn_id",
+                "evidence_plan_id",
+                "acquisition_manifest_id",
+            )
+        },
         "request_id": f"select-{scope['request_id']}",
         "evaluation_id": result["evaluation_id"],
         "evaluated_requirements": result["evaluated_requirements"],
-        "current_premise": current_premise or _premise(),
+        "current_premise": current_premise
+        or copy.deepcopy(scope["_current_premise"]),
     }
     payload.update(overrides)
     return payload
@@ -154,13 +263,23 @@ def _select(payload: dict[str, object]):
     return client.post("/v1/runtime/evidence-next-steps/select", json=payload)
 
 
-def _selection_events(runtime_session_id: str) -> list[dict[str, object]]:
+def _selection_events(runtime_session_id: object) -> list[dict[str, object]]:
     response = client.get(f"/v1/runtime/sessions/{runtime_session_id}")
     assert response.status_code == 200
     return [
         event
         for event in response.json()["events"]
         if event["event_type"] == "evidence_next_step_selected"
+    ]
+
+
+def _plan_events(runtime_session_id: object) -> list[dict[str, object]]:
+    response = client.get(f"/v1/runtime/sessions/{runtime_session_id}")
+    assert response.status_code == 200
+    return [
+        event
+        for event in response.json()["events"]
+        if event["event_type"] == "evidence_plan_compiled"
     ]
 
 
@@ -315,7 +434,7 @@ def test_unchanged_premise_blocks_additional_acquisition():
         [_requirement("failed", "targeted_evidence")],
         [_fact("failed", "failed")],
     )
-    premise = _premise()
+    premise = copy.deepcopy(scope["_current_premise"])
     response = _select(
         _next_step_payload(
             scope,
@@ -330,6 +449,9 @@ def test_unchanged_premise_blocks_additional_acquisition():
     assert result["selected_next_step"] != "perform_additional_acquisition"
     assert result["reacquisition_guard"] == "unchanged_premise_blocked"
     assert result["current_premise_digest"] == result["proposed_premise_digest"]
+    assert result["current_premise_digest"] == _plan_events(
+        scope["runtime_session_id"]
+    )[0]["event_payload_json"]["acquisition_premise_digest"]
 
 
 def test_changed_premise_is_selected_once_and_a_second_change_is_permitted():
@@ -442,69 +564,107 @@ def test_equivalent_reordered_premises_have_identical_digests():
         selected_strategies=["targeted_retrieval", "hybrid"],
     )
 
-    first_model = EvidenceAcquisitionPremise.model_validate(first)
-    second_model = EvidenceAcquisitionPremise.model_validate(second)
-    assert evidence_acquisition_premise_digest(first_model) == (
-        evidence_acquisition_premise_digest(second_model)
-    )
+    assert _premise_digest(first) == _premise_digest(second)
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
         "question",
-        "source_scope",
+        "task_shape",
+        "source_ids",
+        "source_categories",
         "exact_reference",
+        "inventory_status",
         "time_scope",
         "version_scope",
         "domain_scope",
         "project_scope",
-        "inventory",
+        "descriptor_categories",
         "availability",
         "authority",
         "capability",
         "strategy",
-        "task_shape",
     ],
 )
 def test_material_premise_changes_change_the_digest(mutation: str):
     original = _premise()
-    changed = copy.deepcopy(original)
-    if mutation == "question":
-        changed["question_anchor_digest"] = _question_digest("Different question")
-    elif mutation == "source_scope":
-        changed["declared_scope"]["source_ids"] = ["source-a"]
-    elif mutation == "exact_reference":
-        changed["declared_scope"]["exact_source_refs"] = [
-            {"source_ref": "sheet:a:2", "source_id": "source-a"}
-        ]
-    elif mutation.endswith("_scope"):
-        changed["declared_scope"][f"{mutation}_ref"] = f"{mutation}-ref"
-    elif mutation == "inventory":
-        changed["declared_scope"]["inventory_status"] = "partial"
-    elif mutation == "availability":
-        changed["source_inventory"][0]["availability"] = "unavailable"
-    elif mutation == "authority":
-        changed["source_inventory"][0]["authority_role"] = "supplemental"
-    elif mutation == "capability":
-        changed["source_inventory"][0]["capabilities"] = ["targeted_retrieval"]
-    elif mutation == "strategy":
-        changed["selected_strategies"] = ["hybrid"]
-    else:
-        changed["task_shape"] = "cross_source_comparison"
+    changed = _mutated_premise(original, mutation)
 
-    original_digest = evidence_acquisition_premise_digest(
-        EvidenceAcquisitionPremise.model_validate(original)
-    )
-    changed_digest = evidence_acquisition_premise_digest(
-        EvidenceAcquisitionPremise.model_validate(changed)
-    )
+    original_digest = _premise_digest(original)
+    changed_digest = _premise_digest(changed)
     assert changed_digest != original_digest
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "question",
+        "task_shape",
+        "source_ids",
+        "source_categories",
+        "exact_reference",
+        "inventory_status",
+        "time_scope",
+        "version_scope",
+        "domain_scope",
+        "project_scope",
+        "descriptor_categories",
+        "availability",
+        "authority",
+        "capability",
+        "strategy",
+    ],
+)
+def test_current_premise_mutation_fails_compiled_plan_association(mutation: str):
+    scope = _start_runtime()
+    evaluation = _evaluate(
+        scope,
+        [_requirement("failed", "targeted_evidence")],
+        [_fact("failed", "failed")],
+    )
+    claimed_current = _mutated_premise(scope["_current_premise"], mutation)
+
+    response = _select(
+        _next_step_payload(
+            scope,
+            evaluation,
+            current_premise=claimed_current,
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "current_acquisition_premise_mismatch"}
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
+def test_caller_cannot_relabel_attempted_premise_as_changed():
+    scope = _start_runtime()
+    evaluation = _evaluate(
+        scope,
+        [_requirement("failed", "targeted_evidence")],
+        [_fact("failed", "failed")],
+    )
+    actual_premise = copy.deepcopy(scope["_current_premise"])
+    claimed_current = _mutated_premise(actual_premise, "question")
+
+    response = _select(
+        _next_step_payload(
+            scope,
+            evaluation,
+            current_premise=claimed_current,
+            proposed_acquisition_premise=actual_premise,
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "current_acquisition_premise_mismatch"}
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
 def test_association_identifiers_do_not_enter_premise_digest():
-    premise = EvidenceAcquisitionPremise.model_validate(_premise())
-    first = evidence_acquisition_premise_digest(premise)
+    premise = _premise()
+    first = _premise_digest(premise)
 
     association_only = {
         "request_id": "request-other",
@@ -515,8 +675,8 @@ def test_association_identifiers_do_not_enter_premise_digest():
         "evaluation_id": "evaluation-other",
     }
 
-    assert first == evidence_acquisition_premise_digest(premise)
-    assert not set(association_only) & set(premise.model_dump())
+    assert first == _premise_digest(premise)
+    assert not set(association_only) & set(premise)
 
 
 def test_safe_partial_answer_requires_delivered_substantive_evidence():
@@ -632,6 +792,75 @@ def test_unknown_or_mismatched_sufficiency_association_fails_boundedly(
     assert _selection_events(scope["runtime_session_id"]) == []
 
 
+@pytest.mark.parametrize("plan_id_source", ["unknown", "other-session"])
+def test_unknown_or_mismatched_plan_event_fails_boundedly(plan_id_source: str):
+    scope = _start_runtime()
+    mismatched_scope = copy.deepcopy(scope)
+    if plan_id_source == "unknown":
+        mismatched_scope["evidence_plan_id"] = "unknown-plan"
+    else:
+        mismatched_scope["evidence_plan_id"] = _start_runtime()["evidence_plan_id"]
+    evaluation = _evaluate(
+        mismatched_scope,
+        [_requirement("failed", "targeted_evidence")],
+        [_fact("failed", "failed")],
+    )
+
+    response = _select(_next_step_payload(mismatched_scope, evaluation))
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "current_acquisition_premise_mismatch"}
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
+@pytest.mark.parametrize(
+    "event_mutation",
+    ["missing_digest", "malformed_digest", "mismatched_task_shape"],
+)
+def test_invalid_plan_event_fails_before_selection(
+    event_mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    scope = _start_runtime()
+    evaluation = _evaluate(
+        scope,
+        [_requirement("failed", "targeted_evidence")],
+        [_fact("failed", "failed")],
+    )
+    original_get_runtime_session = evidence_next_steps.get_runtime_session
+
+    def _altered_diagnostics(runtime_session_id: str):
+        diagnostics = original_get_runtime_session(runtime_session_id)
+        for event in diagnostics.events:
+            if (
+                event.event_type == "evidence_plan_compiled"
+                and event.event_payload_json.get("plan_id")
+                == scope["evidence_plan_id"]
+            ):
+                if event_mutation == "missing_digest":
+                    event.event_payload_json.pop("acquisition_premise_digest")
+                elif event_mutation == "malformed_digest":
+                    event.event_payload_json["acquisition_premise_digest"] = (
+                        "sha256:not-a-digest"
+                    )
+                else:
+                    event.event_payload_json["task_shape"] = (
+                        "cross_source_comparison"
+                    )
+        return diagnostics
+
+    monkeypatch.setattr(
+        evidence_next_steps,
+        "get_runtime_session",
+        _altered_diagnostics,
+    )
+    response = _select(_next_step_payload(scope, evaluation))
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "current_acquisition_premise_mismatch"}
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
 def test_mismatched_turn_and_runtime_scope_fail_boundedly():
     scope = _start_runtime()
     evaluation = _evaluate(
@@ -735,16 +964,7 @@ def test_conflicting_inputs_and_private_premise_fields_are_rejected():
 
 
 def test_event_is_structural_private_and_deterministic_for_reordered_inputs():
-    scope = _start_runtime()
-    evaluation = _evaluate(
-        scope,
-        [
-            _requirement("scope", "complete_scope_coverage"),
-            _requirement("delivery", "context_delivery"),
-        ],
-        [_fact("scope", "failed"), _fact("delivery", "satisfied")],
-    )
-    first_premise = _premise(
+    planned_premise = _premise(
         source_categories=["private-category", "records"],
         source_inventory=[
             _source(
@@ -753,6 +973,16 @@ def test_event_is_structural_private_and_deterministic_for_reordered_inputs():
             )
         ],
     )
+    scope = _start_runtime(premise=planned_premise)
+    evaluation = _evaluate(
+        scope,
+        [
+            _requirement("scope", "complete_scope_coverage"),
+            _requirement("delivery", "context_delivery"),
+        ],
+        [_fact("scope", "failed"), _fact("delivery", "satisfied")],
+    )
+    first_premise = copy.deepcopy(scope["_current_premise"])
     second_premise = copy.deepcopy(first_premise)
     second_premise["declared_scope"]["source_categories"].reverse()
     second_premise["source_inventory"][0]["source_categories"].reverse()

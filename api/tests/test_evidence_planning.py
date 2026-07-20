@@ -2413,6 +2413,7 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
         "runtime_turn_id",
         "plan_id",
         "question_anchor_digest",
+        "acquisition_premise_digest",
         "task_shape",
         "plan_status",
         "completeness_expectation",
@@ -2445,6 +2446,8 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
         result["declared_requirements"]
     )
     assert payload["optional_requirement_count"] == 0
+    assert payload["acquisition_premise_digest"].startswith("sha256:")
+    assert len(payload["acquisition_premise_digest"]) == 71
 
     serialized = json.dumps(payload, sort_keys=True).lower()
     for excluded in (
@@ -2469,3 +2472,60 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
         "exception",
     ):
         assert excluded not in serialized
+
+
+def test_plan_premise_digest_is_stable_for_reordered_equivalent_inputs():
+    first = _compile(
+        _start_runtime(),
+        declared_scope=_scope(
+            source_ids=["source-b", "source-a"],
+            source_categories=["official", "records"],
+            exact_source_refs=[
+                _exact_ref("source-b", "item-b"),
+                _exact_ref("source-a", "item-a"),
+            ],
+        ),
+        source_inventory=[
+            _source(
+                "source-b",
+                categories=["official", "records"],
+                capabilities=["targeted_retrieval", "exact_fetch"],
+            ),
+            _source(
+                "source-a",
+                categories=["records", "official"],
+                capabilities=["exact_fetch", "targeted_retrieval"],
+            ),
+        ],
+    )
+    second = _compile(
+        _start_runtime(),
+        declared_scope=_scope(
+            source_ids=["source-a", "source-b"],
+            source_categories=["records", "official"],
+            exact_source_refs=[
+                _exact_ref("source-a", "item-a"),
+                _exact_ref("source-b", "item-b"),
+            ],
+        ),
+        source_inventory=[
+            _source(
+                "source-a",
+                categories=["official", "records"],
+                capabilities=["targeted_retrieval", "exact_fetch"],
+            ),
+            _source(
+                "source-b",
+                categories=["records", "official"],
+                capabilities=["exact_fetch", "targeted_retrieval"],
+            ),
+        ],
+    )
+
+    assert first.status_code == second.status_code == 200
+    first_event = _plan_events(first.json()["runtime_session_id"])[0]
+    second_event = _plan_events(second.json()["runtime_session_id"])[0]
+    assert first_event["event_payload_json"]["acquisition_premise_digest"] == (
+        second_event["event_payload_json"]["acquisition_premise_digest"]
+    )
+    assert "acquisition_premise_digest" not in first.json()["result"]

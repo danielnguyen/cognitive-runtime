@@ -21,6 +21,7 @@ from models import (
     EvidenceTaskShape,
     RuntimeEvent,
 )
+from services.evidence_planning import evidence_acquisition_premise_digest
 from services.evidence_sufficiency import evaluated_requirements_digest
 from services.runtime_state import (
     get_runtime_session,
@@ -88,11 +89,6 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
-def _sha256_digest(value: Any) -> str:
-    encoded = _canonical_json(value).encode("utf-8")
-    return f"sha256:{sha256(encoded).hexdigest()}"
-
-
 def _normalized_evaluations(
     evaluations: list[EvidenceRequirementEvaluation],
 ) -> list[EvidenceRequirementEvaluation]:
@@ -107,36 +103,14 @@ def _normalized_evaluations(
     )
 
 
-def _normalized_premise_material(premise: EvidenceAcquisitionPremise) -> dict[str, Any]:
-    declared_scope = premise.declared_scope.model_dump(mode="json")
-    declared_scope["source_ids"] = sorted(declared_scope["source_ids"])
-    declared_scope["source_categories"] = sorted(declared_scope["source_categories"])
-    declared_scope["exact_source_refs"] = sorted(
-        declared_scope["exact_source_refs"],
-        key=lambda reference: (reference["source_ref"], reference["source_id"]),
+def _premise_digest(premise: EvidenceAcquisitionPremise) -> str:
+    return evidence_acquisition_premise_digest(
+        question_anchor_digest=premise.question_anchor_digest,
+        task_shape=premise.task_shape,
+        declared_scope=premise.declared_scope,
+        source_inventory=premise.source_inventory,
+        selected_strategies=premise.selected_strategies,
     )
-
-    source_inventory = []
-    for source in premise.source_inventory:
-        normalized = source.model_dump(mode="json")
-        normalized["source_categories"] = sorted(normalized["source_categories"])
-        normalized["capabilities"] = sorted(normalized["capabilities"])
-        source_inventory.append(normalized)
-    source_inventory.sort(key=lambda source: source["source_id"])
-
-    return {
-        "question_anchor_digest": premise.question_anchor_digest,
-        "task_shape": premise.task_shape,
-        "declared_scope": declared_scope,
-        "source_inventory": source_inventory,
-        "selected_strategies": sorted(premise.selected_strategies),
-    }
-
-
-def evidence_acquisition_premise_digest(
-    premise: EvidenceAcquisitionPremise,
-) -> str:
-    return _sha256_digest(_normalized_premise_material(premise))
 
 
 def _selection_identity(
@@ -207,6 +181,39 @@ def _associated_sufficiency_event(
         or re.fullmatch(r"sha256:[0-9a-f]{64}", requirements_digest) is None
     ):
         raise RuntimeError("evidence_sufficiency_event_invalid")
+    return payload
+
+
+def _associated_plan_event(
+    events: list[RuntimeEvent],
+    body: EvidenceNextStepSelectRequest,
+    *,
+    task_shape: EvidenceTaskShape,
+) -> dict[str, Any]:
+    candidates = [
+        event
+        for event in events
+        if event.event_type == "evidence_plan_compiled"
+        and event.event_payload_json.get("plan_id") == body.evidence_plan_id
+    ]
+    matches = [
+        event
+        for event in candidates
+        if event.runtime_turn_id == body.runtime_turn_id
+        and event.event_payload_json.get("runtime_session_id")
+        == body.runtime_session_id
+        and event.event_payload_json.get("runtime_turn_id") == body.runtime_turn_id
+        and event.event_payload_json.get("task_shape") == task_shape
+    ]
+    if not matches:
+        raise RuntimeError("current_acquisition_premise_mismatch")
+    payload = matches[0].event_payload_json
+    premise_digest = payload.get("acquisition_premise_digest")
+    if (
+        not isinstance(premise_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", premise_digest) is None
+    ):
+        raise RuntimeError("current_acquisition_premise_mismatch")
     return payload
 
 
@@ -422,21 +429,22 @@ def select_evidence_next_step(
 
     task_shape = cast(EvidenceTaskShape, sufficiency_event["task_shape"])
     status = cast(EvidenceSufficiencyStatus, sufficiency_event["sufficiency_status"])
+    plan_event = _associated_plan_event(events, body, task_shape=task_shape)
     constraints = cast(
         list[EvidenceAnswerConstraint],
         sufficiency_event["answer_constraints"],
     )
-    if body.current_premise.task_shape != task_shape:
-        raise RuntimeError("current_acquisition_premise_mismatch")
     if status in {"insufficient", "unknown"} and (
         "withhold_unqualified_conclusion" not in constraints
         or "additional_acquisition_or_clarification_required" not in constraints
     ):
         raise RuntimeError("evidence_sufficiency_event_invalid")
 
-    current_premise_digest = evidence_acquisition_premise_digest(body.current_premise)
+    current_premise_digest = _premise_digest(body.current_premise)
+    if current_premise_digest != plan_event["acquisition_premise_digest"]:
+        raise RuntimeError("current_acquisition_premise_mismatch")
     supplied_proposed_premise_digest = (
-        evidence_acquisition_premise_digest(body.proposed_acquisition_premise)
+        _premise_digest(body.proposed_acquisition_premise)
         if body.proposed_acquisition_premise is not None
         else None
     )

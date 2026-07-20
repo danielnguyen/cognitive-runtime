@@ -105,7 +105,12 @@ task shape, declared evidence scope, source inventory, and selected strategies.
 Request, session, turn, plan, manifest, and evaluation identifiers are excluded,
 so equivalent premises remain stable across turns while material question,
 scope, inventory, availability, authority, capability, or strategy changes
-produce a different digest.
+produce a different digest. Evidence planning retains this privacy-safe premise
+digest on the compiled-plan event without adding it to the public planning
+response. Next-step selection requires the caller's current premise to match
+that retained digest, so callers cannot redefine the premise already attempted.
+Only a proposed premise that differs from the actual retained plan premise can
+authorize more acquisition.
 
 Sufficient evidence permits an answer within the declared scope. Optional
 limitations permit a qualified partial answer without requiring more
@@ -123,7 +128,9 @@ contain association identifiers, premise digests, bounded dispositions, counts,
 guards, and reason codes, but not source identifiers, exact references, premise
 contents, provider text, or evidence content. Cognitive Runtime selects policy;
 it does not execute acquisition, call a provider, or enforce the result in the
-answer path.
+answer path. The public evidence-planning and evidence-sufficiency response
+shapes remain unchanged; only privacy-safe association digests are added to
+retained events.
 
 ## Relationships and context
 
