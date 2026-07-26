@@ -399,15 +399,6 @@ def _history_policy_result(
         "confidence_band": confidence_band,
     }
 
-    if candidate.target_mode == "explicit_reference":
-        return HistoryFollowupPolicyResult(
-            status="explicit_reference",
-            history_lookup_allowed=False,
-            new_verification_allowed_after_history_resolution=False,
-            clarification_required=False,
-            reason_codes=["explicit_reference_routed"],
-            **common,
-        )
     if candidate.intent == "not_history_followup":
         return HistoryFollowupPolicyResult(
             status="not_applicable",
@@ -442,6 +433,15 @@ def _history_policy_result(
             new_verification_allowed_after_history_resolution=False,
             clarification_required=False,
             reason_codes=["classifier_confidence_rejected"],
+            **common,
+        )
+    if candidate.target_mode == "explicit_reference":
+        return HistoryFollowupPolicyResult(
+            status="explicit_reference",
+            history_lookup_allowed=False,
+            new_verification_allowed_after_history_resolution=False,
+            clarification_required=False,
+            reason_codes=["explicit_reference_routed"],
             **common,
         )
 

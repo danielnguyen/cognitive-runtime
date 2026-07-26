@@ -785,6 +785,115 @@ async def test_explicit_reference_is_routed_without_immediate_history_authority(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("source", "confidence"),
+    [("classifier", 0.99), ("deterministic", 1.0)],
+)
+async def test_not_history_precedes_explicit_reference_and_preserves_generic_intent(
+    source,
+    confidence,
+):
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id=f"rid-not-history-explicit-{source}",
+        current_user_text="rename this variable to count",
+        history_followup_candidate=_candidate(
+            source=source,
+            intent="not_history_followup",
+            confidence=confidence,
+            target_mode="explicit_reference",
+        ),
+    )
+
+    policy = result["history_followup_policy"]
+    assert policy["status"] == "not_applicable"
+    assert policy["history_lookup_allowed"] is False
+    assert policy["new_verification_allowed_after_history_resolution"] is False
+    assert policy["reason_codes"] == ["not_history_candidate"]
+    assert diagnostics["latest_turn"]["intent_class"] == "action_command"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "confidence"),
+    [("classifier", 0.99), ("deterministic", 1.0)],
+)
+async def test_ambiguity_precedes_explicit_reference_and_projects_clarification(
+    source,
+    confidence,
+):
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id=f"rid-ambiguous-explicit-{source}",
+        current_user_text="Can you explain that?",
+        history_followup_candidate=_candidate(
+            source=source,
+            intent="ambiguous_history_followup",
+            confidence=confidence,
+            target_mode="explicit_reference",
+        ),
+    )
+
+    policy = result["history_followup_policy"]
+    assert policy["status"] == "clarification_required"
+    assert policy["history_lookup_allowed"] is False
+    assert policy["new_verification_allowed_after_history_resolution"] is False
+    assert policy["clarification_required"] is True
+    assert policy["reason_codes"] == ["ambiguous_candidate"]
+    assert diagnostics["latest_turn"]["intent_class"] == (
+        "ambiguous_history_followup"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confidence", "status", "clarification_required", "reason_code"),
+    [
+        (0.599999, "rejected", False, "classifier_confidence_rejected"),
+        (
+            0.60,
+            "clarification_required",
+            True,
+            "classifier_confidence_requires_clarification",
+        ),
+        (
+            0.849999,
+            "clarification_required",
+            True,
+            "classifier_confidence_requires_clarification",
+        ),
+        (0.85, "explicit_reference", False, "explicit_reference_routed"),
+    ],
+)
+async def test_classifier_confidence_precedes_explicit_reference_target_mode(
+    confidence,
+    status,
+    clarification_required,
+    reason_code,
+):
+    response = await _post(
+        "/v1/runtime/interaction-governance/evaluate",
+        _base(
+            current_user_text="What did you check? Verify it again now.",
+            history_followup_candidate=_candidate(
+                source="classifier",
+                intent="acquisition_checked",
+                confidence=confidence,
+                target_mode="explicit_reference",
+                new_verification_requested=True,
+            ),
+        ),
+    )
+
+    assert response.status_code == 200
+    policy = response.json()["result"]["history_followup_policy"]
+    assert policy["status"] == status
+    assert policy["clarification_required"] is clarification_required
+    assert policy["history_lookup_allowed"] is False
+    assert policy["new_verification_requested"] is True
+    assert policy["new_verification_allowed_after_history_resolution"] is False
+    assert policy["reason_codes"] == [reason_code]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "intent",
     [
         "support_explanation",
