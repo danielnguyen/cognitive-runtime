@@ -247,6 +247,42 @@ InteractionGovernanceResponsePosture = Literal[
     "playful",
     "silent_or_minimal",
 ]
+HistoryFollowupCandidateSource = Literal["deterministic", "classifier"]
+HistoryFollowupIntent = Literal[
+    "not_history_followup",
+    "support_explanation",
+    "acquisition_checked",
+    "acquisition_coverage",
+    "acquisition_gaps",
+    "new_verification_request",
+    "ambiguous_history_followup",
+]
+HistoryFollowupTargetMode = Literal["immediate_previous", "explicit_reference"]
+HistoryFollowupPolicyStatus = Literal[
+    "not_applicable",
+    "accepted",
+    "clarification_required",
+    "rejected",
+    "explicit_reference",
+]
+HistoryFollowupExplanationKind = Literal["support", "acquisition"]
+HistoryFollowupAcquisitionQuestion = Literal["checked", "coverage", "gaps"]
+HistoryFollowupConfidenceBand = Literal[
+    "not_applicable",
+    "low",
+    "medium",
+    "high",
+]
+HistoryFollowupReasonCode = Literal[
+    "no_candidate",
+    "not_history_candidate",
+    "ambiguous_candidate",
+    "deterministic_candidate_accepted",
+    "classifier_candidate_accepted",
+    "classifier_confidence_requires_clarification",
+    "classifier_confidence_rejected",
+    "explicit_reference_routed",
+]
 MemoryHygieneFreshnessState = Literal[
     "active",
     "parked",
@@ -1223,6 +1259,33 @@ class PrivacyContextEvaluateResponse(BaseModel):
     result: PrivacyContextResult
 
 
+class HistoryFollowupCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source: HistoryFollowupCandidateSource
+    intent: HistoryFollowupIntent
+    confidence: float = Field(ge=0.0, le=1.0)
+    target_mode: HistoryFollowupTargetMode
+    new_verification_requested: bool
+
+    @model_validator(mode="after")
+    def validate_candidate_consistency(self):
+        if self.source == "deterministic" and self.confidence != 1.0:
+            raise ValueError("deterministic_candidate_requires_full_confidence")
+        if (
+            self.intent == "new_verification_request"
+            and not self.new_verification_requested
+        ):
+            raise ValueError("new_verification_intent_requires_explicit_request")
+        if (
+            self.intent
+            in {"not_history_followup", "ambiguous_history_followup"}
+            and self.new_verification_requested
+        ):
+            raise ValueError("non_actionable_history_intent_forbids_verification")
+        return self
+
+
 class InteractionGovernanceEvaluateRequest(BaseModel):
     request_id: str = Field(max_length=120)
     owner_id: str = Field(max_length=120)
@@ -1235,6 +1298,37 @@ class InteractionGovernanceEvaluateRequest(BaseModel):
     current_user_text: BoundedText | None = None
     recent_messages: list["InterruptMessage"] = Field(default_factory=list, max_length=12)
     surface_metadata_json: dict[str, Any] = Field(default_factory=dict)
+    history_followup_candidate: HistoryFollowupCandidate | None = None
+
+    @model_validator(mode="after")
+    def validate_history_candidate_has_current_user_turn(self):
+        if self.history_followup_candidate is None:
+            return self
+        if self.current_user_text is not None and self.current_user_text.strip():
+            return self
+        if any(
+            message.role == "user" and message.content.strip()
+            for message in reversed(self.recent_messages)
+        ):
+            return self
+        raise ValueError("history_followup_candidate_requires_current_user_turn")
+
+
+class HistoryFollowupPolicyResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: HistoryFollowupPolicyStatus
+    intent: HistoryFollowupIntent | None = None
+    candidate_source: HistoryFollowupCandidateSource | None = None
+    target_mode: HistoryFollowupTargetMode | None = None
+    explanation_kind: HistoryFollowupExplanationKind | None = None
+    acquisition_question: HistoryFollowupAcquisitionQuestion | None = None
+    history_lookup_allowed: bool
+    new_verification_requested: bool
+    new_verification_allowed_after_history_resolution: bool
+    clarification_required: bool
+    confidence_band: HistoryFollowupConfidenceBand
+    reason_codes: list[HistoryFollowupReasonCode] = Field(min_length=1, max_length=4)
 
 
 class InteractionGovernanceResult(BaseModel):
@@ -1251,6 +1345,7 @@ class InteractionGovernanceResult(BaseModel):
     response_posture: InteractionGovernanceResponsePosture
     confidence: float = Field(ge=0.0, le=1.0)
     reason_summary: list[BoundedLabel] = Field(default_factory=list, max_length=8)
+    history_followup_policy: HistoryFollowupPolicyResult
 
 
 class InteractionGovernanceEvaluateResponse(BaseModel):
