@@ -29,6 +29,11 @@ smoke:
 	  -H "Content-Type: application/json" \
 	  -d '{"request_id":"smoke-question","owner_id":"owner","conversation_id":"conv-smoke","surface":"dev","current_user_text":"What does this function do?","recent_messages":[]}' \
 	  | jq -e '.result.interaction_kind == "question" and .result.action_allowed == false' >/dev/null; \
+	echo "==> POST $$CR_BASE/v1/runtime/interaction-governance/evaluate (history follow-up candidate)"; \
+	curl -sS -X POST "$$CR_BASE/v1/runtime/interaction-governance/evaluate" \
+	  -H "Content-Type: application/json" \
+	  -d '{"request_id":"smoke-history-followup","owner_id":"owner","conversation_id":"conv-smoke","surface":"dev","current_user_text":"What was that based on?","recent_messages":[],"history_followup_candidate":{"source":"deterministic","intent":"support_explanation","confidence":1.0,"target_mode":"immediate_previous","new_verification_requested":false}}' \
+	  | jq -e '.result.interaction_kind == "question" and .result.history_followup_policy.status == "accepted" and .result.history_followup_policy.history_lookup_allowed == true and .result.history_followup_policy.new_verification_allowed_after_history_resolution == false' >/dev/null; \
 	echo "==> POST $$CR_BASE/v1/runtime/interaction-governance/evaluate (tense debugging)"; \
 	curl -sS -X POST "$$CR_BASE/v1/runtime/interaction-governance/evaluate" \
 	  -H "Content-Type: application/json" \

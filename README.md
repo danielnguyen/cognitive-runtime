@@ -29,6 +29,23 @@ The service provides APIs for:
 
 See [API and runtime behavior](docs/api.md) for the current routes.
 
+## Interaction governance and history follow-ups
+
+The existing interaction-governance evaluation accepts an optional strict,
+structured history-follow-up candidate. The candidate is untrusted input:
+Cognitive Runtime validates its closed fields and consistency, applies its own
+confidence thresholds and ambiguity policy, and decides whether orchestration
+may attempt one immediate-history lookup. Cognitive Runtime does not call a
+classification model or provider, select a historical record, or assert that a
+record exists.
+
+Basic Memory Store remains authoritative for resolving the single immediately
+preceding durable assistant response and its retained support or acquisition
+record. Chat Orchestrator remains responsible for the future bounded
+`intent_classifier` call, calling Basic Memory Store after policy acceptance,
+rendering historical explanations, and entering governed fresh verification
+only when the request explicitly asks for it and history resolution succeeds.
+
 ## Run locally
 
 Create a Python virtual environment and start the service from the repository

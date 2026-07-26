@@ -3,6 +3,9 @@ from __future__ import annotations
 import re
 
 from models import (
+    HistoryFollowupAcquisitionQuestion,
+    HistoryFollowupExplanationKind,
+    HistoryFollowupPolicyResult,
     InteractionGovernanceEvaluateRequest,
     InteractionGovernanceEvaluateResponse,
     InteractionGovernanceKind,
@@ -137,6 +140,19 @@ _COMMAND_PHRASES = (
 )
 _QUESTION_WORDS = ("what", "why", "how", "when", "where", "who", "which", "should")
 _ALL_CAPS_TOKEN = re.compile(r"\b[A-Z]{4,}\b")
+
+HISTORY_FOLLOWUP_HIGH_CONFIDENCE_THRESHOLD = 0.85
+HISTORY_FOLLOWUP_CLARIFICATION_THRESHOLD = 0.60
+
+_HISTORY_INTENT_PROJECTION: dict[
+    str, tuple[HistoryFollowupExplanationKind, HistoryFollowupAcquisitionQuestion | None]
+] = {
+    "support_explanation": ("support", None),
+    "acquisition_checked": ("acquisition", "checked"),
+    "acquisition_coverage": ("acquisition", "coverage"),
+    "acquisition_gaps": ("acquisition", "gaps"),
+    "new_verification_request": ("support", None),
+}
 
 
 def _normalize_text(text: str) -> str:
@@ -339,6 +355,113 @@ def _map_intent_class(
     return "low_confidence_unclear"
 
 
+def _history_confidence_band(
+    body: InteractionGovernanceEvaluateRequest,
+) -> str:
+    candidate = body.history_followup_candidate
+    if candidate is None:
+        return "not_applicable"
+    if candidate.source == "deterministic":
+        return "high"
+    if candidate.confidence >= HISTORY_FOLLOWUP_HIGH_CONFIDENCE_THRESHOLD:
+        return "high"
+    if candidate.confidence >= HISTORY_FOLLOWUP_CLARIFICATION_THRESHOLD:
+        return "medium"
+    return "low"
+
+
+def _history_policy_result(
+    body: InteractionGovernanceEvaluateRequest,
+) -> HistoryFollowupPolicyResult:
+    candidate = body.history_followup_candidate
+    if candidate is None:
+        return HistoryFollowupPolicyResult(
+            status="not_applicable",
+            history_lookup_allowed=False,
+            new_verification_requested=False,
+            new_verification_allowed_after_history_resolution=False,
+            clarification_required=False,
+            confidence_band="not_applicable",
+            reason_codes=["no_candidate"],
+        )
+
+    projection = _HISTORY_INTENT_PROJECTION.get(candidate.intent)
+    explanation_kind = projection[0] if projection else None
+    acquisition_question = projection[1] if projection else None
+    confidence_band = _history_confidence_band(body)
+    common = {
+        "intent": candidate.intent,
+        "candidate_source": candidate.source,
+        "target_mode": candidate.target_mode,
+        "explanation_kind": explanation_kind,
+        "acquisition_question": acquisition_question,
+        "new_verification_requested": candidate.new_verification_requested,
+        "confidence_band": confidence_band,
+    }
+
+    if candidate.intent == "not_history_followup":
+        return HistoryFollowupPolicyResult(
+            status="not_applicable",
+            history_lookup_allowed=False,
+            new_verification_allowed_after_history_resolution=False,
+            clarification_required=False,
+            reason_codes=["not_history_candidate"],
+            **common,
+        )
+    if candidate.intent == "ambiguous_history_followup":
+        return HistoryFollowupPolicyResult(
+            status="clarification_required",
+            history_lookup_allowed=False,
+            new_verification_allowed_after_history_resolution=False,
+            clarification_required=True,
+            reason_codes=["ambiguous_candidate"],
+            **common,
+        )
+    if candidate.source == "classifier" and confidence_band == "medium":
+        return HistoryFollowupPolicyResult(
+            status="clarification_required",
+            history_lookup_allowed=False,
+            new_verification_allowed_after_history_resolution=False,
+            clarification_required=True,
+            reason_codes=["classifier_confidence_requires_clarification"],
+            **common,
+        )
+    if candidate.source == "classifier" and confidence_band == "low":
+        return HistoryFollowupPolicyResult(
+            status="rejected",
+            history_lookup_allowed=False,
+            new_verification_allowed_after_history_resolution=False,
+            clarification_required=False,
+            reason_codes=["classifier_confidence_rejected"],
+            **common,
+        )
+    if candidate.target_mode == "explicit_reference":
+        return HistoryFollowupPolicyResult(
+            status="explicit_reference",
+            history_lookup_allowed=False,
+            new_verification_allowed_after_history_resolution=False,
+            clarification_required=False,
+            reason_codes=["explicit_reference_routed"],
+            **common,
+        )
+
+    reason_code = (
+        "deterministic_candidate_accepted"
+        if candidate.source == "deterministic"
+        else "classifier_candidate_accepted"
+    )
+    return HistoryFollowupPolicyResult(
+        status="accepted",
+        history_lookup_allowed=True,
+        new_verification_allowed_after_history_resolution=(
+            candidate.new_verification_requested
+        ),
+        clarification_required=False,
+        reason_codes=[reason_code],
+        **common,
+    )
+
+
 def _classify(body: InteractionGovernanceEvaluateRequest) -> InteractionGovernanceResult:
     raw_text = _latest_user_text(body)
     text = _normalize_text(raw_text)
@@ -359,6 +482,7 @@ def _classify(body: InteractionGovernanceEvaluateRequest) -> InteractionGovernan
             response_posture="silent_or_minimal",
             confidence=0.2,
             reason_summary=["insufficient_signal"],
+            history_followup_policy=_history_policy_result(body),
         )
 
     if _is_destructive_ambiguous(text):
@@ -446,6 +570,7 @@ def _classify(body: InteractionGovernanceEvaluateRequest) -> InteractionGovernan
         response_posture=posture,
         confidence=confidence,
         reason_summary=_reason_summary(kind, text, raw_text),
+        history_followup_policy=_history_policy_result(body),
     )
 
 
@@ -478,10 +603,18 @@ def evaluate_interaction_governance(
     normalized_text = _normalize_text(_latest_user_text(body))
 
     if body.runtime_turn_id:
+        history_policy = result.history_followup_policy
+        intent_class = _map_intent_class(
+            result.interaction_kind, normalized_text, body
+        )
+        if history_policy.status == "accepted" and history_policy.intent is not None:
+            intent_class = history_policy.intent
+        elif history_policy.status == "clarification_required":
+            intent_class = "ambiguous_history_followup"
         update_runtime_turn_intent_class(
             runtime_session_id=runtime_session_id,
             runtime_turn_id=body.runtime_turn_id,
-            intent_class=_map_intent_class(result.interaction_kind, normalized_text, body),
+            intent_class=intent_class,
         )
 
     record_runtime_event(
@@ -497,6 +630,7 @@ def evaluate_interaction_governance(
             "action_allowed": result.action_allowed,
             "requires_confirmation": result.requires_confirmation,
             "reason_summary": result.reason_summary,
+            "history_followup_policy": result.history_followup_policy.model_dump(),
         },
     )
 
