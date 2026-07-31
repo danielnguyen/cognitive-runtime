@@ -1,12 +1,86 @@
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import main as main_module
+import pytest
 from fastapi.testclient import TestClient
 from main import app
-from services.runtime_state import clear_states_for_tests
+from services.runtime_state import RuntimeStateRepository, clear_states_for_tests
 
 
 def setup_function():
     clear_states_for_tests()
+
+
+def _use_database(tmp_path: Path, name: str = "runtime.sqlite3") -> Path:
+    db_path = tmp_path / name
+    clear_states_for_tests(db_path=db_path)
+    return db_path
+
+
+def _thread(client: TestClient, owner_id: str, conversation_id: str):
+    return client.post(
+        "/v1/runtime/threads/resolve",
+        json={
+            "request_id": "thread-read",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+        },
+    )
+
+
+def _start(
+    client: TestClient,
+    *,
+    request_id: str,
+    owner_id: str,
+    conversation_id: str,
+    surface: str,
+    expected_thread_revision: int | None = None,
+):
+    payload = {
+        "request_id": request_id,
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "surface": surface,
+    }
+    if expected_thread_revision is not None:
+        payload["expected_thread_revision"] = expected_thread_revision
+    return client.post("/v1/runtime/turns/start", json=payload)
+
+
+def _complete(
+    client: TestClient,
+    *,
+    request_id: str,
+    runtime_session_id: str,
+    runtime_turn_id: str,
+    turn_status: str = "completed",
+):
+    return client.post(
+        "/v1/runtime/turns/complete",
+        json={
+            "request_id": request_id,
+            "runtime_session_id": runtime_session_id,
+            "runtime_turn_id": runtime_turn_id,
+            "turn_status": turn_status,
+        },
+    )
+
+
+def _runtime_rows(db_path: Path) -> tuple[tuple[tuple[object, ...], ...], ...]:
+    with sqlite3.connect(db_path) as conn:
+        return tuple(
+            tuple(tuple(row) for row in conn.execute(query).fetchall())
+            for query in (
+                "SELECT * FROM conversation_runtime_sessions ORDER BY id;",
+                "SELECT * FROM conversation_runtime_threads ORDER BY id;",
+                "SELECT * FROM conversation_runtime_turns ORDER BY id;",
+                "SELECT * FROM conversation_runtime_events ORDER BY id;",
+            )
+        )
 
 
 def test_resolve_creates_and_reuses_runtime_state():
@@ -271,3 +345,1155 @@ def test_oversized_trace_refs_are_rejected():
     )
 
     assert response.status_code == 422
+
+
+def test_one_thread_projection_is_shared_by_distinct_surface_sessions(tmp_path: Path):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    owner_id = "owner-shared"
+    conversation_id = "conversation-shared"
+
+    first_session = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": "session-first",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": "surface-z",
+            "surface_session_id": "transport-z",
+        },
+    )
+    second_session = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": "session-second",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": "surface-a",
+            "surface_session_id": "transport-a",
+        },
+    )
+    assert first_session.status_code == second_session.status_code == 200
+    assert (
+        first_session.json()["runtime_session"]["runtime_session_id"]
+        != second_session.json()["runtime_session"]["runtime_session_id"]
+    )
+
+    first_projection = _thread(client, owner_id, conversation_id)
+    repeated_projection = _thread(client, owner_id, conversation_id)
+    assert first_projection.status_code == repeated_projection.status_code == 200
+    assert first_projection.json() == repeated_projection.json()
+    assert first_projection.json()["participating_surfaces"] == ["surface-a", "surface-z"]
+    assert first_projection.json()["participating_session_count"] == 2
+
+    assert _thread(client, owner_id, "conversation-other").status_code == 200
+    assert _thread(client, "owner-other", conversation_id).status_code == 200
+    with sqlite3.connect(db_path) as conn:
+        shared_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM conversation_runtime_threads
+            WHERE owner_id = ? AND conversation_id = ?;
+            """,
+            (owner_id, conversation_id),
+        ).fetchone()[0]
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_threads;"
+        ).fetchone()[0]
+    assert shared_count == 1
+    assert total_count == 3
+
+
+def test_cross_surface_admission_contends_without_mutation(tmp_path: Path):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    owner_id = "owner-contention"
+    conversation_id = "conversation-contention"
+
+    admitted = _start(
+        client,
+        request_id="admission-first",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-one",
+    )
+    assert admitted.status_code == 200
+    before = _thread(client, owner_id, conversation_id).json()
+
+    second_session = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": "session-while-active",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": "surface-two",
+        },
+    )
+    assert second_session.status_code == 200
+    after_session_resolution = _thread(client, owner_id, conversation_id).json()
+    assert after_session_resolution["active_runtime_turn_id"] == before["active_runtime_turn_id"]
+    assert after_session_resolution["revision"] == before["revision"]
+
+    rejected = _start(
+        client,
+        request_id="admission-second",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-two",
+    )
+    assert (rejected.status_code, rejected.json()) == (
+        409,
+        {"detail": "runtime_thread_contended"},
+    )
+    after = _thread(client, owner_id, conversation_id).json()
+    assert after["active_runtime_turn_id"] == before["active_runtime_turn_id"]
+    assert after["active_surface"] == "surface-one"
+    assert after["revision"] == before["revision"]
+    with sqlite3.connect(db_path) as conn:
+        turn_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM conversation_runtime_turns AS turns
+            JOIN conversation_runtime_sessions AS sessions
+              ON sessions.runtime_session_id = turns.runtime_session_id
+            WHERE sessions.owner_id = ? AND sessions.conversation_id = ?
+              AND turns.turn_status NOT IN ('completed', 'abandoned');
+            """,
+            (owner_id, conversation_id),
+        ).fetchone()[0]
+    assert turn_count == 1
+
+
+def test_concurrent_repository_admission_allows_exactly_one_writer(tmp_path: Path):
+    db_path = tmp_path / "concurrent.sqlite3"
+    repositories = [RuntimeStateRepository(db_path), RuntimeStateRepository(db_path)]
+    barrier = threading.Barrier(2)
+
+    def attempt(index: int):
+        barrier.wait(timeout=5)
+        try:
+            result = repositories[index].start_turn(
+                request_id=f"overlap-{index}",
+                owner_id="owner-overlap",
+                conversation_id="conversation-overlap",
+                surface=f"surface-{index}",
+            )
+            return "admitted", result[1].runtime_turn_id
+        except RuntimeError as exc:
+            return str(exc), None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(attempt, (0, 1)))
+
+    assert sorted(outcome[0] for outcome in outcomes) == [
+        "admitted",
+        "runtime_thread_contended",
+    ]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM conversation_runtime_turns;").fetchone()[0] == 1
+
+
+def test_revision_compare_and_set_progression_and_terminal_release(tmp_path: Path):
+    _use_database(tmp_path)
+    client = TestClient(app)
+    owner_id = "owner-revision"
+    conversation_id = "conversation-revision"
+    initial = _thread(client, owner_id, conversation_id).json()
+    assert initial["state"] == "idle"
+    assert initial["revision"] == 0
+
+    stale = _start(
+        client,
+        request_id="revision-stale",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-main",
+        expected_thread_revision=1,
+    )
+    assert (stale.status_code, stale.json()) == (
+        409,
+        {"detail": "runtime_thread_revision_conflict"},
+    )
+    assert _thread(client, owner_id, conversation_id).json() == initial
+
+    admitted = _start(
+        client,
+        request_id="revision-match",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-main",
+        expected_thread_revision=0,
+    )
+    assert admitted.status_code == 200
+    admitted_body = admitted.json()
+    assert _thread(client, owner_id, conversation_id).json()["revision"] == 1
+
+    updated = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "revision-update",
+            "runtime_session_id": admitted_body["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": admitted_body["runtime_turn"]["runtime_turn_id"],
+            "turn_status": "responding",
+        },
+    )
+    assert updated.status_code == 200
+    assert _thread(client, owner_id, conversation_id).json()["revision"] == 1
+
+    completed = _complete(
+        client,
+        request_id="revision-complete",
+        runtime_session_id=admitted_body["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=admitted_body["runtime_turn"]["runtime_turn_id"],
+    )
+    assert completed.status_code == 200
+    released = _thread(client, owner_id, conversation_id).json()
+    assert released["state"] == "idle"
+    assert released["active_runtime_turn_id"] is None
+    assert released["revision"] == 2
+
+    abandoned = _start(
+        client,
+        request_id="revision-abandon-start",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-main",
+        expected_thread_revision=2,
+    ).json()
+    abandonment = _complete(
+        client,
+        request_id="revision-abandon-complete",
+        runtime_session_id=abandoned["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=abandoned["runtime_turn"]["runtime_turn_id"],
+        turn_status="abandoned",
+    )
+    assert abandonment.status_code == 200
+    assert _thread(client, owner_id, conversation_id).json()["revision"] == 4
+
+
+def test_admission_and_completion_retries_are_idempotent(tmp_path: Path):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    owner_id = "owner-retry"
+    conversation_id = "conversation-retry"
+
+    first = _start(
+        client,
+        request_id="retry-start",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-one",
+    )
+    retry = _start(
+        client,
+        request_id="retry-start",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-one",
+        expected_thread_revision=0,
+    )
+    assert first.status_code == retry.status_code == 200
+    assert first.json() == retry.json()
+    assert _thread(client, owner_id, conversation_id).json()["revision"] == 1
+
+    other_surface = _start(
+        client,
+        request_id="retry-start",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-two",
+    )
+    assert other_surface.status_code == 409
+    assert other_surface.json() == {"detail": "runtime_thread_contended"}
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM conversation_runtime_turns;").fetchone()[0] == 1
+        start_events = conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_events WHERE event_type = 'turn_started';"
+        ).fetchone()[0]
+    assert start_events == 1
+
+    body = first.json()
+    complete = _complete(
+        client,
+        request_id="retry-complete",
+        runtime_session_id=body["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=body["runtime_turn"]["runtime_turn_id"],
+    )
+    complete_retry = _complete(
+        client,
+        request_id="retry-complete",
+        runtime_session_id=body["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=body["runtime_turn"]["runtime_turn_id"],
+    )
+    assert complete.status_code == complete_retry.status_code == 200
+    assert complete.json() == complete_retry.json()
+    assert _thread(client, owner_id, conversation_id).json()["revision"] == 2
+    with sqlite3.connect(db_path) as conn:
+        terminal_events = conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_events WHERE event_type = 'turn_completed';"
+        ).fetchone()[0]
+    assert terminal_events == 1
+
+
+def test_update_and_completion_require_the_current_owning_session(tmp_path: Path):
+    _use_database(tmp_path)
+    client = TestClient(app)
+    owner_id = "owner-association"
+    conversation_id = "conversation-association"
+    other_session = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": "association-session",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": "surface-other",
+        },
+    ).json()["runtime_session"]
+    admitted = _start(
+        client,
+        request_id="association-start",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-main",
+    ).json()
+    turn_id = admitted["runtime_turn"]["runtime_turn_id"]
+    before = _thread(client, owner_id, conversation_id).json()
+
+    wrong_update = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "association-wrong-update",
+            "runtime_session_id": other_session["runtime_session_id"],
+            "runtime_turn_id": turn_id,
+            "turn_status": "retrieving",
+        },
+    )
+    wrong_complete = _complete(
+        client,
+        request_id="association-wrong-complete",
+        runtime_session_id=other_session["runtime_session_id"],
+        runtime_turn_id=turn_id,
+    )
+    assert wrong_update.status_code == wrong_complete.status_code == 400
+    assert wrong_update.json() == wrong_complete.json() == {
+        "detail": "runtime_turn_session_mismatch"
+    }
+    assert _thread(client, owner_id, conversation_id).json()["revision"] == before["revision"]
+
+    missing_turn = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "association-missing-turn",
+            "runtime_session_id": admitted["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": "turn-missing",
+            "turn_status": "retrieving",
+        },
+    )
+    assert (missing_turn.status_code, missing_turn.json()) == (
+        404,
+        {"detail": "runtime_turn_not_found"},
+    )
+
+    correct = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "association-correct-update",
+            "runtime_session_id": admitted["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": turn_id,
+            "turn_status": "retrieving",
+        },
+    )
+    assert correct.status_code == 200
+
+
+def test_stale_completion_cannot_release_a_later_turn(tmp_path: Path):
+    _use_database(tmp_path)
+    client = TestClient(app)
+    owner_id = "owner-stale-terminal"
+    conversation_id = "conversation-stale-terminal"
+    first = _start(
+        client,
+        request_id="stale-first-start",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-main",
+    ).json()
+    first_session_id = first["runtime_session"]["runtime_session_id"]
+    first_turn_id = first["runtime_turn"]["runtime_turn_id"]
+    assert _complete(
+        client,
+        request_id="stale-first-complete",
+        runtime_session_id=first_session_id,
+        runtime_turn_id=first_turn_id,
+    ).status_code == 200
+
+    second = _start(
+        client,
+        request_id="stale-second-start",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-main",
+    ).json()
+    before = _thread(client, owner_id, conversation_id).json()
+
+    stale = _complete(
+        client,
+        request_id="stale-late-attempt",
+        runtime_session_id=first_session_id,
+        runtime_turn_id=first_turn_id,
+    )
+    assert (stale.status_code, stale.json()) == (
+        409,
+        {"detail": "runtime_turn_not_current"},
+    )
+    exact_retry = _complete(
+        client,
+        request_id="stale-first-complete",
+        runtime_session_id=first_session_id,
+        runtime_turn_id=first_turn_id,
+    )
+    assert exact_retry.status_code == 200
+    after = _thread(client, owner_id, conversation_id).json()
+    assert after["active_runtime_turn_id"] == second["runtime_turn"]["runtime_turn_id"]
+    assert after["revision"] == before["revision"]
+
+
+def test_active_and_idle_thread_state_survive_repository_recreation(tmp_path: Path):
+    db_path = tmp_path / "restart.sqlite3"
+    first_repository = RuntimeStateRepository(db_path)
+    session, turn, _ = first_repository.start_turn(
+        request_id="restart-start",
+        owner_id="owner-restart",
+        conversation_id="conversation-restart",
+        surface="surface-main",
+    )
+
+    reopened = RuntimeStateRepository(db_path)
+    active = reopened.resolve_thread(
+        owner_id="owner-restart",
+        conversation_id="conversation-restart",
+    )
+    assert active.state == "active"
+    assert active.active_runtime_turn_id == turn.runtime_turn_id
+    try:
+        reopened.start_turn(
+            request_id="restart-competing",
+            owner_id="owner-restart",
+            conversation_id="conversation-restart",
+            surface="surface-other",
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "runtime_thread_contended"
+    else:
+        raise AssertionError("competing turn was admitted after repository recreation")
+
+    reopened.complete_turn(
+        request_id="restart-complete",
+        runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id,
+        turn_status="completed",
+    )
+    final_repository = RuntimeStateRepository(db_path)
+    idle = final_repository.resolve_thread(
+        owner_id="owner-restart",
+        conversation_id="conversation-restart",
+    )
+    assert idle.state == "idle"
+    assert idle.revision == 2
+
+
+def test_missing_projection_with_no_active_turn_reconstructs_idle(tmp_path: Path):
+    db_path = tmp_path / "reconstruct-idle.sqlite3"
+    repository = RuntimeStateRepository(db_path)
+    repository.resolve_session(
+        request_id="reconstruct-session",
+        owner_id="owner-reconstruct-idle",
+        conversation_id="conversation-reconstruct-idle",
+        surface="surface-main",
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM conversation_runtime_threads;")
+
+    projection = RuntimeStateRepository(db_path).resolve_thread(
+        owner_id="owner-reconstruct-idle",
+        conversation_id="conversation-reconstruct-idle",
+    )
+    assert projection.state == "idle"
+    assert projection.revision == 0
+
+
+def test_missing_projection_with_one_active_turn_reconstructs_active(tmp_path: Path):
+    db_path = tmp_path / "reconstruct-active.sqlite3"
+    repository = RuntimeStateRepository(db_path)
+    session = repository.resolve_session(
+        request_id="reconstruct-session",
+        owner_id="owner-reconstruct-active",
+        conversation_id="conversation-reconstruct-active",
+        surface="surface-main",
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversation_runtime_turns (
+                runtime_turn_id, runtime_session_id, input_message_id, turn_status,
+                intent_class, timing_policy, restraint_policy, continuation_state,
+                created_at, updated_at, completed_at
+            ) VALUES (?, ?, NULL, 'received', NULL, NULL, NULL, NULL, ?, ?, NULL);
+            """,
+            ("turn-reconstruct-active", session.runtime_session_id, "time-a", "time-a"),
+        )
+        conn.execute("DELETE FROM conversation_runtime_threads;")
+
+    projection = RuntimeStateRepository(db_path).resolve_thread(
+        owner_id="owner-reconstruct-active",
+        conversation_id="conversation-reconstruct-active",
+    )
+    assert projection.state == "active"
+    assert projection.active_runtime_session_id == session.runtime_session_id
+    assert projection.active_runtime_turn_id == "turn-reconstruct-active"
+    assert projection.active_surface == "surface-main"
+
+
+def test_missing_projection_with_multiple_active_turns_reconstructs_contended(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "reconstruct-contended.sqlite3"
+    repository = RuntimeStateRepository(db_path)
+    sessions = [
+        repository.resolve_session(
+            request_id=f"reconstruct-session-{index}",
+            owner_id="owner-reconstruct-contended",
+            conversation_id="conversation-reconstruct-contended",
+            surface=f"surface-{index}",
+        )
+        for index in range(2)
+    ]
+    with sqlite3.connect(db_path) as conn:
+        for index, session in enumerate(sessions):
+            conn.execute(
+                """
+                INSERT INTO conversation_runtime_turns (
+                    runtime_turn_id, runtime_session_id, input_message_id, turn_status,
+                    intent_class, timing_policy, restraint_policy, continuation_state,
+                    created_at, updated_at, completed_at
+                ) VALUES (?, ?, NULL, 'received', NULL, NULL, NULL, NULL, ?, ?, NULL);
+                """,
+                (
+                    f"turn-reconstruct-{index}",
+                    session.runtime_session_id,
+                    f"time-{index}",
+                    f"time-{index}",
+                ),
+            )
+        conn.execute("DELETE FROM conversation_runtime_threads;")
+
+    reopened = RuntimeStateRepository(db_path)
+    projection = reopened.resolve_thread(
+        owner_id="owner-reconstruct-contended",
+        conversation_id="conversation-reconstruct-contended",
+    )
+    assert projection.state == "contended"
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM conversation_runtime_turns;").fetchone()[0] == 2
+    try:
+        reopened.start_turn(
+            request_id="reconstruct-third",
+            owner_id="owner-reconstruct-contended",
+            conversation_id="conversation-reconstruct-contended",
+            surface="surface-third",
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "runtime_thread_contended"
+    else:
+        raise AssertionError("contended reconstruction admitted another turn")
+
+
+def test_inconsistent_active_reference_becomes_unavailable(tmp_path: Path):
+    db_path = tmp_path / "inconsistent.sqlite3"
+    repository = RuntimeStateRepository(db_path)
+    repository.start_turn(
+        request_id="inconsistent-start",
+        owner_id="owner-inconsistent",
+        conversation_id="conversation-inconsistent",
+        surface="surface-main",
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE conversation_runtime_threads
+            SET active_runtime_turn_id = 'turn-missing'
+            WHERE owner_id = 'owner-inconsistent';
+            """
+        )
+
+    reopened = RuntimeStateRepository(db_path)
+    projection = reopened.resolve_thread(
+        owner_id="owner-inconsistent",
+        conversation_id="conversation-inconsistent",
+    )
+    assert projection.state == "unavailable"
+    assert projection.active_runtime_turn_id == "turn-missing"
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM conversation_runtime_turns;").fetchone()[0] == 1
+    try:
+        reopened.start_turn(
+            request_id="inconsistent-next",
+            owner_id="owner-inconsistent",
+            conversation_id="conversation-inconsistent",
+            surface="surface-main",
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "runtime_thread_unavailable"
+    else:
+        raise AssertionError("unavailable thread admitted another turn")
+
+
+def test_thread_api_is_bounded_and_persistence_failures_do_not_leak(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _use_database(tmp_path)
+    client = TestClient(app)
+    projection = _thread(client, "owner-bounded", "conversation-bounded")
+    assert projection.status_code == 200
+    assert set(projection.json()) == {
+        "owner_id",
+        "conversation_id",
+        "state",
+        "revision",
+        "active_runtime_session_id",
+        "active_runtime_turn_id",
+        "active_surface",
+        "participating_surfaces",
+        "participating_session_count",
+        "last_activity_at",
+        "created_at",
+        "updated_at",
+    }
+    serialized = str(projection.json()).lower()
+    for excluded in ("content", "eligib", "lifecycle", "prompt", "provider"):
+        assert excluded not in serialized
+
+    malformed = client.post(
+        "/v1/runtime/turns/start",
+        json={
+            "request_id": "bounded-malformed",
+            "owner_id": "owner-bounded",
+            "conversation_id": "conversation-bounded",
+            "surface": "surface-main",
+            "expected_thread_revision": -1,
+        },
+    )
+    assert malformed.status_code == 422
+
+    def unavailable(**_kwargs):
+        raise sqlite3.OperationalError("storage path /private/runtime.sqlite3 failed")
+
+    monkeypatch.setattr(main_module, "resolve_runtime_thread", unavailable)
+    failed = _thread(client, "owner-bounded", "conversation-bounded")
+    assert (failed.status_code, failed.json()) == (
+        503,
+        {"detail": "runtime_state_persistence_unavailable"},
+    )
+    assert "/private" not in str(failed.json())
+
+
+def test_missing_session_errors_are_bounded(tmp_path: Path):
+    _use_database(tmp_path)
+    client = TestClient(app)
+    update = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "missing-session-update",
+            "runtime_session_id": "session-missing",
+            "runtime_turn_id": "turn-missing",
+            "turn_status": "retrieving",
+        },
+    )
+    diagnostics = client.get("/v1/runtime/sessions/session-missing")
+    assert (update.status_code, update.json()) == (
+        404,
+        {"detail": "runtime_session_not_found"},
+    )
+    assert (diagnostics.status_code, diagnostics.json()) == (
+        404,
+        {"detail": "runtime_session_not_found"},
+    )
+
+
+def test_cross_conversation_session_cannot_mutate_another_conversation_turn(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    admitted = _start(
+        client,
+        request_id="cross-conversation-start",
+        owner_id="owner-cross-conversation",
+        conversation_id="conversation-primary",
+        surface="surface-main",
+    ).json()
+    other_session = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": "cross-conversation-session",
+            "owner_id": "owner-cross-conversation",
+            "conversation_id": "conversation-other",
+            "surface": "surface-main",
+        },
+    ).json()["runtime_session"]
+    before_primary = _thread(
+        client,
+        "owner-cross-conversation",
+        "conversation-primary",
+    ).json()
+    before_other = _thread(
+        client,
+        "owner-cross-conversation",
+        "conversation-other",
+    ).json()
+    before_rows = _runtime_rows(db_path)
+
+    update = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "cross-conversation-update",
+            "runtime_session_id": other_session["runtime_session_id"],
+            "runtime_turn_id": admitted["runtime_turn"]["runtime_turn_id"],
+            "turn_status": "retrieving",
+        },
+    )
+    completion = _complete(
+        client,
+        request_id="cross-conversation-complete",
+        runtime_session_id=other_session["runtime_session_id"],
+        runtime_turn_id=admitted["runtime_turn"]["runtime_turn_id"],
+    )
+
+    assert (update.status_code, update.json()) == (
+        400,
+        {"detail": "runtime_turn_session_mismatch"},
+    )
+    assert (completion.status_code, completion.json()) == (
+        400,
+        {"detail": "runtime_turn_session_mismatch"},
+    )
+    assert _runtime_rows(db_path) == before_rows
+    assert _thread(
+        client,
+        "owner-cross-conversation",
+        "conversation-primary",
+    ).json() == before_primary
+    assert _thread(
+        client,
+        "owner-cross-conversation",
+        "conversation-other",
+    ).json() == before_other
+
+
+def test_contended_thread_rejects_update_and_completion_without_mutation(tmp_path: Path):
+    db_path = _use_database(tmp_path, "contended-mutation.sqlite3")
+    repository = RuntimeStateRepository(db_path)
+    sessions = [
+        repository.resolve_session(
+            request_id=f"contended-session-{index}",
+            owner_id="owner-contended-mutation",
+            conversation_id="conversation-contended-mutation",
+            surface=f"surface-{index}",
+        )
+        for index in range(2)
+    ]
+    with sqlite3.connect(db_path) as conn:
+        for index, session in enumerate(sessions):
+            conn.execute(
+                """
+                INSERT INTO conversation_runtime_turns (
+                    runtime_turn_id, runtime_session_id, input_message_id, turn_status,
+                    intent_class, timing_policy, restraint_policy, continuation_state,
+                    created_at, updated_at, completed_at
+                ) VALUES (?, ?, NULL, 'received', NULL, NULL, NULL, NULL, ?, ?, NULL);
+                """,
+                (
+                    f"turn-contended-mutation-{index}",
+                    session.runtime_session_id,
+                    f"time-{index}",
+                    f"time-{index}",
+                ),
+            )
+        conn.execute("DELETE FROM conversation_runtime_threads;")
+
+    client = TestClient(app)
+    projection = _thread(
+        client,
+        "owner-contended-mutation",
+        "conversation-contended-mutation",
+    )
+    assert projection.status_code == 200
+    assert projection.json()["state"] == "contended"
+    before_rows = _runtime_rows(db_path)
+
+    update = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "contended-update",
+            "runtime_session_id": sessions[0].runtime_session_id,
+            "runtime_turn_id": "turn-contended-mutation-0",
+            "turn_status": "retrieving",
+        },
+    )
+    completion = _complete(
+        client,
+        request_id="contended-complete",
+        runtime_session_id=sessions[0].runtime_session_id,
+        runtime_turn_id="turn-contended-mutation-0",
+    )
+
+    assert (update.status_code, update.json()) == (
+        409,
+        {"detail": "runtime_thread_contended"},
+    )
+    assert (completion.status_code, completion.json()) == (
+        409,
+        {"detail": "runtime_thread_contended"},
+    )
+    assert _runtime_rows(db_path) == before_rows
+
+
+def test_unavailable_thread_rejects_update_and_completion_without_mutation(tmp_path: Path):
+    db_path = _use_database(tmp_path, "unavailable-mutation.sqlite3")
+    client = TestClient(app)
+    admitted = _start(
+        client,
+        request_id="unavailable-mutation-start",
+        owner_id="owner-unavailable-mutation",
+        conversation_id="conversation-unavailable-mutation",
+        surface="surface-main",
+    ).json()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE conversation_runtime_threads
+            SET active_runtime_turn_id = 'turn-missing'
+            WHERE owner_id = ? AND conversation_id = ?;
+            """,
+            ("owner-unavailable-mutation", "conversation-unavailable-mutation"),
+        )
+
+    projection = _thread(
+        client,
+        "owner-unavailable-mutation",
+        "conversation-unavailable-mutation",
+    )
+    assert projection.status_code == 200
+    assert projection.json()["state"] == "unavailable"
+    before_rows = _runtime_rows(db_path)
+    session_id = admitted["runtime_session"]["runtime_session_id"]
+    turn_id = admitted["runtime_turn"]["runtime_turn_id"]
+
+    update = client.post(
+        "/v1/runtime/turns/update",
+        json={
+            "request_id": "unavailable-update",
+            "runtime_session_id": session_id,
+            "runtime_turn_id": turn_id,
+            "turn_status": "retrieving",
+        },
+    )
+    completion = _complete(
+        client,
+        request_id="unavailable-complete",
+        runtime_session_id=session_id,
+        runtime_turn_id=turn_id,
+    )
+
+    assert (update.status_code, update.json()) == (
+        503,
+        {"detail": "runtime_thread_unavailable"},
+    )
+    assert (completion.status_code, completion.json()) == (
+        503,
+        {"detail": "runtime_thread_unavailable"},
+    )
+    assert _runtime_rows(db_path) == before_rows
+
+
+@pytest.mark.parametrize(
+    ("function_name", "method", "path", "payload"),
+    [
+        (
+            "resolve_runtime_session",
+            "POST",
+            "/v1/runtime/sessions/resolve",
+            {
+                "request_id": "persistence-session",
+                "owner_id": "owner-persistence",
+                "conversation_id": "conversation-persistence",
+                "surface": "surface-main",
+            },
+        ),
+        (
+            "start_turn",
+            "POST",
+            "/v1/runtime/turns/start",
+            {
+                "request_id": "persistence-start",
+                "owner_id": "owner-persistence",
+                "conversation_id": "conversation-persistence",
+                "surface": "surface-main",
+            },
+        ),
+        (
+            "update_turn",
+            "POST",
+            "/v1/runtime/turns/update",
+            {
+                "request_id": "persistence-update",
+                "runtime_session_id": "session-persistence",
+                "runtime_turn_id": "turn-persistence",
+                "turn_status": "retrieving",
+            },
+        ),
+        (
+            "complete_turn",
+            "POST",
+            "/v1/runtime/turns/complete",
+            {
+                "request_id": "persistence-complete",
+                "runtime_session_id": "session-persistence",
+                "runtime_turn_id": "turn-persistence",
+                "turn_status": "completed",
+            },
+        ),
+        (
+            "get_runtime_session",
+            "GET",
+            "/v1/runtime/sessions/session-persistence",
+            None,
+        ),
+    ],
+)
+def test_runtime_endpoints_bound_persistence_failures(
+    tmp_path: Path,
+    monkeypatch,
+    function_name: str,
+    method: str,
+    path: str,
+    payload: dict[str, object] | None,
+):
+    _use_database(tmp_path)
+    client = TestClient(app)
+
+    def unavailable(*_args, **_kwargs):
+        raise sqlite3.OperationalError("storage path /private/runtime.sqlite3 SELECT failed")
+
+    monkeypatch.setattr(main_module, function_name, unavailable)
+    response = client.request(method, path, json=payload)
+
+    assert (response.status_code, response.json()) == (
+        503,
+        {"detail": "runtime_state_persistence_unavailable"},
+    )
+    serialized = str(response.json()).lower()
+    assert "/private" not in serialized
+    assert "select" not in serialized
+
+
+def test_admission_failure_after_turn_insert_rolls_back_all_state(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db_path = tmp_path / "admission-rollback.sqlite3"
+    repository = RuntimeStateRepository(db_path)
+    repository.resolve_session(
+        request_id="rollback-session",
+        owner_id="owner-rollback",
+        conversation_id="conversation-rollback",
+        surface="surface-main",
+    )
+    before_rows = _runtime_rows(db_path)
+    original_record_event = repository._record_event
+
+    def fail_before_admission_commit(conn, **kwargs):
+        if kwargs["event_type"] == "turn_started":
+            raise sqlite3.OperationalError("injected admission failure")
+        return original_record_event(conn, **kwargs)
+
+    monkeypatch.setattr(repository, "_record_event", fail_before_admission_commit)
+    with pytest.raises(sqlite3.OperationalError, match="injected admission failure"):
+        repository.start_turn(
+            request_id="rollback-start",
+            owner_id="owner-rollback",
+            conversation_id="conversation-rollback",
+            surface="surface-main",
+        )
+
+    assert _runtime_rows(db_path) == before_rows
+    projection = RuntimeStateRepository(db_path).resolve_thread(
+        owner_id="owner-rollback",
+        conversation_id="conversation-rollback",
+    )
+    assert projection.state == "idle"
+    assert projection.revision == 0
+    assert projection.active_runtime_session_id is None
+    assert projection.active_runtime_turn_id is None
+
+
+def test_concurrent_exact_admission_retry_returns_one_turn(tmp_path: Path):
+    db_path = tmp_path / "concurrent-retry.sqlite3"
+    repositories = [RuntimeStateRepository(db_path), RuntimeStateRepository(db_path)]
+    barrier = threading.Barrier(2)
+
+    def attempt(index: int):
+        barrier.wait(timeout=5)
+        return repositories[index].start_turn(
+            request_id="concurrent-retry-start",
+            owner_id="owner-concurrent-retry",
+            conversation_id="conversation-concurrent-retry",
+            surface="surface-main",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(attempt, (0, 1)))
+
+    assert outcomes[0][0].runtime_session_id == outcomes[1][0].runtime_session_id
+    assert outcomes[0][1].runtime_turn_id == outcomes[1][1].runtime_turn_id
+    assert outcomes[0][2].event_id == outcomes[1][2].event_id
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM conversation_runtime_turns;").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_events WHERE event_type = 'turn_started';"
+        ).fetchone()[0] == 1
+        revision = conn.execute(
+            "SELECT revision FROM conversation_runtime_threads;"
+        ).fetchone()[0]
+    assert revision == 1
+
+
+@pytest.mark.parametrize(
+    ("active_turn_count", "expected_state"),
+    [(0, "idle"), (1, "active"), (2, "contended")],
+)
+def test_legacy_database_initialization_reconstructs_conservatively(
+    tmp_path: Path,
+    active_turn_count: int,
+    expected_state: str,
+):
+    db_path = tmp_path / f"legacy-{active_turn_count}.sqlite3"
+    owner_id = f"owner-legacy-{active_turn_count}"
+    conversation_id = f"conversation-legacy-{active_turn_count}"
+    timestamp = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE conversation_runtime_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                runtime_session_id TEXT NOT NULL UNIQUE,
+                runtime_state_id TEXT NOT NULL UNIQUE,
+                owner_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                surface TEXT NOT NULL,
+                surface_session_id TEXT,
+                status TEXT NOT NULL,
+                active_mode TEXT,
+                attention_state TEXT,
+                active_scene TEXT,
+                interaction_mode TEXT,
+                attention_focus_json TEXT NOT NULL,
+                temporary_constraints_json TEXT NOT NULL,
+                reset_after_turn INTEGER NOT NULL,
+                trace_refs_json TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                last_activity_at TEXT NOT NULL,
+                closed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_id, conversation_id, surface)
+            );
+            CREATE TABLE conversation_runtime_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                runtime_turn_id TEXT NOT NULL UNIQUE,
+                runtime_session_id TEXT NOT NULL,
+                input_message_id TEXT,
+                turn_status TEXT NOT NULL,
+                intent_class TEXT,
+                timing_policy TEXT,
+                restraint_policy TEXT,
+                continuation_state TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY(runtime_session_id)
+                    REFERENCES conversation_runtime_sessions(runtime_session_id)
+            );
+            """
+        )
+        session_count = max(1, active_turn_count)
+        for index in range(session_count):
+            session_id = f"legacy-session-{active_turn_count}-{index}"
+            conn.execute(
+                """
+                INSERT INTO conversation_runtime_sessions (
+                    runtime_session_id, runtime_state_id, owner_id, conversation_id,
+                    surface, surface_session_id, status, active_mode, attention_state,
+                    active_scene, interaction_mode, attention_focus_json,
+                    temporary_constraints_json, reset_after_turn, trace_refs_json,
+                    started_at, last_activity_at, closed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, 'active', NULL, NULL, NULL, NULL,
+                          'null', '[]', 0, '[]', ?, ?, NULL, ?, ?);
+                """,
+                (
+                    session_id,
+                    f"legacy-state-{active_turn_count}-{index}",
+                    owner_id,
+                    conversation_id,
+                    f"surface-{index}",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            if index < active_turn_count:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_runtime_turns (
+                        runtime_turn_id, runtime_session_id, input_message_id,
+                        turn_status, intent_class, timing_policy, restraint_policy,
+                        continuation_state, created_at, updated_at, completed_at
+                    ) VALUES (?, ?, NULL, 'received', NULL, NULL, NULL, NULL, ?, ?, NULL);
+                    """,
+                    (
+                        f"legacy-turn-{active_turn_count}-{index}",
+                        session_id,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+        assert conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'conversation_runtime_threads';
+            """
+        ).fetchone() is None
+
+    repository = RuntimeStateRepository(db_path)
+    projection = repository.resolve_thread(
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+    )
+
+    assert projection.state == expected_state
+    assert projection.revision == 0
+    if active_turn_count == 1:
+        assert projection.active_runtime_session_id == "legacy-session-1-0"
+        assert projection.active_runtime_turn_id == "legacy-turn-1-0"
+        assert projection.active_surface == "surface-0"
+    else:
+        assert projection.active_runtime_session_id is None
+        assert projection.active_runtime_turn_id is None
+        assert projection.active_surface is None
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_sessions;"
+        ).fetchone()[0] == max(1, active_turn_count)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_turns;"
+        ).fetchone()[0] == active_turn_count

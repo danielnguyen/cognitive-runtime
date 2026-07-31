@@ -138,6 +138,7 @@ RuntimeEventType = Literal[
     "evidence_sufficiency_evaluated",
     "evidence_next_step_selected",
 ]
+RuntimeThreadState = Literal["idle", "active", "contended", "unavailable"]
 
 
 class RuntimeSession(BaseModel):
@@ -187,11 +188,39 @@ class RuntimeSessionResponse(BaseModel):
 
 
 class RuntimeTurnStartRequest(RuntimeSessionResolveRequest):
+    model_config = ConfigDict(extra="forbid")
+
     input_message_id: str | None = Field(default=None, max_length=120)
     intent_class: str | None = Field(default=None, max_length=64)
     timing_policy: str | None = Field(default=None, max_length=64)
     restraint_policy: str | None = Field(default=None, max_length=64)
     continuation_state: str | None = Field(default=None, max_length=64)
+    expected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+
+
+class RuntimeThreadResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+
+
+class RuntimeThreadProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    state: RuntimeThreadState
+    revision: int = Field(ge=0)
+    active_runtime_session_id: str | None = Field(default=None, max_length=120)
+    active_runtime_turn_id: str | None = Field(default=None, max_length=120)
+    active_surface: str | None = Field(default=None, max_length=64)
+    participating_surfaces: list[BoundedLabel] = Field(default_factory=list, max_length=32)
+    participating_session_count: int = Field(ge=0)
+    last_activity_at: str
+    created_at: str
+    updated_at: str
 
 
 class RuntimeTurnUpdateRequest(BaseModel):

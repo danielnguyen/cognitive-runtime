@@ -16,6 +16,7 @@ from models import (
     RuntimeSessionDiagnosticsResponse,
     RuntimeState,
     RuntimeStateUpdate,
+    RuntimeThreadProjection,
     RuntimeTurn,
 )
 
@@ -71,8 +72,10 @@ class RuntimeStateRepository:
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 10000;")
+        conn.execute("PRAGMA foreign_keys = ON;")
         return conn
 
     def _initialize(self) -> None:
@@ -104,6 +107,23 @@ class RuntimeStateRepository:
                     UNIQUE(owner_id, conversation_id, surface)
                 );
 
+                CREATE TABLE IF NOT EXISTS conversation_runtime_threads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('idle', 'active', 'contended', 'unavailable')),
+                    revision INTEGER NOT NULL CHECK(revision >= 0),
+                    active_runtime_session_id TEXT,
+                    active_runtime_turn_id TEXT,
+                    active_surface TEXT,
+                    active_request_id TEXT,
+                    last_activity_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(owner_id, conversation_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS conversation_runtime_turns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     runtime_turn_id TEXT NOT NULL UNIQUE,
@@ -117,7 +137,8 @@ class RuntimeStateRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     completed_at TEXT,
-                    FOREIGN KEY(runtime_session_id) REFERENCES conversation_runtime_sessions(runtime_session_id)
+                    FOREIGN KEY(runtime_session_id)
+                        REFERENCES conversation_runtime_sessions(runtime_session_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS conversation_runtime_events (
@@ -128,10 +149,220 @@ class RuntimeStateRepository:
                     event_type TEXT NOT NULL,
                     event_payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY(runtime_session_id) REFERENCES conversation_runtime_sessions(runtime_session_id)
+                    FOREIGN KEY(runtime_session_id)
+                        REFERENCES conversation_runtime_sessions(runtime_session_id)
                 );
                 """
             )
+
+    def resolve_thread(
+        self,
+        *,
+        owner_id: str,
+        conversation_id: str,
+    ) -> RuntimeThreadProjection:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            row = self._ensure_thread(
+                conn,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
+            return self._thread_from_row(conn, row)
+
+    def _ensure_thread(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        conversation_id: str,
+    ) -> sqlite3.Row:
+        row = self._thread_by_key(
+            conn,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+        )
+        if row is None:
+            active_rows = self._non_terminal_turn_rows(
+                conn,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
+            now = _now()
+            state = "idle"
+            active_runtime_session_id = None
+            active_runtime_turn_id = None
+            active_surface = None
+            if len(active_rows) == 1:
+                state = "active"
+                active_runtime_session_id = active_rows[0]["runtime_session_id"]
+                active_runtime_turn_id = active_rows[0]["runtime_turn_id"]
+                active_surface = active_rows[0]["surface"]
+            elif len(active_rows) > 1:
+                state = "contended"
+            conn.execute(
+                """
+                INSERT INTO conversation_runtime_threads (
+                    owner_id, conversation_id, state, revision,
+                    active_runtime_session_id, active_runtime_turn_id,
+                    active_surface, active_request_id, last_activity_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    owner_id,
+                    conversation_id,
+                    state,
+                    0,
+                    active_runtime_session_id,
+                    active_runtime_turn_id,
+                    active_surface,
+                    None,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            row = self._thread_by_key(
+                conn,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
+            assert row is not None
+        return self._validated_thread_row(conn, row)
+
+    def _validated_thread_row(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> sqlite3.Row:
+        if row["state"] in {"contended", "unavailable"}:
+            return row
+
+        active_rows = self._non_terminal_turn_rows(
+            conn,
+            owner_id=row["owner_id"],
+            conversation_id=row["conversation_id"],
+        )
+        consistent = not active_rows if row["state"] == "idle" else False
+        if row["state"] == "active" and len(active_rows) == 1:
+            active_row = active_rows[0]
+            consistent = all(
+                (
+                    row["active_runtime_session_id"] == active_row["runtime_session_id"],
+                    row["active_runtime_turn_id"] == active_row["runtime_turn_id"],
+                    row["active_surface"] == active_row["surface"],
+                )
+            )
+
+        if consistent:
+            return row
+
+        now = _now()
+        conn.execute(
+            """
+            UPDATE conversation_runtime_threads
+            SET state = 'unavailable', updated_at = ?
+            WHERE owner_id = ? AND conversation_id = ?;
+            """,
+            (now, row["owner_id"], row["conversation_id"]),
+        )
+        unavailable = self._thread_by_key(
+            conn,
+            owner_id=row["owner_id"],
+            conversation_id=row["conversation_id"],
+        )
+        assert unavailable is not None
+        return unavailable
+
+    def _resolve_session_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        request_id: str,
+        owner_id: str,
+        conversation_id: str,
+        surface: str,
+        surface_session_id: str | None,
+        active_mode: str | None,
+        record_event: bool = True,
+    ) -> RuntimeSession:
+        now = _now()
+        row = conn.execute(
+            """
+            SELECT * FROM conversation_runtime_sessions
+            WHERE owner_id = ? AND conversation_id = ? AND surface = ?
+            LIMIT 1;
+            """,
+            (owner_id, conversation_id, surface),
+        ).fetchone()
+        if row is None:
+            runtime_session_id = _session_id(owner_id, conversation_id, surface)
+            runtime_state_id = _state_id(owner_id, conversation_id, surface)
+            conn.execute(
+                """
+                INSERT INTO conversation_runtime_sessions (
+                    runtime_session_id, runtime_state_id, owner_id, conversation_id,
+                    surface, surface_session_id, status, active_mode, attention_state,
+                    active_scene, interaction_mode, attention_focus_json,
+                    temporary_constraints_json, reset_after_turn, trace_refs_json,
+                    started_at, last_activity_at, closed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    runtime_session_id,
+                    runtime_state_id,
+                    owner_id,
+                    conversation_id,
+                    surface,
+                    surface_session_id,
+                    "active",
+                    active_mode,
+                    None,
+                    None,
+                    None,
+                    _json(None),
+                    _json([]),
+                    0,
+                    _json([]),
+                    now,
+                    now,
+                    None,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            updates: dict[str, Any] = {
+                "last_activity_at": now,
+                "updated_at": now,
+            }
+            if surface_session_id is not None:
+                updates["surface_session_id"] = surface_session_id
+            if active_mode is not None:
+                updates["active_mode"] = active_mode
+            self._update_session_row(conn, row["runtime_session_id"], updates)
+
+        session = self._session_by_key(
+            conn,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
+        assert session is not None
+        if record_event:
+            self._record_event(
+                conn,
+                runtime_session_id=session.runtime_session_id,
+                runtime_turn_id=None,
+                event_type="session_resolved",
+                event_payload_json={
+                    "request_id": request_id,
+                    "surface": surface,
+                    "conversation_id": conversation_id,
+                },
+            )
+        return session
 
     def resolve_session(
         self,
@@ -143,80 +374,30 @@ class RuntimeStateRepository:
         surface_session_id: str | None = None,
         active_mode: str | None = None,
     ) -> RuntimeSession:
-        now = _now()
         with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM conversation_runtime_sessions
-                WHERE owner_id = ? AND conversation_id = ? AND surface = ?
-                LIMIT 1;
-                """,
-                (owner_id, conversation_id, surface),
-            ).fetchone()
-            if row is None:
-                runtime_session_id = _session_id(owner_id, conversation_id, surface)
-                runtime_state_id = _state_id(owner_id, conversation_id, surface)
-                conn.execute(
-                    """
-                    INSERT INTO conversation_runtime_sessions (
-                        runtime_session_id, runtime_state_id, owner_id, conversation_id,
-                        surface, surface_session_id, status, active_mode, attention_state,
-                        active_scene, interaction_mode, attention_focus_json,
-                        temporary_constraints_json, reset_after_turn, trace_refs_json,
-                        started_at, last_activity_at, closed_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        runtime_session_id,
-                        runtime_state_id,
-                        owner_id,
-                        conversation_id,
-                        surface,
-                        surface_session_id,
-                        "active",
-                        active_mode,
-                        None,
-                        None,
-                        None,
-                        _json(None),
-                        _json([]),
-                        0,
-                        _json([]),
-                        now,
-                        now,
-                        None,
-                        now,
-                        now,
-                    ),
-                )
-            else:
-                updates: dict[str, Any] = {
-                    "last_activity_at": now,
-                    "updated_at": now,
-                }
-                if surface_session_id is not None:
-                    updates["surface_session_id"] = surface_session_id
-                if active_mode is not None:
-                    updates["active_mode"] = active_mode
-                self._update_session_row(conn, row["runtime_session_id"], updates)
-
-            session = self._session_by_key(
+            conn.execute("BEGIN IMMEDIATE;")
+            self._ensure_thread(
                 conn,
                 owner_id=owner_id,
                 conversation_id=conversation_id,
-                surface=surface,
             )
-            assert session is not None
-            self._record_event(
+            session = self._resolve_session_in_transaction(
                 conn,
-                runtime_session_id=session.runtime_session_id,
-                runtime_turn_id=None,
-                event_type="session_resolved",
-                event_payload_json={
-                    "request_id": request_id,
-                    "surface": surface,
-                    "conversation_id": conversation_id,
-                },
+                request_id=request_id,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                surface=surface,
+                surface_session_id=surface_session_id,
+                active_mode=active_mode,
+            )
+            now = _now()
+            conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET last_activity_at = ?, updated_at = ?
+                WHERE owner_id = ? AND conversation_id = ?;
+                """,
+                (now, now, owner_id, conversation_id),
             )
             return session
 
@@ -272,7 +453,11 @@ class RuntimeStateRepository:
         surface: str,
         updates: RuntimeStateUpdate,
     ) -> RuntimeState:
-        state = self.resolve_state(owner_id=owner_id, conversation_id=conversation_id, surface=surface)
+        state = self.resolve_state(
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
         payload = updates.model_dump(exclude_unset=True, exclude_none=True)
         db_updates: dict[str, Any] = {"updated_at": _now(), "last_activity_at": _now()}
         if "active_scene" in payload:
@@ -290,11 +475,23 @@ class RuntimeStateRepository:
             db_updates["trace_refs_json"] = _json(payload["trace_refs"])
 
         with self._connect() as conn:
-            self._update_session_row(conn, state.runtime_state_id.replace("rtstate", "rtsession", 1), db_updates)
-        return self.resolve_state(owner_id=owner_id, conversation_id=conversation_id, surface=surface)
+            self._update_session_row(
+                conn,
+                state.runtime_state_id.replace("rtstate", "rtsession", 1),
+                db_updates,
+            )
+        return self.resolve_state(
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
 
     def reset_state(self, *, owner_id: str, conversation_id: str, surface: str) -> RuntimeState:
-        state = self.resolve_state(owner_id=owner_id, conversation_id=conversation_id, surface=surface)
+        state = self.resolve_state(
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
         with self._connect() as conn:
             self._update_session_row(
                 conn,
@@ -311,7 +508,11 @@ class RuntimeStateRepository:
                     "last_activity_at": _now(),
                 },
             )
-        return self.resolve_state(owner_id=owner_id, conversation_id=conversation_id, surface=surface)
+        return self.resolve_state(
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+        )
 
     def start_turn(
         self,
@@ -327,18 +528,52 @@ class RuntimeStateRepository:
         timing_policy: str | None = None,
         restraint_policy: str | None = None,
         continuation_state: str | None = None,
+        expected_thread_revision: int | None = None,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
-        session = self.resolve_session(
-            request_id=request_id,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            surface=surface,
-            surface_session_id=surface_session_id,
-            active_mode=active_mode,
-        )
-        created_at = _now()
-        runtime_turn_id = _turn_id(session.runtime_session_id, request_id, created_at)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            thread = self._ensure_thread(
+                conn,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
+            if thread["state"] == "active":
+                if (
+                    thread["active_request_id"] == request_id
+                    and thread["active_surface"] == surface
+                ):
+                    session = self._session_by_id(conn, thread["active_runtime_session_id"])
+                    turn = self._turn_by_id(conn, thread["active_runtime_turn_id"])
+                    event = self._turn_event(
+                        conn,
+                        runtime_turn_id=thread["active_runtime_turn_id"],
+                        event_type="turn_started",
+                        request_id=request_id,
+                    )
+                    if session is None or turn is None or event is None:
+                        raise RuntimeError("runtime_thread_unavailable")
+                    return session, turn, event
+                raise RuntimeError("runtime_thread_contended")
+            if thread["state"] == "contended":
+                raise RuntimeError("runtime_thread_contended")
+            if thread["state"] == "unavailable":
+                raise RuntimeError("runtime_thread_unavailable")
+            if expected_thread_revision is not None and (
+                expected_thread_revision != thread["revision"]
+            ):
+                raise RuntimeError("runtime_thread_revision_conflict")
+
+            session = self._resolve_session_in_transaction(
+                conn,
+                request_id=request_id,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                surface=surface,
+                surface_session_id=surface_session_id,
+                active_mode=active_mode,
+            )
+            created_at = _now()
+            runtime_turn_id = _turn_id(session.runtime_session_id, request_id, created_at)
             conn.execute(
                 """
                 INSERT INTO conversation_runtime_turns (
@@ -382,6 +617,28 @@ class RuntimeStateRepository:
                     "input_message_id": input_message_id,
                 },
             )
+            thread_update = conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET state = 'active', revision = revision + 1,
+                    active_runtime_session_id = ?, active_runtime_turn_id = ?,
+                    active_surface = ?, active_request_id = ?,
+                    last_activity_at = ?, updated_at = ?
+                WHERE owner_id = ? AND conversation_id = ?;
+                """,
+                (
+                    session.runtime_session_id,
+                    runtime_turn_id,
+                    surface,
+                    request_id,
+                    created_at,
+                    created_at,
+                    owner_id,
+                    conversation_id,
+                ),
+            )
+            if thread_update.rowcount != 1:
+                raise RuntimeError("runtime_thread_unavailable")
             turn = self._turn_by_id(conn, runtime_turn_id)
             updated_session = self._session_by_id(conn, session.runtime_session_id)
         assert turn is not None and updated_session is not None
@@ -400,9 +657,20 @@ class RuntimeStateRepository:
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         now = _now()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            session = self._session_by_id(conn, runtime_session_id)
+            if session is None:
+                raise RuntimeError("runtime_session_not_found")
             turn = self._turn_by_id(conn, runtime_turn_id)
             if turn is None:
                 raise RuntimeError("runtime_turn_not_found")
+            if turn.runtime_session_id != runtime_session_id:
+                raise RuntimeError("runtime_turn_session_mismatch")
+            if turn.turn_status in _TERMINAL_TURN_STATUSES:
+                raise RuntimeError("runtime_turn_not_current")
+            if turn_status in _TERMINAL_TURN_STATUSES:
+                raise RuntimeError("runtime_turn_not_current")
+            self._validate_current_turn(conn, session=session, turn=turn)
             updates: dict[str, Any] = {
                 "turn_status": turn_status,
                 "updated_at": now,
@@ -435,10 +703,20 @@ class RuntimeStateRepository:
                     "turn_status": turn_status,
                 },
             )
+            thread_update = conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET last_activity_at = ?, updated_at = ?
+                WHERE owner_id = ? AND conversation_id = ?;
+                """,
+                (now, now, session.owner_id, session.conversation_id),
+            )
+            if thread_update.rowcount != 1:
+                raise RuntimeError("runtime_thread_unavailable")
             updated_turn = self._turn_by_id(conn, runtime_turn_id)
-            session = self._session_by_id(conn, runtime_session_id)
-        assert updated_turn is not None and session is not None
-        return session, updated_turn, event
+            updated_session = self._session_by_id(conn, runtime_session_id)
+        assert updated_turn is not None and updated_session is not None
+        return updated_session, updated_turn, event
 
     def complete_turn(
         self,
@@ -451,9 +729,33 @@ class RuntimeStateRepository:
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         now = _now()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            session = self._session_by_id(conn, runtime_session_id)
+            if session is None:
+                raise RuntimeError("runtime_session_not_found")
             turn = self._turn_by_id(conn, runtime_turn_id)
             if turn is None:
                 raise RuntimeError("runtime_turn_not_found")
+            if turn.runtime_session_id != runtime_session_id:
+                raise RuntimeError("runtime_turn_session_mismatch")
+            if turn.turn_status in _TERMINAL_TURN_STATUSES:
+                event = self._turn_event(
+                    conn,
+                    runtime_turn_id=runtime_turn_id,
+                    event_type="turn_completed",
+                    request_id=request_id,
+                    turn_status=turn_status,
+                )
+                if (
+                    turn.turn_status == turn_status
+                    and event is not None
+                    and event.event_payload_json.get("continuation_state")
+                    == continuation_state
+                ):
+                    return session, turn, event
+                raise RuntimeError("runtime_turn_not_current")
+
+            thread = self._validate_current_turn(conn, session=session, turn=turn)
             self._update_turn_row(
                 conn,
                 runtime_turn_id,
@@ -484,10 +786,83 @@ class RuntimeStateRepository:
                     "continuation_state": continuation_state,
                 },
             )
+            thread_update = conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET state = 'idle', revision = revision + 1,
+                    active_runtime_session_id = NULL,
+                    active_runtime_turn_id = NULL,
+                    active_surface = NULL, active_request_id = NULL,
+                    last_activity_at = ?, updated_at = ?
+                WHERE owner_id = ? AND conversation_id = ? AND revision = ?;
+                """,
+                (
+                    now,
+                    now,
+                    session.owner_id,
+                    session.conversation_id,
+                    thread["revision"],
+                ),
+            )
+            if thread_update.rowcount != 1:
+                raise RuntimeError("runtime_thread_unavailable")
             updated_turn = self._turn_by_id(conn, runtime_turn_id)
-            session = self._session_by_id(conn, runtime_session_id)
-        assert updated_turn is not None and session is not None
-        return session, updated_turn, event
+            updated_session = self._session_by_id(conn, runtime_session_id)
+        assert updated_turn is not None and updated_session is not None
+        return updated_session, updated_turn, event
+
+    def _validate_current_turn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        session: RuntimeSession,
+        turn: RuntimeTurn,
+    ) -> sqlite3.Row:
+        thread = self._ensure_thread(
+            conn,
+            owner_id=session.owner_id,
+            conversation_id=session.conversation_id,
+        )
+        if thread["state"] == "contended":
+            raise RuntimeError("runtime_thread_contended")
+        if thread["state"] == "unavailable":
+            raise RuntimeError("runtime_thread_unavailable")
+        if (
+            thread["state"] != "active"
+            or thread["active_runtime_session_id"] != session.runtime_session_id
+            or thread["active_runtime_turn_id"] != turn.runtime_turn_id
+            or thread["active_surface"] != session.surface
+        ):
+            raise RuntimeError("runtime_turn_not_current")
+        return thread
+
+    def _turn_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        runtime_turn_id: str,
+        event_type: str,
+        request_id: str,
+        turn_status: str | None = None,
+    ) -> RuntimeEvent | None:
+        rows = conn.execute(
+            """
+            SELECT * FROM conversation_runtime_events
+            WHERE runtime_turn_id = ? AND event_type = ?
+            ORDER BY id ASC;
+            """,
+            (runtime_turn_id, event_type),
+        ).fetchall()
+        for row in rows:
+            event = self._event_from_row(row)
+            if event.event_payload_json.get("request_id") != request_id:
+                continue
+            if turn_status is not None and (
+                event.event_payload_json.get("turn_status") != turn_status
+            ):
+                continue
+            return event
+        return None
 
     def record_session_event(
         self,
@@ -515,11 +890,18 @@ class RuntimeStateRepository:
     ) -> RuntimeTurn:
         now = _now()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            session = self._session_by_id(conn, runtime_session_id)
+            if session is None:
+                raise RuntimeError("runtime_session_not_found")
             turn = self._turn_by_id(conn, runtime_turn_id)
             if turn is None:
                 raise RuntimeError("runtime_turn_not_found")
             if turn.runtime_session_id != runtime_session_id:
                 raise RuntimeError("runtime_turn_session_mismatch")
+            if turn.turn_status in _TERMINAL_TURN_STATUSES:
+                raise RuntimeError("runtime_turn_not_current")
+            self._validate_current_turn(conn, session=session, turn=turn)
             self._update_turn_row(
                 conn,
                 runtime_turn_id,
@@ -541,11 +923,18 @@ class RuntimeStateRepository:
     ) -> RuntimeTurn:
         now = _now()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            session = self._session_by_id(conn, runtime_session_id)
+            if session is None:
+                raise RuntimeError("runtime_session_not_found")
             turn = self._turn_by_id(conn, runtime_turn_id)
             if turn is None:
                 raise RuntimeError("runtime_turn_not_found")
             if turn.runtime_session_id != runtime_session_id:
                 raise RuntimeError("runtime_turn_session_mismatch")
+            if turn.turn_status in _TERMINAL_TURN_STATUSES:
+                raise RuntimeError("runtime_turn_not_current")
+            self._validate_current_turn(conn, session=session, turn=turn)
             self._update_turn_row(
                 conn,
                 runtime_turn_id,
@@ -598,6 +987,42 @@ class RuntimeStateRepository:
 
     def list_events_for_tests(self, runtime_session_id: str) -> list[RuntimeEvent]:
         return self.diagnostics(runtime_session_id).events
+
+    def _thread_by_key(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        conversation_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT * FROM conversation_runtime_threads
+            WHERE owner_id = ? AND conversation_id = ?
+            LIMIT 1;
+            """,
+            (owner_id, conversation_id),
+        ).fetchone()
+
+    def _non_terminal_turn_rows(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        conversation_id: str,
+    ) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT turns.*, sessions.owner_id, sessions.conversation_id, sessions.surface
+            FROM conversation_runtime_turns AS turns
+            JOIN conversation_runtime_sessions AS sessions
+              ON sessions.runtime_session_id = turns.runtime_session_id
+            WHERE sessions.owner_id = ? AND sessions.conversation_id = ?
+              AND turns.turn_status NOT IN ('completed', 'abandoned')
+            ORDER BY turns.id ASC;
+            """,
+            (owner_id, conversation_id),
+        ).fetchall()
 
     def _record_event(
         self,
@@ -659,7 +1084,11 @@ class RuntimeStateRepository:
             return None
         return self._session_from_row(row)
 
-    def _session_by_id(self, conn: sqlite3.Connection, runtime_session_id: str) -> RuntimeSession | None:
+    def _session_by_id(
+        self,
+        conn: sqlite3.Connection,
+        runtime_session_id: str,
+    ) -> RuntimeSession | None:
         row = conn.execute(
             "SELECT * FROM conversation_runtime_sessions WHERE runtime_session_id = ? LIMIT 1;",
             (runtime_session_id,),
@@ -738,6 +1167,35 @@ class RuntimeStateRepository:
             updated_at=row["updated_at"],
         )
 
+    def _thread_from_row(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> RuntimeThreadProjection:
+        session_rows = conn.execute(
+            """
+            SELECT surface FROM conversation_runtime_sessions
+            WHERE owner_id = ? AND conversation_id = ?
+            ORDER BY surface ASC;
+            """,
+            (row["owner_id"], row["conversation_id"]),
+        ).fetchall()
+        participating_surfaces = sorted({item["surface"] for item in session_rows})[:32]
+        return RuntimeThreadProjection(
+            owner_id=row["owner_id"],
+            conversation_id=row["conversation_id"],
+            state=row["state"],
+            revision=row["revision"],
+            active_runtime_session_id=row["active_runtime_session_id"],
+            active_runtime_turn_id=row["active_runtime_turn_id"],
+            active_surface=row["active_surface"],
+            participating_surfaces=participating_surfaces,
+            participating_session_count=len(session_rows),
+            last_activity_at=row["last_activity_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
     def _turn_from_row(self, row: sqlite3.Row) -> RuntimeTurn:
         return RuntimeTurn(
             runtime_turn_id=row["runtime_turn_id"],
@@ -798,6 +1256,17 @@ def runtime_session_by_id(runtime_session_id: str) -> RuntimeSession | None:
     return runtime_state_repository().session_by_id(runtime_session_id)
 
 
+def resolve_runtime_thread(
+    *,
+    owner_id: str,
+    conversation_id: str,
+) -> RuntimeThreadProjection:
+    return runtime_state_repository().resolve_thread(
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+    )
+
+
 def resolve_state(*, owner_id: str, conversation_id: str, surface: str) -> RuntimeState:
     return runtime_state_repository().resolve_state(
         owner_id=owner_id,
@@ -842,6 +1311,7 @@ def start_turn(
     timing_policy: str | None = None,
     restraint_policy: str | None = None,
     continuation_state: str | None = None,
+    expected_thread_revision: int | None = None,
 ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
     return runtime_state_repository().start_turn(
         request_id=request_id,
@@ -855,6 +1325,7 @@ def start_turn(
         timing_policy=timing_policy,
         restraint_policy=restraint_policy,
         continuation_state=continuation_state,
+        expected_thread_revision=expected_thread_revision,
     )
 
 

@@ -41,6 +41,7 @@ def _available_capability_registry():
 def _start_turn(
     client: TestClient,
     *,
+    request_id: str = "capability-turn",
     surface: str = "dev",
     owner_id: str = "owner",
     conversation_id: str = "conv-1",
@@ -49,7 +50,7 @@ def _start_turn(
         "/v1/runtime/turns/start",
         json={
             **_base(surface=surface),
-            "request_id": "capability-turn",
+            "request_id": request_id,
             "owner_id": owner_id,
             "conversation_id": conversation_id,
         },
@@ -337,7 +338,10 @@ def _issue_confirmed_challenge(
     argument_digest: str = "args_dispatch_bound",
     request_overrides: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], dict[str, object], str]:
-    origin_turn = _start_turn(client)
+    origin_turn = _start_turn(
+        client,
+        request_id=f"challenge-origin-{argument_digest}",
+    )
     overrides = dict(request_overrides or {})
     capability_id = str(overrides.pop("capability_id", "integration.external_write.test"))
     operation_class = str(overrides.pop("operation_class", "external_write"))
@@ -353,7 +357,11 @@ def _issue_confirmed_challenge(
         "result"
     ]
     assert selection["decision_code"] == "confirmation_required"
-    confirm_turn = _start_turn(client)
+    _complete_turn(client, origin_turn)
+    confirm_turn = _start_turn(
+        client,
+        request_id=f"challenge-confirm-{argument_digest}",
+    )
     confirmed = client.post(
         "/v1/capabilities/confirm",
         json={
@@ -2016,7 +2024,7 @@ def test_canonical_jellyfin_selection_issues_one_bounded_challenge():
 
 def test_distinct_current_turn_resumes_exact_jellyfin_challenge_without_replacement():
     client = TestClient(app)
-    origin_turn = _start_turn(client)
+    origin_turn = _start_turn(client, request_id="jellyfin-origin-turn")
     first = client.post(
         "/v1/capabilities/authorize",
         json=_jellyfin_authorization_request(
@@ -2027,7 +2035,8 @@ def test_distinct_current_turn_resumes_exact_jellyfin_challenge_without_replacem
         ),
     ).json()["result"]
     stored = _challenge_record(first["challenge_ref"])
-    continuation_turn = _start_turn(client)
+    _complete_turn(client, origin_turn)
+    continuation_turn = _start_turn(client, request_id="jellyfin-continuation-turn")
 
     continuation = client.post(
         "/v1/capabilities/authorize",
@@ -2886,7 +2895,7 @@ def test_world_state_authorization_uses_persona_surface_scope_and_sensitivity():
 
 def test_world_state_confirmation_policy_requires_current_confirmation_for_non_read():
     client = TestClient(app)
-    turn = _start_turn(client)
+    turn = _start_turn(client, request_id="claim-policy-origin-turn")
     claim = client.post(
         "/v1/world-state/claims/upsert",
         json={
@@ -2909,7 +2918,8 @@ def test_world_state_confirmation_policy_requires_current_confirmation_for_non_r
     assert selection["decision_code"] == "confirmation_required"
     assert selection["challenge_ref"]
 
-    next_turn = _start_turn(client)
+    _complete_turn(client, turn)
+    next_turn = _start_turn(client, request_id="claim-policy-confirm-turn")
     confirmed = client.post(
         "/v1/capabilities/confirm",
         json={
@@ -2956,7 +2966,7 @@ def test_invalid_continuation_identity_does_not_issue_replacement_or_allow_selec
     expected_reason: str,
 ):
     client = TestClient(app)
-    origin_turn = _start_turn(client)
+    origin_turn = _start_turn(client, request_id=f"continuation-origin-turn-{case}")
     first = client.post(
         "/v1/capabilities/authorize",
         json=_authorization_request(
@@ -2968,7 +2978,11 @@ def test_invalid_continuation_identity_does_not_issue_replacement_or_allow_selec
             argument_digest="args_continuation_identity",
         ),
     ).json()["result"]
-    continuation_turn = _start_turn(client)
+    _complete_turn(client, origin_turn)
+    continuation_turn = _start_turn(
+        client,
+        request_id=f"continuation-current-turn-{case}",
+    )
     capability_id = "integration.external_write.test"
     operation_class = "external_write"
     argument_digest = "args_continuation_identity"
@@ -2981,7 +2995,8 @@ def test_invalid_continuation_identity_does_not_issue_replacement_or_allow_selec
     elif case == "same_turn":
         attempt_turn = origin_turn
     elif case == "not_current":
-        _start_turn(client)
+        _complete_turn(client, continuation_turn)
+        _start_turn(client, request_id=f"continuation-later-turn-{case}")
     elif case == "created_before_issue":
         issued_at = str(_challenge_record(first["challenge_ref"])["issued_at"])
         with capability_authorization_repository()._connect() as conn:
@@ -2997,10 +3012,18 @@ def test_invalid_continuation_identity_does_not_issue_replacement_or_allow_selec
                 ),
             )
     elif case == "wrong_owner":
-        attempt_turn = _start_turn(client, owner_id="owner-2")
+        attempt_turn = _start_turn(
+            client,
+            request_id=f"continuation-wrong-owner-turn-{case}",
+            owner_id="owner-2",
+        )
         request_overrides["owner_id"] = "owner-2"
     elif case == "wrong_conversation_session":
-        attempt_turn = _start_turn(client, conversation_id="conv-2")
+        attempt_turn = _start_turn(
+            client,
+            request_id=f"continuation-wrong-conversation-turn-{case}",
+            conversation_id="conv-2",
+        )
         request_overrides["conversation_id"] = "conv-2"
     elif case == "wrong_capability":
         capability_id = "integration.external_write.other"
@@ -3054,7 +3077,10 @@ def test_invalid_continuation_state_does_not_issue_replacement_or_dispatch_again
     expected_reason: str,
 ):
     client = TestClient(app)
-    origin_turn = _start_turn(client)
+    origin_turn = _start_turn(
+        client,
+        request_id=f"continuation-state-origin-turn-{challenge_state}",
+    )
     first = client.post(
         "/v1/capabilities/authorize",
         json=_authorization_request(
@@ -3066,7 +3092,11 @@ def test_invalid_continuation_state_does_not_issue_replacement_or_dispatch_again
             argument_digest="args_continuation_state",
         ),
     ).json()["result"]
-    continuation_turn = _start_turn(client)
+    _complete_turn(client, origin_turn)
+    continuation_turn = _start_turn(
+        client,
+        request_id=f"continuation-state-current-turn-{challenge_state}",
+    )
     challenge_ref = first["challenge_ref"]
 
     if challenge_state == "expired":
@@ -3154,7 +3184,7 @@ def test_invalid_continuation_state_does_not_issue_replacement_or_dispatch_again
 
 def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_remain_compatible():
     client = TestClient(app)
-    origin_turn = _start_turn(client)
+    origin_turn = _start_turn(client, request_id="generic-origin-turn")
     first = client.post(
         "/v1/capabilities/authorize",
         json=_authorization_request(
@@ -3166,7 +3196,8 @@ def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_r
             argument_digest="args_generic_compatibility",
         ),
     ).json()["result"]
-    confirmation_turn = _start_turn(client)
+    _complete_turn(client, origin_turn)
+    confirmation_turn = _start_turn(client, request_id="generic-confirmation-turn")
     continuation = client.post(
         "/v1/capabilities/authorize",
         json=_authorization_request(
@@ -3260,7 +3291,7 @@ def test_unregistered_generic_confirmation_continuation_and_atomic_consumption_r
 
 def test_risky_confirmation_is_exact_one_use_and_privacy_safe():
     client = TestClient(app)
-    turn = _start_turn(client)
+    turn = _start_turn(client, request_id="one-use-origin-turn")
     selection_request = _authorized_request(
         turn,
         authorization_phase="selection",
@@ -3309,7 +3340,8 @@ def test_risky_confirmation_is_exact_one_use_and_privacy_safe():
     assert same_turn.status_code == 400
     assert same_turn.json()["detail"] == "confirmation_turn_not_distinct"
 
-    next_turn = _start_turn(client)
+    _complete_turn(client, turn)
+    next_turn = _start_turn(client, request_id="one-use-confirmation-turn")
     confirmed = client.post(
         "/v1/capabilities/confirm",
         json={
@@ -3353,7 +3385,7 @@ def test_risky_confirmation_is_exact_one_use_and_privacy_safe():
 
 def test_explicit_confirmation_rejection_cannot_later_dispatch_or_be_accepted():
     client = TestClient(app)
-    turn = _start_turn(client)
+    turn = _start_turn(client, request_id="rejection-origin-turn")
     selection = client.post(
         "/v1/capabilities/authorize",
         json=_authorized_request(
@@ -3364,7 +3396,8 @@ def test_explicit_confirmation_rejection_cannot_later_dispatch_or_be_accepted():
             argument_digest="args_rejected",
         ),
     ).json()["result"]
-    next_turn = _start_turn(client)
+    _complete_turn(client, turn)
+    next_turn = _start_turn(client, request_id="rejection-confirmation-turn")
     rejected = client.post(
         "/v1/capabilities/confirm",
         json={
@@ -3412,7 +3445,7 @@ def test_explicit_confirmation_rejection_cannot_later_dispatch_or_be_accepted():
 
 def test_concurrent_dispatch_consumes_confirmation_once():
     client = TestClient(app)
-    turn = _start_turn(client)
+    turn = _start_turn(client, request_id="concurrent-origin-turn")
     selection = client.post(
         "/v1/capabilities/authorize",
         json=_authorized_request(
@@ -3423,7 +3456,8 @@ def test_concurrent_dispatch_consumes_confirmation_once():
             argument_digest="args_concurrent",
         ),
     ).json()["result"]
-    next_turn = _start_turn(client)
+    _complete_turn(client, turn)
+    next_turn = _start_turn(client, request_id="concurrent-confirmation-turn")
     confirmed = client.post(
         "/v1/capabilities/confirm",
         json={
@@ -3500,7 +3534,8 @@ def test_dispatch_requires_confirmed_current_turn_and_missing_turn_does_not_cons
 def test_confirmation_on_turn_cannot_dispatch_on_later_turn_without_consuming():
     client = TestClient(app)
     origin_turn, confirm_turn, challenge_ref = _issue_confirmed_challenge(client)
-    later_turn = _start_turn(client)
+    _complete_turn(client, confirm_turn)
+    later_turn = _start_turn(client, request_id="later-dispatch-turn")
     runtime_session_id = origin_turn["runtime_session"]["runtime_session_id"]
 
     later_dispatch = client.post(
@@ -3606,7 +3641,7 @@ def test_relationship_denial_after_confirmation_does_not_consume():
 def test_world_state_denial_and_revalidation_after_confirmation_do_not_consume():
     client = TestClient(app)
     _configure_repo_verifier()
-    origin_turn = _start_turn(client)
+    origin_turn = _start_turn(client, request_id="world-denial-origin-turn")
     claim = client.post(
         "/v1/world-state/claims/upsert",
         json={
@@ -3626,7 +3661,8 @@ def test_world_state_denial_and_revalidation_after_confirmation_do_not_consume()
     selection = client.post("/v1/capabilities/authorize", json=selection_request).json()[
         "result"
     ]
-    confirm_turn = _start_turn(client)
+    _complete_turn(client, origin_turn)
+    confirm_turn = _start_turn(client, request_id="world-denial-confirmation-turn")
     confirmed = client.post(
         "/v1/capabilities/confirm",
         json={
@@ -3673,6 +3709,7 @@ def test_world_state_denial_and_revalidation_after_confirmation_do_not_consume()
             ),
         },
     ).json()["claim"]
+    _complete_turn(client, confirm_turn)
     stale_origin, stale_turn, stale_challenge = _issue_confirmed_challenge(
         client,
         argument_digest="args_stale_denied",
