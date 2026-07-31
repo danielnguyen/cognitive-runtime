@@ -304,7 +304,8 @@ async def test_confirmation_response_projection_requires_immediately_preceding_a
 
 
 @pytest.mark.asyncio
-async def test_older_assistant_question_separated_by_user_message_does_not_enable_confirmation_response():
+async def test_older_assistant_question_separated_by_user_message_does_not_enable_confirmation_response(  # noqa: E501
+):
     result, diagnostics = await _governance_turn_diagnostics(
         request_id="rid-confirmation-stale",
         current_user_text="Yes.",
@@ -397,6 +398,18 @@ async def test_existing_supported_intent_class_mappings_remain_unchanged():
             recent_messages=recent_messages,
         )
         assert diagnostics["latest_turn"]["intent_class"] == expected_intent_class
+        completion = await _post(
+            "/v1/runtime/turns/complete",
+            {
+                "request_id": f"{request_id}-complete",
+                "runtime_session_id": diagnostics["runtime_session"][
+                    "runtime_session_id"
+                ],
+                "runtime_turn_id": diagnostics["latest_turn"]["runtime_turn_id"],
+                "turn_status": "completed",
+            },
+        )
+        assert completion.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -969,6 +982,18 @@ async def test_history_projection_modifies_only_the_requested_runtime_turn():
             "intent_class": "existing_intent",
         },
     )
+    assert first.status_code == 200
+    first_turn_id = first.json()["runtime_turn"]["runtime_turn_id"]
+    completion = await _post(
+        "/v1/runtime/turns/complete",
+        {
+            "request_id": "rid-unrelated-first-complete",
+            "runtime_session_id": first.json()["runtime_session"]["runtime_session_id"],
+            "runtime_turn_id": first_turn_id,
+            "turn_status": "completed",
+        },
+    )
+    assert completion.status_code == 200
     second = await _post(
         "/v1/runtime/turns/start",
         {
@@ -980,7 +1005,7 @@ async def test_history_projection_modifies_only_the_requested_runtime_turn():
             "intent_class": "second_existing_intent",
         },
     )
-    first_turn_id = first.json()["runtime_turn"]["runtime_turn_id"]
+    assert second.status_code == 200
     runtime_session_id = second.json()["runtime_session"]["runtime_session_id"]
     second_turn_id = second.json()["runtime_turn"]["runtime_turn_id"]
 

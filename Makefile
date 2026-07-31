@@ -75,6 +75,11 @@ smoke:
 	echo "==> GET $$CR_BASE/v1/runtime/sessions/$$RTSESSION"; \
 	curl -sS "$$CR_BASE/v1/runtime/sessions/$$RTSESSION" \
 	  | jq -e '.latest_turn.intent_class == "action_command" and ([.events[] | select(.event_type == "interaction_governance_evaluated")] | length) >= 1' >/dev/null; \
+	echo "==> POST $$CR_BASE/v1/runtime/turns/complete"; \
+	curl -sS -X POST "$$CR_BASE/v1/runtime/turns/complete" \
+	  -H "Content-Type: application/json" \
+	  -d '{"request_id":"smoke-turn-complete","runtime_session_id":"'"$$RTSESSION"'","runtime_turn_id":"'"$$RTTURN"'","turn_status":"completed"}' \
+	  | jq -e '.runtime_turn.turn_status == "completed"' >/dev/null; \
 	echo "Smoke passed."
 
 dev-start:

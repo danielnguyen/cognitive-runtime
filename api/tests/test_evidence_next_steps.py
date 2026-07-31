@@ -868,6 +868,16 @@ def test_mismatched_turn_and_runtime_scope_fail_boundedly():
         [_requirement("missing", "targeted_evidence")],
         [],
     )
+    completion = client.post(
+        "/v1/runtime/turns/complete",
+        json={
+            "request_id": f"complete-{scope['request_id']}",
+            "runtime_session_id": scope["runtime_session_id"],
+            "runtime_turn_id": scope["runtime_turn_id"],
+            "turn_status": "completed",
+        },
+    )
+    assert completion.status_code == 200
     next_turn = client.post(
         "/v1/runtime/turns/start",
         json={

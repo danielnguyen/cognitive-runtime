@@ -19,14 +19,55 @@ Session and turn operations provide a durable local runtime lifecycle:
 
 | Operation | Endpoint |
 | --- | --- |
+| Resolve a shared conversation projection | `POST /v1/runtime/threads/resolve` |
 | Resolve a session | `POST /v1/runtime/sessions/resolve` |
 | Read session diagnostics | `GET /v1/runtime/sessions/{runtime_session_id}` |
 | Start a turn | `POST /v1/runtime/turns/start` |
 | Update a turn | `POST /v1/runtime/turns/update` |
 | Complete a turn | `POST /v1/runtime/turns/complete` |
 
+One shared projection is persisted for each owner and conversation. Surface
+sessions remain separate, so each surface retains its own runtime session,
+surface session identifier, and operational state while participating in the
+same projection. Resolving a projection does not assert that the durable
+conversation exists, belongs to the caller, or may be resumed. Exact durable
+authorization remains an upstream responsibility.
+
+`POST /v1/runtime/threads/resolve` accepts `request_id`, `owner_id`, and
+`conversation_id`. Its bounded response contains the owner and conversation,
+thread state, non-negative revision, optional active runtime session, turn, and
+surface, sorted participating surfaces, participating session count, and
+timestamps. Thread state is one of `idle`, `active`, `contended`, or
+`unavailable`. The response contains no message content, provider output,
+semantic memory, or durable lifecycle decision.
+
+Turn admission is atomic across all surface sessions for the owner and
+conversation. `POST /v1/runtime/turns/start` accepts the optional non-negative
+`expected_thread_revision`. A matching revision admits an idle thread; a stale
+revision returns `runtime_thread_revision_conflict`. Callers may omit the field
+for compatibility. While a turn is active, another request or surface receives
+`runtime_thread_contended`. An exact retry from the same surface and request
+returns the existing admitted turn without advancing the revision.
+
+Admission advances the shared revision once. Ordinary turn updates do not
+advance it. Completion or abandonment releases the active admission and
+advances it once; an exact terminal retry does neither again. Active admission,
+terminal release, and revisions persist across repository and service restart.
+Preexisting state is reconstructed conservatively: no active turn becomes
+`idle`, one becomes `active`, and multiple active turns become `contended`.
+Inconsistent stored associations are exposed as `unavailable` without choosing
+or deleting a turn.
+
+Expected runtime-state failures use bounded reason codes. Contention, revision
+conflicts, and a non-current turn return `409`; session or turn absence returns
+`404`; a session/turn mismatch is a bounded client error; unavailable or failed
+persistence returns `503`. Responses do not expose storage paths, statements,
+exception details, identifiers from another surface, or turn content.
+
 Session diagnostics contain bounded state, turn, and event summaries. Runtime
-state and overlays are operational context, not canonical durable memory.
+state, projections, and overlays are operational context, not canonical durable
+memory. Shared admission coordinates active work; it does not itself decide
+whether a durable conversation is eligible to resume.
 
 ## Runtime policy evaluation
 

@@ -70,6 +70,8 @@ from models import (
     RuntimeStateResolveRequest,
     RuntimeStateResponse,
     RuntimeStateUpdateRequest,
+    RuntimeThreadProjection,
+    RuntimeThreadResolveRequest,
     RuntimeTurnCompleteRequest,
     RuntimeTurnResponse,
     RuntimeTurnStartRequest,
@@ -145,6 +147,7 @@ from services.runtime_state import (
     record_runtime_event,
     reset_state,
     resolve_runtime_session,
+    resolve_runtime_thread,
     resolve_state,
     start_turn,
     update_state,
@@ -264,6 +267,16 @@ _EVIDENCE_SHAPE_ERROR_STATUS = {
     "runtime_turn_not_found": 404,
 }
 
+_RUNTIME_STATE_ERROR_STATUS = {
+    "runtime_thread_contended": 409,
+    "runtime_thread_revision_conflict": 409,
+    "runtime_thread_unavailable": 503,
+    "runtime_turn_not_current": 409,
+    "runtime_turn_session_mismatch": 400,
+    "runtime_session_not_found": 404,
+    "runtime_turn_not_found": 404,
+}
+
 
 def _relationship_domain_http_error(exc: RuntimeError) -> HTTPException | None:
     detail = str(exc)
@@ -279,6 +292,15 @@ def _bounded_http_error(exc: RuntimeError, status_map: dict[str, int]) -> HTTPEx
     if status_code is None:
         return None
     return HTTPException(status_code=status_code, detail=detail)
+
+
+def _runtime_state_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, RuntimeError):
+        detail = str(exc)
+        status_code = _RUNTIME_STATE_ERROR_STATUS.get(detail)
+        if status_code is not None:
+            return HTTPException(status_code=status_code, detail=detail)
+    return HTTPException(status_code=503, detail="runtime_state_persistence_unavailable")
 
 
 @app.get("/healthz")
@@ -300,15 +322,31 @@ async def resolve_runtime_state(body: RuntimeStateResolveRequest) -> RuntimeStat
 async def resolve_runtime_session_endpoint(
     body: RuntimeSessionResolveRequest,
 ) -> RuntimeSessionResponse:
-    session = resolve_runtime_session(
-        request_id=body.request_id,
-        owner_id=body.owner_id,
-        conversation_id=body.conversation_id,
-        surface=body.surface,
-        surface_session_id=body.surface_session_id,
-        active_mode=body.active_mode,
-    )
+    try:
+        session = resolve_runtime_session(
+            request_id=body.request_id,
+            owner_id=body.owner_id,
+            conversation_id=body.conversation_id,
+            surface=body.surface,
+            surface_session_id=body.surface_session_id,
+            active_mode=body.active_mode,
+        )
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
     return RuntimeSessionResponse(runtime_session=session)
+
+
+@app.post("/v1/runtime/threads/resolve", response_model=RuntimeThreadProjection)
+async def resolve_runtime_thread_endpoint(
+    body: RuntimeThreadResolveRequest,
+) -> RuntimeThreadProjection:
+    try:
+        return resolve_runtime_thread(
+            owner_id=body.owner_id,
+            conversation_id=body.conversation_id,
+        )
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
 
 
 @app.get(
@@ -318,50 +356,63 @@ async def resolve_runtime_session_endpoint(
 async def runtime_session_diagnostics(
     runtime_session_id: str,
 ) -> RuntimeSessionDiagnosticsResponse:
-    return get_runtime_session(runtime_session_id)
+    try:
+        return get_runtime_session(runtime_session_id)
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
 
 
 @app.post("/v1/runtime/turns/start", response_model=RuntimeTurnResponse)
 async def runtime_turn_start(body: RuntimeTurnStartRequest) -> RuntimeTurnResponse:
-    session, turn, event = start_turn(
-        request_id=body.request_id,
-        owner_id=body.owner_id,
-        conversation_id=body.conversation_id,
-        surface=body.surface,
-        surface_session_id=body.surface_session_id,
-        active_mode=body.active_mode,
-        input_message_id=body.input_message_id,
-        intent_class=body.intent_class,
-        timing_policy=body.timing_policy,
-        restraint_policy=body.restraint_policy,
-        continuation_state=body.continuation_state,
-    )
+    try:
+        session, turn, event = start_turn(
+            request_id=body.request_id,
+            owner_id=body.owner_id,
+            conversation_id=body.conversation_id,
+            surface=body.surface,
+            surface_session_id=body.surface_session_id,
+            active_mode=body.active_mode,
+            input_message_id=body.input_message_id,
+            intent_class=body.intent_class,
+            timing_policy=body.timing_policy,
+            restraint_policy=body.restraint_policy,
+            continuation_state=body.continuation_state,
+            expected_thread_revision=body.expected_thread_revision,
+        )
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
     return RuntimeTurnResponse(runtime_session=session, runtime_turn=turn, event=event)
 
 
 @app.post("/v1/runtime/turns/update", response_model=RuntimeTurnResponse)
 async def runtime_turn_update(body: RuntimeTurnUpdateRequest) -> RuntimeTurnResponse:
-    session, turn, event = update_turn(
-        request_id=body.request_id,
-        runtime_session_id=body.runtime_session_id,
-        runtime_turn_id=body.runtime_turn_id,
-        turn_status=body.turn_status,
-        timing_policy=body.timing_policy,
-        restraint_policy=body.restraint_policy,
-        continuation_state=body.continuation_state,
-    )
+    try:
+        session, turn, event = update_turn(
+            request_id=body.request_id,
+            runtime_session_id=body.runtime_session_id,
+            runtime_turn_id=body.runtime_turn_id,
+            turn_status=body.turn_status,
+            timing_policy=body.timing_policy,
+            restraint_policy=body.restraint_policy,
+            continuation_state=body.continuation_state,
+        )
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
     return RuntimeTurnResponse(runtime_session=session, runtime_turn=turn, event=event)
 
 
 @app.post("/v1/runtime/turns/complete", response_model=RuntimeTurnResponse)
 async def runtime_turn_complete(body: RuntimeTurnCompleteRequest) -> RuntimeTurnResponse:
-    session, turn, event = complete_turn(
-        request_id=body.request_id,
-        runtime_session_id=body.runtime_session_id,
-        runtime_turn_id=body.runtime_turn_id,
-        turn_status=body.turn_status,
-        continuation_state=body.continuation_state,
-    )
+    try:
+        session, turn, event = complete_turn(
+            request_id=body.request_id,
+            runtime_session_id=body.runtime_session_id,
+            runtime_turn_id=body.runtime_turn_id,
+            turn_status=body.turn_status,
+            continuation_state=body.continuation_state,
+        )
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
     return RuntimeTurnResponse(runtime_session=session, runtime_turn=turn, event=event)
 
 
