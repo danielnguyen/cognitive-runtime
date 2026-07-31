@@ -403,6 +403,104 @@ def test_one_thread_projection_is_shared_by_distinct_surface_sessions(tmp_path: 
     assert total_count == 3
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/runtime/sessions/resolve",
+        "/v1/runtime/turns/start",
+        "/v1/runtime/state/resolve",
+    ],
+)
+def test_public_runtime_requests_reject_empty_surface_without_persistence(
+    tmp_path: Path,
+    path: str,
+):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+
+    response = client.post(
+        path,
+        json={
+            "request_id": "empty-surface-request",
+            "owner_id": "owner-empty-surface",
+            "conversation_id": "conversation-empty-surface",
+            "surface": "",
+        },
+    )
+
+    assert response.status_code == 422
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_sessions;"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_threads;"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_turns;"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_events;"
+        ).fetchone()[0] == 0
+
+
+def test_legacy_empty_surface_remains_visible_in_thread_projection(tmp_path: Path):
+    db_path = _use_database(tmp_path, "legacy-empty-surface.sqlite3")
+    timestamp = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversation_runtime_sessions (
+                runtime_session_id, runtime_state_id, owner_id, conversation_id,
+                surface, surface_session_id, status, active_mode, attention_state,
+                active_scene, interaction_mode, attention_focus_json,
+                temporary_constraints_json, reset_after_turn, trace_refs_json,
+                started_at, last_activity_at, closed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, '', NULL, 'active', NULL, NULL, NULL, NULL,
+                      'null', '[]', 0, '[]', ?, ?, NULL, ?, ?);
+            """,
+            (
+                "legacy-empty-surface-session",
+                "legacy-empty-surface-state",
+                "owner-legacy-empty-surface",
+                "conversation-legacy-empty-surface",
+                timestamp,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        stored_before = conn.execute(
+            """
+            SELECT * FROM conversation_runtime_sessions
+            WHERE runtime_session_id = 'legacy-empty-surface-session';
+            """
+        ).fetchone()
+
+    response = _thread(
+        TestClient(app),
+        "owner-legacy-empty-surface",
+        "conversation-legacy-empty-surface",
+    )
+
+    assert response.status_code == 200
+    projection = response.json()
+    assert projection["state"] == "idle"
+    assert projection["participating_surfaces"] == [""]
+    assert projection["participating_session_count"] == 1
+    with sqlite3.connect(db_path) as conn:
+        stored_after = conn.execute(
+            """
+            SELECT * FROM conversation_runtime_sessions
+            WHERE runtime_session_id = 'legacy-empty-surface-session';
+            """
+        ).fetchone()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_sessions;"
+        ).fetchone()[0] == 1
+    assert stored_after == stored_before
+
+
 def test_cross_surface_admission_contends_without_mutation(tmp_path: Path):
     db_path = _use_database(tmp_path)
     client = TestClient(app)

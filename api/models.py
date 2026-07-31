@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 AttentionStatus = Literal["active", "paused", "resolved"]
 BoundedLabel = Annotated[str, Field(min_length=1, max_length=64)]
+BoundedSurface = Annotated[str, Field(max_length=64)]
 BoundedTraceRef = Annotated[str, Field(min_length=1, max_length=120)]
 BoundedCompanionContent = Annotated[str, Field(min_length=1, max_length=1200)]
 BoundedScene = Annotated[str, Field(min_length=1, max_length=64)]
@@ -56,7 +57,7 @@ class RuntimeStateResolveRequest(BaseModel):
     request_id: str = Field(max_length=120)
     owner_id: str = Field(max_length=120)
     conversation_id: str = Field(max_length=120)
-    surface: str = Field(default="unknown", max_length=64)
+    surface: str = Field(default="unknown", min_length=1, max_length=64)
 
 
 class RuntimeStateUpdate(BaseModel):
@@ -215,8 +216,8 @@ class RuntimeThreadProjection(BaseModel):
     revision: int = Field(ge=0)
     active_runtime_session_id: str | None = Field(default=None, max_length=120)
     active_runtime_turn_id: str | None = Field(default=None, max_length=120)
-    active_surface: str | None = Field(default=None, max_length=64)
-    participating_surfaces: list[BoundedLabel] = Field(default_factory=list, max_length=32)
+    active_surface: BoundedSurface | None = None
+    participating_surfaces: list[BoundedSurface] = Field(default_factory=list, max_length=32)
     participating_session_count: int = Field(ge=0)
     last_activity_at: str
     created_at: str

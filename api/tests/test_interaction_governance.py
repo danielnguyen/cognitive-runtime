@@ -304,8 +304,8 @@ async def test_confirmation_response_projection_requires_immediately_preceding_a
 
 
 @pytest.mark.asyncio
-async def \
-    test_older_assistant_question_separated_by_user_message_does_not_enable_confirmation_response():
+async def test_older_assistant_question_separated_by_user_message_does_not_enable_confirmation_response(  # noqa: E501
+):
     result, diagnostics = await _governance_turn_diagnostics(
         request_id="rid-confirmation-stale",
         current_user_text="Yes.",
