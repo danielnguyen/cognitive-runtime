@@ -20,6 +20,7 @@ Session and turn operations provide a durable local runtime lifecycle:
 | Operation | Endpoint |
 | --- | --- |
 | Resolve a shared conversation projection | `POST /v1/runtime/threads/resolve` |
+| Select a bounded continuation candidate | `POST /v1/runtime/continuations/select` |
 | Resolve a session | `POST /v1/runtime/sessions/resolve` |
 | Read session diagnostics | `GET /v1/runtime/sessions/{runtime_session_id}` |
 | Start a turn | `POST /v1/runtime/turns/start` |
@@ -68,6 +69,39 @@ Session diagnostics contain bounded state, turn, and event summaries. Runtime
 state, projections, and overlays are operational context, not canonical durable
 memory. Shared admission coordinates active work; it does not itself decide
 whether a durable conversation is eligible to resume.
+
+`POST /v1/runtime/continuations/select` evaluates a caller-supplied bounded set
+of owner-authorized durable conversation facts against existing runtime-thread
+state. The strict request contains `request_id`, `owner_id`, the current
+`surface`, an explicit `candidate_set_complete` boolean, a bounded
+`stale_after_seconds` interval, and at most eight unique candidates. Each
+candidate contains only `conversation_id`, durable lifecycle (`open`, `closed`,
+or `superseded`), and a timezone-aware durable update timestamp. The endpoint
+does not accept titles, content, summaries, client identifiers, message counts,
+semantic scores, embeddings, provider output, or adapter state.
+
+The response uses schema `runtime-continuation-selection.v1` and returns one
+policy result: `resume`, `create_new`, `clarify`, `wait`, or `decline`. A
+complete empty candidate set authorizes `create_new`. Exactly one fresh open
+candidate may return `resume` only when an existing, internally consistent idle
+thread has at least one participating runtime session. Multiple eligible
+candidates clarify; an active candidate waits; contended, unavailable, or
+inconsistent state declines. Missing runtime state, missing participating
+sessions, stale activity, and non-open durable lifecycle cannot resume a
+candidate. Durable recency alone never establishes eligibility.
+
+Only `resume` returns a conversation identifier and the exact inspected thread
+revision. The revision is read-only advisory input for normal atomic turn
+admission: it is not incremented, reserved, or guaranteed to remain current.
+Non-resume outcomes disclose no candidate identifiers, runtime session or turn
+identifiers, timestamps, active surfaces, or participating surfaces.
+
+Selection uses one read-only SQLite transaction and never creates or updates a
+conversation, runtime thread, runtime session, turn, event, revision, or
+activity timestamp. Cognitive Runtime does not call a durable store, provider,
+semantic retrieval system, model, or adapter while evaluating candidates. The
+current surface is response context only; it is not treated as a permission,
+presence, attention, or preferred-device signal.
 
 ## Runtime policy evaluation
 

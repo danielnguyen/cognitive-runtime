@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -222,6 +223,138 @@ class RuntimeThreadProjection(BaseModel):
     last_activity_at: str
     created_at: str
     updated_at: str
+
+
+ContinuationCandidateLifecycle = Literal["open", "closed", "superseded"]
+ContinuationSelectionOutcome = Literal[
+    "resume",
+    "create_new",
+    "clarify",
+    "wait",
+    "decline",
+]
+ContinuationTimingPolicy = Literal[
+    "answer_now",
+    "ask_clarifying_question",
+    "pause_or_wait",
+    "resume_previous_thread",
+    "close_turn",
+]
+ContinuationSelectionReason = Literal[
+    "candidate_set_incomplete",
+    "no_candidates",
+    "one_eligible_candidate",
+    "multiple_eligible_candidates",
+    "active_thread_present",
+    "contended_thread_present",
+    "unavailable_thread_present",
+    "runtime_state_missing",
+    "runtime_state_inconsistent",
+    "runtime_session_missing",
+    "candidate_stale",
+    "candidate_not_open",
+    "no_eligible_candidates",
+]
+
+
+class ContinuationCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    conversation_id: str = Field(min_length=1, max_length=120)
+    lifecycle_state: ContinuationCandidateLifecycle
+    durable_updated_at: datetime
+
+    @field_validator("durable_updated_at", mode="before")
+    @classmethod
+    def validate_datetime_input(cls, value: Any) -> Any:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError("durable_updated_at_invalid") from exc
+        raise ValueError("durable_updated_at_invalid")
+
+    @field_validator("durable_updated_at")
+    @classmethod
+    def validate_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("durable_updated_at_timezone_required")
+        return value
+
+
+class ContinuationSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    candidate_set_complete: bool = Field(strict=True)
+    stale_after_seconds: int = Field(ge=60, le=86400, strict=True)
+    candidates: list[ContinuationCandidate] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_unique_candidates(self) -> "ContinuationSelectionRequest":
+        conversation_ids = [candidate.conversation_id for candidate in self.candidates]
+        if len(conversation_ids) != len(set(conversation_ids)):
+            raise ValueError("duplicate_conversation_id")
+        return self
+
+
+class ContinuationSelectionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    outcome: ContinuationSelectionOutcome
+    timing_policy: ContinuationTimingPolicy
+    selected_conversation_id: str | None = Field(default=None, min_length=1, max_length=120)
+    selected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+    candidate_count: int = Field(ge=0, strict=True)
+    eligible_candidate_count: int = Field(ge=0, strict=True)
+    reason_codes: list[ContinuationSelectionReason] = Field(min_length=1, max_length=8)
+    policy_version: Literal["continuation-selection.v1"] = "continuation-selection.v1"
+
+    @model_validator(mode="after")
+    def validate_coherence(self) -> "ContinuationSelectionResult":
+        expected_timing = {
+            "resume": "resume_previous_thread",
+            "create_new": "answer_now",
+            "clarify": "ask_clarifying_question",
+            "wait": "pause_or_wait",
+            "decline": "close_turn",
+        }
+        if self.timing_policy != expected_timing[self.outcome]:
+            raise ValueError("continuation_timing_policy_inconsistent")
+        if self.eligible_candidate_count > self.candidate_count:
+            raise ValueError("continuation_candidate_counts_inconsistent")
+        if len(self.reason_codes) != len(set(self.reason_codes)):
+            raise ValueError("continuation_reason_codes_duplicate")
+        if self.outcome == "resume":
+            if (
+                self.selected_conversation_id is None
+                or self.selected_thread_revision is None
+                or self.eligible_candidate_count != 1
+                or self.reason_codes != ["one_eligible_candidate"]
+            ):
+                raise ValueError("continuation_resume_result_inconsistent")
+        elif (
+            self.selected_conversation_id is not None
+            or self.selected_thread_revision is not None
+        ):
+            raise ValueError("continuation_nonresume_selection_forbidden")
+        return self
+
+
+class ContinuationSelectionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["runtime-continuation-selection.v1"] = (
+        "runtime-continuation-selection.v1"
+    )
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    result: ContinuationSelectionResult
 
 
 class RuntimeTurnUpdateRequest(BaseModel):

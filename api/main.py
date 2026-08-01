@@ -21,6 +21,8 @@ from models import (
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
     CompanionProfileActiveResponse,
+    ContinuationSelectionRequest,
+    ContinuationSelectionResponse,
     EvidenceNextStepSelectRequest,
     EvidenceNextStepSelectResponse,
     EvidencePlanCompileRequest,
@@ -149,6 +151,7 @@ from services.runtime_state import (
     resolve_runtime_session,
     resolve_runtime_thread,
     resolve_state,
+    select_runtime_continuation,
     start_turn,
     update_state,
     update_turn,
@@ -345,6 +348,19 @@ async def resolve_runtime_thread_endpoint(
             owner_id=body.owner_id,
             conversation_id=body.conversation_id,
         )
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
+
+
+@app.post(
+    "/v1/runtime/continuations/select",
+    response_model=ContinuationSelectionResponse,
+)
+async def select_runtime_continuation_endpoint(
+    body: ContinuationSelectionRequest,
+) -> ContinuationSelectionResponse:
+    try:
+        return select_runtime_continuation(body)
     except Exception as exc:
         raise _runtime_state_http_error(exc) from None
 

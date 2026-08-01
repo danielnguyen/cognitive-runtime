@@ -1,12 +1,19 @@
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import main as main_module
 import pytest
 from fastapi.testclient import TestClient
 from main import app
+from models import (
+    ContinuationSelectionRequest,
+    ContinuationSelectionResponse,
+    ContinuationSelectionResult,
+)
+from pydantic import ValidationError
 from services.runtime_state import RuntimeStateRepository, clear_states_for_tests
 
 
@@ -81,6 +88,63 @@ def _runtime_rows(db_path: Path) -> tuple[tuple[tuple[object, ...], ...], ...]:
                 "SELECT * FROM conversation_runtime_events ORDER BY id;",
             )
         )
+
+
+def _continuation_candidate(
+    conversation_id: str,
+    *,
+    lifecycle_state: str = "open",
+    durable_updated_at: datetime | None = None,
+) -> dict[str, object]:
+    return {
+        "conversation_id": conversation_id,
+        "lifecycle_state": lifecycle_state,
+        "durable_updated_at": (
+            durable_updated_at or datetime.now(UTC)
+        ).isoformat(),
+    }
+
+
+def _select_continuation(
+    client: TestClient,
+    *,
+    candidates: list[dict[str, object]],
+    owner_id: str = "owner-selection",
+    surface: str = "surface-current",
+    candidate_set_complete: bool = True,
+    stale_after_seconds: int = 3600,
+):
+    return client.post(
+        "/v1/runtime/continuations/select",
+        json={
+            "request_id": "continuation-selection-request",
+            "owner_id": owner_id,
+            "surface": surface,
+            "candidate_set_complete": candidate_set_complete,
+            "stale_after_seconds": stale_after_seconds,
+            "candidates": candidates,
+        },
+    )
+
+
+def _resolve_selection_session(
+    client: TestClient,
+    *,
+    owner_id: str,
+    conversation_id: str,
+    surface: str = "surface-existing",
+) -> dict[str, object]:
+    response = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": f"resolve-{conversation_id}-{surface}",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": surface,
+        },
+    )
+    assert response.status_code == 200
+    return response.json()["runtime_session"]
 
 
 def test_resolve_creates_and_reuses_runtime_state():
@@ -1595,3 +1659,717 @@ def test_legacy_database_initialization_reconstructs_conservatively(
         assert conn.execute(
             "SELECT COUNT(*) FROM conversation_runtime_turns;"
         ).fetchone()[0] == active_turn_count
+
+
+def test_continuation_selection_request_validation_is_strict_and_bounded(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "selection-validation.sqlite3")
+    client = TestClient(app)
+    valid = {
+        "request_id": "selection-validation",
+        "owner_id": "owner-selection-validation",
+        "surface": "surface-current",
+        "candidate_set_complete": True,
+        "stale_after_seconds": 3600,
+        "candidates": [_continuation_candidate("conversation-validation")],
+    }
+    invalid_payloads = [
+        {**valid, "candidates": [
+            _continuation_candidate(f"conversation-{index}") for index in range(9)
+        ]},
+        {**valid, "request_id": ""},
+        {**valid, "request_id": "r" * 121},
+        {**valid, "owner_id": ""},
+        {**valid, "owner_id": "o" * 121},
+        {**valid, "surface": ""},
+        {**valid, "surface": "s" * 65},
+        {**valid, "candidate_set_complete": 1},
+        {**valid, "stale_after_seconds": True},
+        {**valid, "stale_after_seconds": 59},
+        {**valid, "stale_after_seconds": 86401},
+        {**valid, "extra": "forbidden"},
+        {
+            **valid,
+            "candidates": [
+                {**_continuation_candidate("conversation-validation"), "extra": "forbidden"}
+            ],
+        },
+        {
+            **valid,
+            "candidates": [
+                _continuation_candidate(
+                    "conversation-validation",
+                    lifecycle_state="unknown",
+                )
+            ],
+        },
+        {
+            **valid,
+            "candidates": [
+                _continuation_candidate("conversation-validation")
+                | {"durable_updated_at": "2026-01-01T00:00:00"}
+            ],
+        },
+        {
+            **valid,
+            "candidates": [
+                _continuation_candidate("conversation-validation")
+                | {"durable_updated_at": "not-a-timestamp"}
+            ],
+        },
+        {
+            **valid,
+            "candidates": [
+                _continuation_candidate("conversation-validation")
+                | {"durable_updated_at": 1_700_000_000}
+            ],
+        },
+        {
+            **valid,
+            "candidates": [
+                _continuation_candidate(""),
+            ],
+        },
+        {
+            **valid,
+            "candidates": [
+                _continuation_candidate("c" * 121),
+            ],
+        },
+    ]
+
+    for payload in invalid_payloads:
+        response = client.post("/v1/runtime/continuations/select", json=payload)
+        assert response.status_code == 422
+
+    assert _runtime_rows(db_path) == ((), (), (), ())
+
+
+def test_duplicate_continuation_candidates_fail_before_repository_access(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db_path = _use_database(tmp_path, "selection-duplicates.sqlite3")
+
+    def unexpected_repository_access(_request):
+        raise AssertionError("repository must not be called")
+
+    monkeypatch.setattr(
+        main_module,
+        "select_runtime_continuation",
+        unexpected_repository_access,
+    )
+    candidate = _continuation_candidate("conversation-duplicate")
+    response = _select_continuation(
+        TestClient(app),
+        candidates=[candidate, candidate],
+    )
+
+    assert response.status_code == 422
+    assert _runtime_rows(db_path) == ((), (), (), ())
+
+
+def test_continuation_selection_response_models_reject_extras_and_incoherence():
+    valid_result = {
+        "outcome": "create_new",
+        "timing_policy": "answer_now",
+        "selected_conversation_id": None,
+        "selected_thread_revision": None,
+        "candidate_count": 0,
+        "eligible_candidate_count": 0,
+        "reason_codes": ["no_candidates"],
+        "policy_version": "continuation-selection.v1",
+    }
+    valid_response = {
+        "schema_version": "runtime-continuation-selection.v1",
+        "request_id": "selection-response",
+        "owner_id": "owner-selection-response",
+        "surface": "surface-current",
+        "result": valid_result,
+    }
+
+    with pytest.raises(ValidationError):
+        ContinuationSelectionResult.model_validate({**valid_result, "extra": "forbidden"})
+    with pytest.raises(ValidationError):
+        ContinuationSelectionResponse.model_validate(
+            {**valid_response, "extra": "forbidden"}
+        )
+    with pytest.raises(ValidationError):
+        ContinuationSelectionResult.model_validate(
+            {
+                **valid_result,
+                "selected_conversation_id": "conversation-forbidden",
+                "selected_thread_revision": 0,
+            }
+        )
+    with pytest.raises(ValidationError):
+        ContinuationSelectionResult.model_validate(
+            {**valid_result, "timing_policy": "close_turn"}
+        )
+    with pytest.raises(ValidationError):
+        ContinuationSelectionResult.model_validate(
+            {**valid_result, "reason_codes": ["no_candidates", "no_candidates"]}
+        )
+
+
+def test_complete_empty_candidate_set_authorizes_create_new_without_state(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "selection-empty.sqlite3")
+    before = _runtime_rows(db_path)
+
+    response = _select_continuation(TestClient(app), candidates=[])
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": "runtime-continuation-selection.v1",
+        "request_id": "continuation-selection-request",
+        "owner_id": "owner-selection",
+        "surface": "surface-current",
+        "result": {
+            "outcome": "create_new",
+            "timing_policy": "answer_now",
+            "selected_conversation_id": None,
+            "selected_thread_revision": None,
+            "candidate_count": 0,
+            "eligible_candidate_count": 0,
+            "reason_codes": ["no_candidates"],
+            "policy_version": "continuation-selection.v1",
+        },
+    }
+    assert _runtime_rows(db_path) == before
+
+
+def test_missing_other_owner_and_sessionless_runtime_state_cannot_resume(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "selection-missing.sqlite3")
+    client = TestClient(app)
+    candidate = _continuation_candidate("conversation-missing")
+
+    missing = _select_continuation(client, candidates=[candidate])
+    assert missing.status_code == 200
+    assert missing.json()["result"]["outcome"] == "create_new"
+    assert missing.json()["result"]["reason_codes"] == [
+        "no_eligible_candidates",
+        "runtime_state_missing",
+    ]
+    assert _runtime_rows(db_path) == ((), (), (), ())
+
+    _resolve_selection_session(
+        client,
+        owner_id="owner-other",
+        conversation_id="conversation-missing",
+    )
+    other_owner_before = _runtime_rows(db_path)
+    other_owner = _select_continuation(client, candidates=[candidate])
+    assert other_owner.json()["result"] == missing.json()["result"]
+    assert _runtime_rows(db_path) == other_owner_before
+
+    _thread(client, "owner-selection", "conversation-sessionless")
+    sessionless_before = _runtime_rows(db_path)
+    sessionless = _select_continuation(
+        client,
+        candidates=[_continuation_candidate("conversation-sessionless")],
+    )
+    assert sessionless.status_code == 200
+    assert sessionless.json()["result"]["outcome"] == "create_new"
+    assert sessionless.json()["result"]["reason_codes"] == [
+        "no_eligible_candidates",
+        "runtime_session_missing",
+    ]
+    assert _runtime_rows(db_path) == sessionless_before
+
+
+def test_one_fresh_idle_candidate_resumes_without_mutation_and_survives_reopen(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "selection-resume.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-selection"
+    conversation_id = "conversation-resume"
+    _resolve_selection_session(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+    )
+    candidates = [_continuation_candidate(conversation_id)]
+    before = _runtime_rows(db_path)
+
+    first = _select_continuation(client, candidates=candidates, surface="surface-a")
+    second = _select_continuation(client, candidates=candidates, surface="surface-b")
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["result"] == second.json()["result"]
+    assert first.json()["result"] == {
+        "outcome": "resume",
+        "timing_policy": "resume_previous_thread",
+        "selected_conversation_id": conversation_id,
+        "selected_thread_revision": 0,
+        "candidate_count": 1,
+        "eligible_candidate_count": 1,
+        "reason_codes": ["one_eligible_candidate"],
+        "policy_version": "continuation-selection.v1",
+    }
+    assert _runtime_rows(db_path) == before
+
+    request = ContinuationSelectionRequest.model_validate(
+        {
+            "request_id": "selection-after-reopen",
+            "owner_id": owner_id,
+            "surface": "surface-after-reopen",
+            "candidate_set_complete": True,
+            "stale_after_seconds": 3600,
+            "candidates": [
+                {
+                    **candidates[0],
+                    "durable_updated_at": datetime.fromisoformat(
+                        str(candidates[0]["durable_updated_at"])
+                    ),
+                }
+            ],
+        }
+    )
+    reopened_result = RuntimeStateRepository(db_path).select_continuation(request)
+    assert reopened_result.result.selected_conversation_id == conversation_id
+    assert reopened_result.result.selected_thread_revision == 0
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize(
+    ("lifecycle_state", "durable_age", "runtime_age", "expected_reasons"),
+    [
+        ("open", 7200, 0, ["no_eligible_candidates", "candidate_stale"]),
+        ("open", 0, 7200, ["no_eligible_candidates", "candidate_stale"]),
+        ("open", 7200, 7200, ["no_eligible_candidates", "candidate_stale"]),
+        ("closed", 0, 0, ["no_eligible_candidates", "candidate_not_open"]),
+        ("superseded", 0, 0, ["no_eligible_candidates", "candidate_not_open"]),
+    ],
+)
+def test_stale_and_nonopen_candidates_cannot_resume(
+    tmp_path: Path,
+    lifecycle_state: str,
+    durable_age: int,
+    runtime_age: int,
+    expected_reasons: list[str],
+):
+    db_path = _use_database(
+        tmp_path,
+        f"selection-{lifecycle_state}-{durable_age}-{runtime_age}.sqlite3",
+    )
+    client = TestClient(app)
+    conversation_id = "conversation-ineligible"
+    _resolve_selection_session(
+        client,
+        owner_id="owner-selection",
+        conversation_id=conversation_id,
+    )
+    if runtime_age:
+        stale_runtime = (datetime.now(UTC) - timedelta(seconds=runtime_age)).isoformat()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET last_activity_at = ?
+                WHERE owner_id = ? AND conversation_id = ?;
+                """,
+                (stale_runtime, "owner-selection", conversation_id),
+            )
+    before = _runtime_rows(db_path)
+    response = _select_continuation(
+        client,
+        candidates=[
+            _continuation_candidate(
+                conversation_id,
+                lifecycle_state=lifecycle_state,
+                durable_updated_at=datetime.now(UTC) - timedelta(seconds=durable_age),
+            )
+        ],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["outcome"] == "create_new"
+    assert response.json()["result"]["reason_codes"] == expected_reasons
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("future_source", ["durable", "runtime"])
+def test_future_timestamp_declines_without_mutation(
+    tmp_path: Path,
+    future_source: str,
+):
+    db_path = _use_database(tmp_path, f"selection-future-{future_source}.sqlite3")
+    client = TestClient(app)
+    conversation_id = "conversation-future"
+    _resolve_selection_session(
+        client,
+        owner_id="owner-selection",
+        conversation_id=conversation_id,
+    )
+    future_time = datetime.now(UTC) + timedelta(seconds=301)
+    if future_source == "runtime":
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET last_activity_at = ?
+                WHERE owner_id = ? AND conversation_id = ?;
+                """,
+                (future_time.isoformat(), "owner-selection", conversation_id),
+            )
+    before = _runtime_rows(db_path)
+
+    response = _select_continuation(
+        client,
+        candidates=[
+            _continuation_candidate(
+                conversation_id,
+                durable_updated_at=(
+                    future_time if future_source == "durable" else datetime.now(UTC)
+                ),
+            )
+        ],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["outcome"] == "decline"
+    assert response.json()["result"]["reason_codes"] == [
+        "runtime_state_inconsistent"
+    ]
+    assert _runtime_rows(db_path) == before
+
+
+def test_one_eligible_candidate_is_selected_with_nonblocking_candidates(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "selection-one-with-others.sqlite3")
+    client = TestClient(app)
+    eligible_id = "conversation-eligible"
+    _resolve_selection_session(
+        client,
+        owner_id="owner-selection",
+        conversation_id=eligible_id,
+    )
+    before = _runtime_rows(db_path)
+
+    response = _select_continuation(
+        client,
+        candidates=[
+            _continuation_candidate("conversation-missing"),
+            _continuation_candidate(
+                "conversation-closed",
+                lifecycle_state="closed",
+            ),
+            _continuation_candidate(
+                "conversation-stale",
+                durable_updated_at=datetime.now(UTC) - timedelta(hours=2),
+            ),
+            _continuation_candidate(eligible_id),
+        ],
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["outcome"] == "resume"
+    assert result["selected_conversation_id"] == eligible_id
+    assert result["eligible_candidate_count"] == 1
+    assert _runtime_rows(db_path) == before
+
+
+def test_no_eligible_candidate_reasons_are_deterministic_and_bounded(tmp_path: Path):
+    db_path = _use_database(tmp_path, "selection-reason-order.sqlite3")
+    client = TestClient(app)
+    before = _runtime_rows(db_path)
+    candidates = [
+        _continuation_candidate(
+            "conversation-stale",
+            durable_updated_at=datetime.now(UTC) - timedelta(hours=2),
+        ),
+        _continuation_candidate(
+            "conversation-closed",
+            lifecycle_state="closed",
+        ),
+        _continuation_candidate("conversation-missing"),
+    ]
+
+    forward = _select_continuation(client, candidates=candidates)
+    reverse = _select_continuation(client, candidates=list(reversed(candidates)))
+
+    assert forward.status_code == reverse.status_code == 200
+    assert forward.json()["result"] == reverse.json()["result"]
+    assert forward.json()["result"]["reason_codes"] == [
+        "no_eligible_candidates",
+        "candidate_not_open",
+        "runtime_state_missing",
+        "candidate_stale",
+    ]
+    assert _runtime_rows(db_path) == before
+
+
+def test_multiple_eligible_candidates_clarify_without_recency_tiebreaker(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "selection-multiple.sqlite3")
+    client = TestClient(app)
+    candidate_ids = ["conversation-first", "conversation-second"]
+    for conversation_id in candidate_ids:
+        _resolve_selection_session(
+            client,
+            owner_id="owner-selection",
+            conversation_id=conversation_id,
+        )
+    candidates = [
+        _continuation_candidate(
+            candidate_ids[0],
+            durable_updated_at=datetime.now(UTC) - timedelta(minutes=5),
+        ),
+        _continuation_candidate(candidate_ids[1]),
+    ]
+    before = _runtime_rows(db_path)
+
+    forward = _select_continuation(client, candidates=candidates)
+    reverse = _select_continuation(client, candidates=list(reversed(candidates)))
+
+    assert forward.status_code == reverse.status_code == 200
+    assert forward.json()["result"] == reverse.json()["result"]
+    assert forward.json()["result"] == {
+        "outcome": "clarify",
+        "timing_policy": "ask_clarifying_question",
+        "selected_conversation_id": None,
+        "selected_thread_revision": None,
+        "candidate_count": 2,
+        "eligible_candidate_count": 2,
+        "reason_codes": ["multiple_eligible_candidates"],
+        "policy_version": "continuation-selection.v1",
+    }
+    assert _runtime_rows(db_path) == before
+
+
+def test_incomplete_candidate_set_clarifies_before_inspection(tmp_path: Path):
+    db_path = _use_database(tmp_path, "selection-incomplete.sqlite3")
+    client = TestClient(app)
+    conversation_id = "conversation-incomplete"
+    _resolve_selection_session(
+        client,
+        owner_id="owner-selection",
+        conversation_id=conversation_id,
+    )
+    before = _runtime_rows(db_path)
+
+    response = _select_continuation(
+        client,
+        candidates=[_continuation_candidate(conversation_id)],
+        candidate_set_complete=False,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == {
+        "outcome": "clarify",
+        "timing_policy": "ask_clarifying_question",
+        "selected_conversation_id": None,
+        "selected_thread_revision": None,
+        "candidate_count": 1,
+        "eligible_candidate_count": 0,
+        "reason_codes": ["candidate_set_incomplete"],
+        "policy_version": "continuation-selection.v1",
+    }
+    assert _runtime_rows(db_path) == before
+
+
+def test_active_candidate_waits_and_blocks_an_idle_candidate(tmp_path: Path):
+    db_path = _use_database(tmp_path, "selection-active.sqlite3")
+    client = TestClient(app)
+    active_id = "conversation-active"
+    idle_id = "conversation-idle"
+    started = _start(
+        client,
+        request_id="selection-active-turn",
+        owner_id="owner-selection",
+        conversation_id=active_id,
+        surface="surface-active",
+    )
+    assert started.status_code == 200
+    _resolve_selection_session(
+        client,
+        owner_id="owner-selection",
+        conversation_id=idle_id,
+    )
+    before = _runtime_rows(db_path)
+
+    response = _select_continuation(
+        client,
+        candidates=[
+            _continuation_candidate(idle_id),
+            _continuation_candidate(active_id),
+        ],
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["outcome"] == "wait"
+    assert result["timing_policy"] == "pause_or_wait"
+    assert result["eligible_candidate_count"] == 1
+    assert result["selected_conversation_id"] is None
+    assert result["selected_thread_revision"] is None
+    assert result["reason_codes"] == ["active_thread_present"]
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize(
+    ("stored_state", "expected_reason"),
+    [
+        ("contended", "contended_thread_present"),
+        ("unavailable", "unavailable_thread_present"),
+        ("inconsistent", "runtime_state_inconsistent"),
+    ],
+)
+def test_blocking_thread_state_declines_and_preserves_all_runtime_rows(
+    tmp_path: Path,
+    stored_state: str,
+    expected_reason: str,
+):
+    db_path = _use_database(tmp_path, f"selection-{stored_state}.sqlite3")
+    client = TestClient(app)
+    blocking_id = f"conversation-{stored_state}"
+    eligible_id = "conversation-safe-idle"
+    if stored_state == "inconsistent":
+        started = _start(
+            client,
+            request_id="selection-inconsistent-turn",
+            owner_id="owner-selection",
+            conversation_id=blocking_id,
+            surface="surface-blocking",
+        )
+        assert started.status_code == 200
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET active_runtime_turn_id = 'missing-active-turn'
+                WHERE owner_id = ? AND conversation_id = ?;
+                """,
+                ("owner-selection", blocking_id),
+            )
+    else:
+        _resolve_selection_session(
+            client,
+            owner_id="owner-selection",
+            conversation_id=blocking_id,
+        )
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET state = ?
+                WHERE owner_id = ? AND conversation_id = ?;
+                """,
+                (stored_state, "owner-selection", blocking_id),
+            )
+    _resolve_selection_session(
+        client,
+        owner_id="owner-selection",
+        conversation_id=eligible_id,
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE conversation_runtime_events
+            SET event_payload_json = '{"private":"event-sentinel"}'
+            WHERE id = (SELECT MIN(id) FROM conversation_runtime_events);
+            """
+        )
+    before = _runtime_rows(db_path)
+
+    response = _select_continuation(
+        client,
+        candidates=[
+            _continuation_candidate(eligible_id),
+            _continuation_candidate(blocking_id),
+        ],
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["outcome"] == "decline"
+    assert result["timing_policy"] == "close_turn"
+    assert result["selected_conversation_id"] is None
+    assert result["selected_thread_revision"] is None
+    assert result["reason_codes"] == [expected_reason]
+    assert "event-sentinel" not in response.text
+    assert _runtime_rows(db_path) == before
+
+
+def test_selection_returns_revision_without_reserving_or_consuming_it(tmp_path: Path):
+    db_path = _use_database(tmp_path, "selection-revision.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-selection"
+    conversation_id = "conversation-revision-selection"
+    admitted = _start(
+        client,
+        request_id="selection-revision-initial",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-existing",
+    )
+    assert admitted.status_code == 200
+    completed = _complete(
+        client,
+        request_id="selection-revision-complete",
+        runtime_session_id=admitted.json()["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=admitted.json()["runtime_turn"]["runtime_turn_id"],
+    )
+    assert completed.status_code == 200
+    before = _runtime_rows(db_path)
+
+    selection = _select_continuation(
+        client,
+        candidates=[_continuation_candidate(conversation_id)],
+        owner_id=owner_id,
+    )
+
+    assert selection.status_code == 200
+    assert selection.json()["result"]["selected_thread_revision"] == 2
+    assert _runtime_rows(db_path) == before
+
+    next_turn = _start(
+        client,
+        request_id="selection-revision-next",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-current",
+        expected_thread_revision=2,
+    )
+    assert next_turn.status_code == 200
+    released = _complete(
+        client,
+        request_id="selection-revision-release",
+        runtime_session_id=next_turn.json()["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=next_turn.json()["runtime_turn"]["runtime_turn_id"],
+    )
+    assert released.status_code == 200
+    stale = _start(
+        client,
+        request_id="selection-revision-stale",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-current",
+        expected_thread_revision=2,
+    )
+    assert stale.status_code == 409
+    assert stale.json() == {"detail": "runtime_thread_revision_conflict"}
+
+
+def test_selection_persistence_failure_is_bounded(monkeypatch):
+    def fail_selection(_request):
+        raise sqlite3.OperationalError("private storage detail")
+
+    monkeypatch.setattr(main_module, "select_runtime_continuation", fail_selection)
+    response = _select_continuation(
+        TestClient(app),
+        candidates=[_continuation_candidate("conversation-persistence")],
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert "private storage detail" not in response.text
