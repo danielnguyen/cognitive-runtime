@@ -10,6 +10,10 @@ from typing import Any
 
 from models import (
     AttentionFocus,
+    ContinuationCandidate,
+    ContinuationSelectionRequest,
+    ContinuationSelectionResponse,
+    ContinuationSelectionResult,
     RuntimeEvent,
     RuntimeOverlay,
     RuntimeSession,
@@ -22,6 +26,22 @@ from models import (
 
 DEFAULT_RUNTIME_DB_PATH = "./data/runtime_state.sqlite3"
 _TERMINAL_TURN_STATUSES = {"completed", "abandoned"}
+_CONTINUATION_CLOCK_SKEW_SECONDS = 300
+_CONTINUATION_REASON_ORDER = (
+    "candidate_set_incomplete",
+    "contended_thread_present",
+    "unavailable_thread_present",
+    "runtime_state_inconsistent",
+    "active_thread_present",
+    "multiple_eligible_candidates",
+    "one_eligible_candidate",
+    "no_candidates",
+    "no_eligible_candidates",
+    "candidate_not_open",
+    "runtime_state_missing",
+    "runtime_session_missing",
+    "candidate_stale",
+)
 _RUNTIME_REPOSITORY: RuntimeStateRepository | None = None
 
 
@@ -169,6 +189,302 @@ class RuntimeStateRepository:
                 conversation_id=conversation_id,
             )
             return self._thread_from_row(conn, row)
+
+    def select_continuation(
+        self,
+        request: ContinuationSelectionRequest,
+        *,
+        evaluated_at: datetime | None = None,
+    ) -> ContinuationSelectionResponse:
+        if not request.candidate_set_complete:
+            return self._continuation_response(
+                request,
+                outcome="clarify",
+                eligible_candidate_count=0,
+                reason_codes={"candidate_set_incomplete"},
+            )
+
+        now = evaluated_at or datetime.now(UTC)
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("continuation_evaluation_timezone_required")
+        now = now.astimezone(UTC)
+
+        evaluations: list[dict[str, Any]] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN;")
+            for candidate in request.candidates:
+                evaluations.append(
+                    self._evaluate_continuation_candidate(
+                        conn,
+                        owner_id=request.owner_id,
+                        candidate=candidate,
+                        stale_after_seconds=request.stale_after_seconds,
+                        evaluated_at=now,
+                    )
+                )
+
+        eligible = [item for item in evaluations if item["eligible"]]
+        blocking_reasons = {
+            reason
+            for item in evaluations
+            for reason in item["reason_codes"]
+            if reason
+            in {
+                "contended_thread_present",
+                "unavailable_thread_present",
+                "runtime_state_inconsistent",
+            }
+        }
+        if blocking_reasons:
+            return self._continuation_response(
+                request,
+                outcome="decline",
+                eligible_candidate_count=len(eligible),
+                reason_codes=blocking_reasons,
+            )
+        if any("active_thread_present" in item["reason_codes"] for item in evaluations):
+            return self._continuation_response(
+                request,
+                outcome="wait",
+                eligible_candidate_count=len(eligible),
+                reason_codes={"active_thread_present"},
+            )
+        if len(eligible) > 1:
+            return self._continuation_response(
+                request,
+                outcome="clarify",
+                eligible_candidate_count=len(eligible),
+                reason_codes={"multiple_eligible_candidates"},
+            )
+        if len(eligible) == 1:
+            selected = eligible[0]
+            return self._continuation_response(
+                request,
+                outcome="resume",
+                eligible_candidate_count=1,
+                reason_codes={"one_eligible_candidate"},
+                selected_conversation_id=selected["conversation_id"],
+                selected_thread_revision=selected["revision"],
+            )
+        if not evaluations:
+            reasons = {"no_candidates"}
+        else:
+            reasons = {
+                "no_eligible_candidates",
+                *(
+                    reason
+                    for item in evaluations
+                    for reason in item["reason_codes"]
+                    if reason
+                    in {
+                        "candidate_not_open",
+                        "runtime_state_missing",
+                        "runtime_session_missing",
+                        "candidate_stale",
+                    }
+                ),
+            }
+        return self._continuation_response(
+            request,
+            outcome="create_new",
+            eligible_candidate_count=0,
+            reason_codes=reasons,
+        )
+
+    def _evaluate_continuation_candidate(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        candidate: ContinuationCandidate,
+        stale_after_seconds: int,
+        evaluated_at: datetime,
+    ) -> dict[str, Any]:
+        reasons: set[str] = set()
+        durable_time = candidate.durable_updated_at.astimezone(UTC)
+        if self._continuation_time_is_future(durable_time, evaluated_at):
+            reasons.add("runtime_state_inconsistent")
+        elif self._continuation_time_is_stale(
+            durable_time,
+            evaluated_at,
+            stale_after_seconds,
+        ):
+            reasons.add("candidate_stale")
+        if candidate.lifecycle_state != "open":
+            reasons.add("candidate_not_open")
+
+        inspection = self._inspect_continuation_thread(
+            conn,
+            owner_id=owner_id,
+            conversation_id=candidate.conversation_id,
+        )
+        state = inspection["state"]
+        if state == "missing":
+            reasons.add("runtime_state_missing")
+        elif state == "inconsistent":
+            reasons.add("runtime_state_inconsistent")
+        elif state == "contended":
+            reasons.add("contended_thread_present")
+        elif state == "unavailable":
+            reasons.add("unavailable_thread_present")
+        elif state == "active":
+            reasons.add("active_thread_present")
+        elif inspection["participating_session_count"] == 0:
+            reasons.add("runtime_session_missing")
+
+        runtime_time = inspection.get("last_activity_at")
+        if runtime_time is not None:
+            if self._continuation_time_is_future(runtime_time, evaluated_at):
+                reasons.add("runtime_state_inconsistent")
+            elif self._continuation_time_is_stale(
+                runtime_time,
+                evaluated_at,
+                stale_after_seconds,
+            ):
+                reasons.add("candidate_stale")
+
+        eligible = not reasons and state == "idle"
+        return {
+            "conversation_id": candidate.conversation_id,
+            "eligible": eligible,
+            "reason_codes": reasons,
+            "revision": inspection.get("revision"),
+        }
+
+    def _inspect_continuation_thread(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        row = self._thread_by_key(
+            conn,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+        )
+        if row is None:
+            return {
+                "state": "missing",
+                "revision": None,
+                "participating_session_count": 0,
+                "participating_surfaces": (),
+                "last_activity_at": None,
+            }
+
+        session_rows = conn.execute(
+            """
+            SELECT surface FROM conversation_runtime_sessions
+            WHERE owner_id = ? AND conversation_id = ?
+            ORDER BY surface ASC;
+            """,
+            (owner_id, conversation_id),
+        ).fetchall()
+        active_rows = self._non_terminal_turn_rows(
+            conn,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+        )
+        state = row["state"]
+        revision = row["revision"]
+        revision_is_valid = (
+            isinstance(revision, int) and not isinstance(revision, bool) and revision >= 0
+        )
+        if state == "idle":
+            consistent = (
+                revision_is_valid
+                and not active_rows
+                and all(
+                    row[field] is None
+                    for field in (
+                        "active_runtime_session_id",
+                        "active_runtime_turn_id",
+                        "active_surface",
+                        "active_request_id",
+                    )
+                )
+            )
+        elif state == "active" and len(active_rows) == 1:
+            active_row = active_rows[0]
+            consistent = revision_is_valid and all(
+                (
+                    row["active_runtime_session_id"] == active_row["runtime_session_id"],
+                    row["active_runtime_turn_id"] == active_row["runtime_turn_id"],
+                    row["active_surface"] == active_row["surface"],
+                )
+            )
+        elif state in {"contended", "unavailable"}:
+            consistent = revision_is_valid
+        else:
+            consistent = False
+
+        try:
+            last_activity_at = datetime.fromisoformat(row["last_activity_at"])
+            if last_activity_at.tzinfo is None or last_activity_at.utcoffset() is None:
+                consistent = False
+                last_activity_at = None
+            else:
+                last_activity_at = last_activity_at.astimezone(UTC)
+        except (TypeError, ValueError):
+            consistent = False
+            last_activity_at = None
+
+        return {
+            "state": state if consistent else "inconsistent",
+            "revision": revision,
+            "participating_session_count": len(session_rows),
+            "participating_surfaces": tuple(
+                sorted({session_row["surface"] for session_row in session_rows})
+            ),
+            "last_activity_at": last_activity_at,
+        }
+
+    @staticmethod
+    def _continuation_time_is_future(value: datetime, evaluated_at: datetime) -> bool:
+        return (value - evaluated_at).total_seconds() > _CONTINUATION_CLOCK_SKEW_SECONDS
+
+    @staticmethod
+    def _continuation_time_is_stale(
+        value: datetime,
+        evaluated_at: datetime,
+        stale_after_seconds: int,
+    ) -> bool:
+        return (evaluated_at - value).total_seconds() > stale_after_seconds
+
+    @staticmethod
+    def _continuation_response(
+        request: ContinuationSelectionRequest,
+        *,
+        outcome: str,
+        eligible_candidate_count: int,
+        reason_codes: set[str],
+        selected_conversation_id: str | None = None,
+        selected_thread_revision: int | None = None,
+    ) -> ContinuationSelectionResponse:
+        timing_policy = {
+            "resume": "resume_previous_thread",
+            "create_new": "answer_now",
+            "clarify": "ask_clarifying_question",
+            "wait": "pause_or_wait",
+            "decline": "close_turn",
+        }[outcome]
+        ordered_reasons = [
+            reason for reason in _CONTINUATION_REASON_ORDER if reason in reason_codes
+        ]
+        return ContinuationSelectionResponse(
+            request_id=request.request_id,
+            owner_id=request.owner_id,
+            surface=request.surface,
+            result=ContinuationSelectionResult(
+                outcome=outcome,
+                timing_policy=timing_policy,
+                selected_conversation_id=selected_conversation_id,
+                selected_thread_revision=selected_thread_revision,
+                candidate_count=len(request.candidates),
+                eligible_candidate_count=eligible_candidate_count,
+                reason_codes=ordered_reasons,
+            ),
+        )
 
     def _ensure_thread(
         self,
@@ -1265,6 +1581,12 @@ def resolve_runtime_thread(
         owner_id=owner_id,
         conversation_id=conversation_id,
     )
+
+
+def select_runtime_continuation(
+    request: ContinuationSelectionRequest,
+) -> ContinuationSelectionResponse:
+    return runtime_state_repository().select_continuation(request)
 
 
 def resolve_state(*, owner_id: str, conversation_id: str, surface: str) -> RuntimeState:
