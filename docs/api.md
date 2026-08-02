@@ -110,6 +110,7 @@ presence, attention, or preferred-device signal.
 | Interaction governance | `POST /v1/runtime/interaction-governance/evaluate` |
 | Persona containment | `POST /v1/runtime/persona-containment/evaluate` |
 | Restraint | `POST /v1/runtime/restraint/evaluate` |
+| Situated presence | `POST /v1/runtime/situated-presence/evaluate` |
 | Privacy context | `POST /v1/runtime/privacy-context/evaluate` |
 | Memory hygiene | `POST /v1/runtime/memory-hygiene/evaluate` |
 | Claim calibration | `POST /v1/runtime/claim-calibration/evaluate` |
@@ -122,6 +123,47 @@ presence, attention, or preferred-device signal.
 These evaluators return typed, bounded decisions for the current context. When
 an active runtime session is supplied, supported evaluators may also record a
 summarized runtime event.
+
+`POST /v1/runtime/situated-presence/evaluate` requires an existing admitted
+runtime session and turn. Its strict request binds request, owner,
+conversation, surface, session, and turn identifiers to explicit surface
+visibility and constraint facts. It consumes compact projections from the
+existing interaction-governance and restraint decisions. Those projections
+contain bounded decision fields only; the request accepts no user text, recent
+messages, prompt overlay, title, content, provider output, or arbitrary
+metadata.
+
+The response uses schema and policy version `situated-presence.v1`. It returns
+only commentary and humor permission, bounded emotional-attunement and
+challenge levels, a silence preference, the surface commentary gate, response
+posture, an always-false action-implication gate, and neutral reason codes. The
+result is a response-shaping envelope, not final wording. It contains no joke,
+sympathy line, tactical phrase, or response template.
+
+A private, normal, low-risk playful context may permit light commentary and
+humor when both upstream decisions allow it. Tense debugging suppresses humor
+and commentary while retaining tactical posture. High-impact context suppresses
+casual commentary and humor. Private mistake or expression context may permit
+brief bounded attunement without labeling or inferring a feeling. Shared,
+public, constrained, or unknown surface facts suppress commentary
+conservatively while required direct or tactical posture remains available.
+
+Interaction-governance commentary, humor, privacy, and confirmation boundaries
+cannot be loosened. Restraint suppression, personalization, brevity, and
+clarification inputs can only preserve or tighten the envelope. The endpoint
+cannot authorize or imply an action and does not replace confirmation.
+Insufficient upstream confidence returns a silent-or-minimal envelope.
+
+Successful evaluation records one `situated_presence_evaluated` event associated
+with the existing session and turn. Its payload contains the final gates,
+posture, policy version, and reason codes only. Evaluation does not create a
+session or turn or change thread, session, turn, revision, activity, intent,
+restraint, or status state. Missing or mismatched scope records no event.
+
+The evaluator is deterministic and calls no provider, model, semantic retrieval
+system, adapter, or external service. Persistent presence and idle transitions,
+a complete timing decision, behavior tuning, watch delivery, and proactive
+silence scheduling are not part of this endpoint.
 
 Claim calibration evaluates one caller-selected factual claim against only the
 bounded evidence references attributed to that claim. It derives a deterministic
