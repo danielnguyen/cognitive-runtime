@@ -81,6 +81,8 @@ from models import (
     ScenePolicyDetail,
     SceneResolveRequest,
     SceneResolveResponse,
+    SituatedPresenceEvaluateRequest,
+    SituatedPresenceEvaluateResponse,
     SocialContextDiagnosticsRequest,
     SocialContextDiagnosticsResponse,
     SocialContextItemResponse,
@@ -156,6 +158,7 @@ from services.runtime_state import (
     update_state,
     update_turn,
 )
+from services.situated_presence import evaluate_situated_presence
 from services.social_context import (
     get_social_context_diagnostics,
     record_social_context_usage_event,
@@ -924,6 +927,33 @@ async def runtime_restraint_evaluate(
             raise HTTPException(status_code=404, detail=detail) from exc
         if detail == "runtime_turn_session_mismatch":
             raise HTTPException(status_code=400, detail=detail) from exc
+        raise
+
+
+@app.post(
+    "/v1/runtime/situated-presence/evaluate",
+    response_model=SituatedPresenceEvaluateResponse,
+)
+async def runtime_situated_presence_evaluate(
+    body: SituatedPresenceEvaluateRequest,
+) -> SituatedPresenceEvaluateResponse:
+    try:
+        return evaluate_situated_presence(body)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "runtime_session_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "runtime_session_mismatch":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise
+    except RuntimeError as exc:
+        detail = str(exc)
+        if detail == "runtime_turn_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "runtime_turn_session_mismatch":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail == "runtime_turn_not_current":
+            raise HTTPException(status_code=409, detail=detail) from exc
         raise
 
 

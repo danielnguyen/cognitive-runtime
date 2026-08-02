@@ -101,7 +101,7 @@ async def test_recent_messages_latest_user_text_is_used_when_current_user_text_i
 
 
 @pytest.mark.asyncio
-async def test_playful_low_risk_message_allows_humor_without_forcing_commentary():
+async def test_playful_low_risk_message_allows_commentary_and_humor_without_forcing_output():
     response = await _post(
         "/v1/runtime/interaction-governance/evaluate",
         _base(current_user_text="lol roast my tiny todo list"),
@@ -110,7 +110,41 @@ async def test_playful_low_risk_message_allows_humor_without_forcing_commentary(
     assert response.status_code == 200
     result = response.json()["result"]
     assert result["interaction_kind"] == "joke_or_playful"
+    assert result["tension_level"] == "low"
     assert result["humor_allowed"] is True
+    assert result["commentary_allowed"] is True
+    assert result["action_allowed"] is False
+    assert result["requires_confirmation"] is False
+    assert result["privacy_sensitivity_hint"] == "normal"
+    assert result["response_posture"] == "playful"
+
+
+@pytest.mark.parametrize(
+    ("current_user_text", "expected_kind"),
+    [
+        ("What does this function do?", "question"),
+        ("rename this variable to count", "command"),
+        ("brainstorm options for this name", "brainstorm"),
+        ("Ugh, this sucks and I am upset.", "vent_or_expression"),
+        ("That was wrong in the report.", "mistake_or_failure_report"),
+        ("I think I broke the server and prod is failing", "tense_debugging"),
+        ("Should I change payroll taxes?", "high_impact_decision"),
+        ("Maybe later", "ambiguous"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_playful_interactions_do_not_receive_commentary_permission(
+    current_user_text: str,
+    expected_kind: str,
+):
+    response = await _post(
+        "/v1/runtime/interaction-governance/evaluate",
+        _base(current_user_text=current_user_text),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["interaction_kind"] == expected_kind
     assert result["commentary_allowed"] is False
 
 

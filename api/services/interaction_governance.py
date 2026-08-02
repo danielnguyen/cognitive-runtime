@@ -536,8 +536,10 @@ def _classify(body: InteractionGovernanceEvaluateRequest) -> InteractionGovernan
         posture = "silent_or_minimal"
         confidence = 0.45
 
-    commentary_allowed = False
     humor_allowed = kind == "joke_or_playful"
+    commentary_allowed = (
+        kind == "joke_or_playful" and tension == "low" and humor_allowed
+    )
     clarifying_question_allowed = kind in {
         "tense_debugging",
         "mistake_or_failure_report",

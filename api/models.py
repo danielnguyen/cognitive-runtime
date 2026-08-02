@@ -128,6 +128,7 @@ RuntimeEventType = Literal[
     "interaction_governance_evaluated",
     "persona_containment_evaluated",
     "restraint_evaluated",
+    "situated_presence_evaluated",
     "memory_hygiene_evaluated",
     "privacy_context_evaluated",
     "world_state_verification_evaluated",
@@ -1635,6 +1636,192 @@ class RestraintEvaluateResponse(BaseModel):
     runtime_session_id: str = Field(max_length=120)
     runtime_turn_id: str | None = Field(default=None, max_length=120)
     result: RestraintResult
+
+
+SituatedPresenceVisibility = Literal["private", "shared", "public", "unknown"]
+SituatedPresenceConstraint = Literal["normal", "constrained", "unknown"]
+SituatedPresenceEmotionalAttunement = Literal["none", "minimal", "brief"]
+SituatedPresenceChallenge = Literal["none", "low", "medium"]
+SituatedPresenceReason = Literal[
+    "upstream_confidence_insufficient",
+    "tense_context",
+    "tactical_response_required",
+    "high_impact_context",
+    "brief_steadying_allowed",
+    "light_commentary_allowed",
+    "low_risk_commentary_allowed",
+    "ambiguous_context",
+    "surface_public",
+    "surface_shared",
+    "surface_visibility_unknown",
+    "surface_constrained",
+    "surface_constraint_unknown",
+    "privacy_sensitive",
+    "proactive_output_suppressed",
+    "personalization_suppressed",
+    "confirmation_required",
+    "upstream_commentary_suppressed",
+    "upstream_humor_suppressed",
+    "brevity_preferred",
+    "clarification_preferred",
+]
+SITUATED_PRESENCE_REASON_ORDER: tuple[SituatedPresenceReason, ...] = (
+    "upstream_confidence_insufficient",
+    "tense_context",
+    "tactical_response_required",
+    "high_impact_context",
+    "brief_steadying_allowed",
+    "light_commentary_allowed",
+    "low_risk_commentary_allowed",
+    "ambiguous_context",
+    "surface_public",
+    "surface_shared",
+    "surface_visibility_unknown",
+    "surface_constrained",
+    "surface_constraint_unknown",
+    "privacy_sensitive",
+    "proactive_output_suppressed",
+    "personalization_suppressed",
+    "confirmation_required",
+    "upstream_commentary_suppressed",
+    "upstream_humor_suppressed",
+    "brevity_preferred",
+    "clarification_preferred",
+)
+
+
+class SituatedPresenceSurfaceContext(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    visibility: SituatedPresenceVisibility
+    constraint: SituatedPresenceConstraint
+
+
+class SituatedPresenceInteractionGovernanceProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    interaction_kind: InteractionGovernanceKind
+    tension_level: InteractionGovernanceTension
+    commentary_allowed: bool = Field(strict=True)
+    humor_allowed: bool = Field(strict=True)
+    action_allowed: bool = Field(strict=True)
+    requires_confirmation: bool = Field(strict=True)
+    privacy_sensitivity_hint: InteractionGovernancePrivacySensitivity
+    response_posture: InteractionGovernanceResponsePosture
+    confidence: float = Field(ge=0.0, le=1.0, strict=True)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def validate_strict_confidence(cls, value: Any) -> Any:
+        if not isinstance(value, float):
+            raise ValueError("situated_presence_confidence_float_required")
+        return value
+
+
+class SituatedPresenceRestraintProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    restraint_policy: RestraintPolicy
+    proactive_output_suppressed: bool = Field(strict=True)
+    personalization_suppressed: bool = Field(strict=True)
+    brevity_preferred: bool = Field(strict=True)
+    clarification_preferred: bool = Field(strict=True)
+    confidence: float = Field(ge=0.0, le=1.0, strict=True)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def validate_strict_confidence(cls, value: Any) -> Any:
+        if not isinstance(value, float):
+            raise ValueError("situated_presence_confidence_float_required")
+        return value
+
+
+class SituatedPresenceEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    runtime_turn_id: str = Field(min_length=1, max_length=120)
+    surface_context: SituatedPresenceSurfaceContext
+    interaction_governance: SituatedPresenceInteractionGovernanceProjection
+    restraint: SituatedPresenceRestraintProjection
+
+    @field_validator(
+        "request_id",
+        "owner_id",
+        "conversation_id",
+        "surface",
+        "runtime_session_id",
+        "runtime_turn_id",
+    )
+    @classmethod
+    def validate_nonblank_identifier(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("situated_presence_identifier_blank")
+        return value
+
+
+class SituatedPresenceResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    commentary_allowed: bool = Field(strict=True)
+    humor_allowed: bool = Field(strict=True)
+    emotional_attunement_allowed: SituatedPresenceEmotionalAttunement
+    challenge_allowed: SituatedPresenceChallenge
+    silence_preferred: bool = Field(strict=True)
+    surface_allows_commentary: bool = Field(strict=True)
+    response_posture: InteractionGovernanceResponsePosture
+    action_implication_allowed: Literal[False] = False
+    reason_summary: list[SituatedPresenceReason] = Field(min_length=1, max_length=8)
+    policy_version: Literal["situated-presence.v1"] = "situated-presence.v1"
+
+    @field_validator("action_implication_allowed", mode="before")
+    @classmethod
+    def validate_action_implication_false(cls, value: Any) -> Any:
+        if value is not False:
+            raise ValueError("situated_presence_action_implication_forbidden")
+        return value
+
+    @model_validator(mode="after")
+    def validate_coherence(self) -> "SituatedPresenceResult":
+        if self.commentary_allowed and not self.surface_allows_commentary:
+            raise ValueError("situated_presence_commentary_surface_inconsistent")
+        if self.humor_allowed and (
+            not self.commentary_allowed or not self.surface_allows_commentary
+        ):
+            raise ValueError("situated_presence_humor_inconsistent")
+        if self.silence_preferred and (
+            self.commentary_allowed or self.humor_allowed
+        ):
+            raise ValueError("situated_presence_silence_inconsistent")
+        if len(self.reason_summary) != len(set(self.reason_summary)):
+            raise ValueError("situated_presence_reasons_duplicate")
+        reason_positions = {
+            reason: index
+            for index, reason in enumerate(SITUATED_PRESENCE_REASON_ORDER)
+        }
+        if self.reason_summary != sorted(
+            self.reason_summary,
+            key=reason_positions.__getitem__,
+        ):
+            raise ValueError("situated_presence_reasons_out_of_order")
+        return self
+
+
+class SituatedPresenceEvaluateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["situated-presence.v1"] = "situated-presence.v1"
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    runtime_turn_id: str = Field(min_length=1, max_length=120)
+    result: SituatedPresenceResult
 
 
 class PersonaProfile(BaseModel):
