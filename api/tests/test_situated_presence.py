@@ -133,6 +133,92 @@ def _presence_events(runtime_session_id: str) -> list[dict[str, object]]:
     ]
 
 
+def _actual_policy_chain(
+    *,
+    label: str,
+    current_user_text: str,
+    visibility: str = "private",
+    constraint: str = "normal",
+) -> dict[str, object]:
+    scope = _start_scope(
+        owner_id=f"owner-{label}",
+        conversation_id=f"conversation-{label}",
+        request_id=f"{label}-turn-start",
+    )
+    common = {
+        "owner_id": scope["owner_id"],
+        "conversation_id": scope["conversation_id"],
+        "surface": scope["surface"],
+        "runtime_session_id": scope["runtime_session_id"],
+        "runtime_turn_id": scope["runtime_turn_id"],
+        "current_user_text": current_user_text,
+        "recent_messages": [],
+    }
+    governance_response = client.post(
+        "/v1/runtime/interaction-governance/evaluate",
+        json={**common, "request_id": f"{label}-governance"},
+    )
+    assert governance_response.status_code == 200
+    governance = governance_response.json()["result"]
+
+    restraint_response = client.post(
+        "/v1/runtime/restraint/evaluate",
+        json={
+            **common,
+            "request_id": f"{label}-restraint",
+            "interaction_kind": governance["interaction_kind"],
+            "response_posture": governance["response_posture"],
+        },
+    )
+    assert restraint_response.status_code == 200
+    restraint = restraint_response.json()["result"]
+
+    governance_projection = {
+        key: governance[key]
+        for key in (
+            "interaction_kind",
+            "tension_level",
+            "commentary_allowed",
+            "humor_allowed",
+            "action_allowed",
+            "requires_confirmation",
+            "privacy_sensitivity_hint",
+            "response_posture",
+            "confidence",
+        )
+    }
+    restraint_projection = {
+        key: restraint[key]
+        for key in (
+            "restraint_policy",
+            "proactive_output_suppressed",
+            "personalization_suppressed",
+            "brevity_preferred",
+            "clarification_preferred",
+            "confidence",
+        )
+    }
+    before_presence = _policy_rows(runtime_state_db_path())
+    presence_response = _evaluate(
+        _request(
+            scope,
+            visibility=visibility,
+            constraint=constraint,
+            governance=governance_projection,
+            restraint=restraint_projection,
+            request_id=f"{label}-presence",
+        )
+    )
+    assert presence_response.status_code == 200
+    return {
+        "scope": scope,
+        "governance": governance,
+        "restraint": restraint,
+        "presence": presence_response.json()["result"],
+        "before_presence": before_presence,
+    }
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -395,6 +481,182 @@ def test_brevity_keeps_allowed_playfulness_bounded_to_brief_posture():
     assert "brevity_preferred" in result["reason_summary"]
 
 
+def test_actual_playful_policy_chain_reaches_bounded_commentary_and_humor():
+    chain = _actual_policy_chain(
+        label="actual-playful",
+        current_user_text="lol roast my tiny todo list",
+    )
+    governance = chain["governance"]
+    restraint = chain["restraint"]
+    result = chain["presence"]
+
+    assert governance["interaction_kind"] == "joke_or_playful"
+    assert governance["tension_level"] == "low"
+    assert governance["commentary_allowed"] is True
+    assert governance["humor_allowed"] is True
+    assert governance["action_allowed"] is False
+    assert governance["requires_confirmation"] is False
+    assert governance["privacy_sensitivity_hint"] == "normal"
+    assert governance["response_posture"] == "playful"
+    assert restraint["restraint_policy"] == "answer_normally"
+    assert restraint["personalization_suppressed"] is True
+    assert restraint["proactive_output_suppressed"] is True
+    assert restraint["brevity_preferred"] is False
+    assert restraint["clarification_preferred"] is False
+    assert result == {
+        "commentary_allowed": True,
+        "humor_allowed": True,
+        "emotional_attunement_allowed": "none",
+        "challenge_allowed": "low",
+        "silence_preferred": False,
+        "surface_allows_commentary": True,
+        "response_posture": "playful",
+        "action_implication_allowed": False,
+        "reason_summary": [
+            "light_commentary_allowed",
+            "proactive_output_suppressed",
+            "personalization_suppressed",
+        ],
+        "policy_version": "situated-presence.v1",
+    }
+
+
+def test_actual_playful_chain_records_summarized_events_without_policy_mutation():
+    fixture_text = "lol roast my tiny todo list"
+    chain = _actual_policy_chain(
+        label="actual-playful-events",
+        current_user_text=fixture_text,
+    )
+    scope = chain["scope"]
+
+    assert _policy_rows(runtime_state_db_path()) == chain["before_presence"]
+    diagnostics = client.get(
+        f"/v1/runtime/sessions/{scope['runtime_session_id']}"
+    )
+    assert diagnostics.status_code == 200
+    events = diagnostics.json()["events"]
+    event_types = [event["event_type"] for event in events]
+    assert event_types.count("interaction_governance_evaluated") == 1
+    assert event_types.count("restraint_evaluated") == 1
+    assert event_types.count("situated_presence_evaluated") == 1
+    presence_event = next(
+        event
+        for event in events
+        if event["event_type"] == "situated_presence_evaluated"
+    )
+    assert presence_event["runtime_turn_id"] == scope["runtime_turn_id"]
+    assert fixture_text.lower() not in str(
+        presence_event["event_payload_json"]
+    ).lower()
+
+
+def test_actual_question_chain_does_not_invent_commentary():
+    chain = _actual_policy_chain(
+        label="actual-question",
+        current_user_text="What does this function do?",
+    )
+
+    assert chain["governance"]["interaction_kind"] == "question"
+    assert chain["governance"]["commentary_allowed"] is False
+    assert chain["governance"]["humor_allowed"] is False
+    result = chain["presence"]
+    assert result["commentary_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["response_posture"] == "direct"
+    assert result["silence_preferred"] is False
+
+
+def test_actual_tense_debugging_chain_stays_tactical_and_humorless():
+    chain = _actual_policy_chain(
+        label="actual-tense",
+        current_user_text="I think I broke the server and prod is failing",
+    )
+
+    assert chain["governance"]["interaction_kind"] == "tense_debugging"
+    assert chain["restraint"]["restraint_policy"] == "short_answer"
+    result = chain["presence"]
+    assert result["commentary_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["challenge_allowed"] == "medium"
+    assert result["silence_preferred"] is False
+    assert result["response_posture"] == "tactical"
+    assert result["action_implication_allowed"] is False
+
+
+def test_actual_high_impact_chain_stays_direct_and_humorless():
+    chain = _actual_policy_chain(
+        label="actual-high-impact",
+        current_user_text="Should I change payroll taxes?",
+    )
+
+    assert chain["governance"]["interaction_kind"] == "high_impact_decision"
+    result = chain["presence"]
+    assert result["commentary_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["response_posture"] in {"direct", "brief"}
+    assert result["silence_preferred"] is False
+    assert result["action_implication_allowed"] is False
+    assert "high_impact_context" in result["reason_summary"]
+
+
+def test_actual_vent_chain_allows_only_generic_brief_attunement():
+    chain = _actual_policy_chain(
+        label="actual-vent",
+        current_user_text="Ugh, this sucks and I am upset.",
+    )
+
+    assert chain["governance"]["interaction_kind"] == "vent_or_expression"
+    assert chain["restraint"]["personalization_suppressed"] is True
+    assert chain["restraint"]["proactive_output_suppressed"] is True
+    assert chain["restraint"]["brevity_preferred"] is True
+    result = chain["presence"]
+    assert result["commentary_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["emotional_attunement_allowed"] == "brief"
+    assert result["challenge_allowed"] == "none"
+    assert result["response_posture"] == "brief"
+    assert result["silence_preferred"] is False
+    assert result["action_implication_allowed"] is False
+    assert "brief_steadying_allowed" in result["reason_summary"]
+
+
+def test_actual_mistake_chain_keeps_confirmation_and_allows_generic_attunement():
+    chain = _actual_policy_chain(
+        label="actual-mistake",
+        current_user_text="That was wrong in the report.",
+    )
+
+    governance = chain["governance"]
+    assert governance["interaction_kind"] == "mistake_or_failure_report"
+    assert governance["privacy_sensitivity_hint"] == "private"
+    assert governance["requires_confirmation"] is True
+    result = chain["presence"]
+    assert result["commentary_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["emotional_attunement_allowed"] == "brief"
+    assert result["challenge_allowed"] == "low"
+    assert result["response_posture"] == "brief"
+    assert result["action_implication_allowed"] is False
+    assert "brief_steadying_allowed" in result["reason_summary"]
+    assert "confirmation_required" in result["reason_summary"]
+    assert "privacy_sensitive" in result["reason_summary"]
+
+
+def test_actual_mistake_chain_public_surface_clamps_brief_attunement():
+    chain = _actual_policy_chain(
+        label="actual-mistake-public",
+        current_user_text="That was wrong in the report.",
+        visibility="public",
+    )
+
+    result = chain["presence"]
+    assert result["surface_allows_commentary"] is False
+    assert result["commentary_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["emotional_attunement_allowed"] != "brief"
+    assert result["action_implication_allowed"] is False
+
+
 @pytest.mark.parametrize(
     "governance",
     [
@@ -477,38 +739,39 @@ def test_private_emotional_or_mistake_context_allows_only_brief_attunement(
     assert "brief_steadying_allowed" in result["reason_summary"]
 
 
-@pytest.mark.parametrize(
-    ("governance_overrides", "restraint_overrides", "expected_reason"),
-    [
-        (
-            {"privacy_sensitivity_hint": "sensitive"},
-            {},
-            "privacy_sensitive",
-        ),
-        (
-            {},
-            {"personalization_suppressed": True},
-            "personalization_suppressed",
-        ),
-    ],
-)
-def test_privacy_or_personalization_clamp_reduces_emotional_attunement(
-    governance_overrides,
-    restraint_overrides,
-    expected_reason,
-):
+def test_sensitive_privacy_clamps_brief_emotional_attunement():
     governance = _governance(
         interaction_kind="mistake_or_failure_report",
         tension_level="medium",
         humor_allowed=False,
         response_posture="supportive",
-        **governance_overrides,
+        privacy_sensitivity_hint="sensitive",
+    )
+
+    response = _evaluate(
+        _request(governance=governance)
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["commentary_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["emotional_attunement_allowed"] == "none"
+    assert "privacy_sensitive" in result["reason_summary"]
+
+
+def test_personalization_suppression_keeps_steadying_response_generic_and_brief():
+    governance = _governance(
+        interaction_kind="mistake_or_failure_report",
+        tension_level="medium",
+        humor_allowed=False,
+        response_posture="supportive",
     )
 
     response = _evaluate(
         _request(
             governance=governance,
-            restraint=_restraint(**restraint_overrides),
+            restraint=_restraint(personalization_suppressed=True),
         )
     )
 
@@ -516,8 +779,9 @@ def test_privacy_or_personalization_clamp_reduces_emotional_attunement(
     result = response.json()["result"]
     assert result["commentary_allowed"] is False
     assert result["humor_allowed"] is False
-    assert result["emotional_attunement_allowed"] != "brief"
-    assert expected_reason in result["reason_summary"]
+    assert result["emotional_attunement_allowed"] == "brief"
+    assert result["response_posture"] == "brief"
+    assert "personalization_suppressed" in result["reason_summary"]
 
 
 @pytest.mark.parametrize(
@@ -580,12 +844,19 @@ def test_public_tense_context_keeps_tactical_help_while_suppressing_commentary()
 
 
 @pytest.mark.parametrize(
-    ("governance", "restraint", "reason", "commentary_allowed"),
+    (
+        "governance",
+        "restraint",
+        "reason",
+        "commentary_allowed",
+        "humor_allowed",
+    ),
     [
         (
             _governance(commentary_allowed=False),
             _restraint(),
             "upstream_commentary_suppressed",
+            False,
             False,
         ),
         (
@@ -593,23 +864,27 @@ def test_public_tense_context_keeps_tactical_help_while_suppressing_commentary()
             _restraint(),
             "upstream_humor_suppressed",
             True,
+            False,
         ),
         (
             _governance(),
             _restraint(proactive_output_suppressed=True),
             "proactive_output_suppressed",
-            False,
+            True,
+            True,
         ),
         (
             _governance(),
             _restraint(personalization_suppressed=True),
             "personalization_suppressed",
-            False,
+            True,
+            True,
         ),
         (
             _governance(commentary_allowed=False),
             _restraint(brevity_preferred=True),
             "brevity_preferred",
+            False,
             False,
         ),
         (
@@ -617,20 +892,23 @@ def test_public_tense_context_keeps_tactical_help_while_suppressing_commentary()
             _restraint(clarification_preferred=True),
             "clarification_preferred",
             False,
+            False,
         ),
         (
             _governance(requires_confirmation=True),
             _restraint(),
             "confirmation_required",
             False,
+            False,
         ),
     ],
 )
-def test_upstream_governance_and_restraint_can_only_tighten(
+def test_upstream_governance_and_restraint_are_composed_by_domain(
     governance,
     restraint,
     reason,
     commentary_allowed,
+    humor_allowed,
 ):
     response = _evaluate(
         _request(governance=governance, restraint=restraint)
@@ -639,9 +917,36 @@ def test_upstream_governance_and_restraint_can_only_tighten(
     assert response.status_code == 200
     result = response.json()["result"]
     assert result["commentary_allowed"] is commentary_allowed
-    assert result["humor_allowed"] is False
+    assert result["humor_allowed"] is humor_allowed
     assert result["action_implication_allowed"] is False
     assert reason in result["reason_summary"]
+
+
+@pytest.mark.parametrize(
+    "restraint",
+    [
+        _restraint(proactive_output_suppressed=True),
+        _restraint(personalization_suppressed=True),
+    ],
+)
+def test_domain_suppressions_do_not_create_commentary_permission(restraint):
+    response = _evaluate(
+        _request(
+            governance=_governance(
+                interaction_kind="question",
+                commentary_allowed=False,
+                humor_allowed=False,
+                response_posture="direct",
+            ),
+            restraint=restraint,
+        )
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["commentary_allowed"] is False
+    assert result["humor_allowed"] is False
+    assert result["action_implication_allowed"] is False
 
 
 def test_ambiguous_and_low_confidence_inputs_prefer_silence():

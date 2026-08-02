@@ -112,8 +112,6 @@ def _evaluate_policy(body: SituatedPresenceEvaluateRequest) -> SituatedPresenceR
         not in {"tense_debugging", "high_impact_decision", "ambiguous"}
         and governance.privacy_sensitivity_hint == "normal"
         and not governance.requires_confirmation
-        and not restraint.proactive_output_suppressed
-        and not restraint.personalization_suppressed
         and not restraint.clarification_preferred
     )
 
@@ -173,26 +171,25 @@ def _evaluate_policy(body: SituatedPresenceEvaluateRequest) -> SituatedPresenceR
         commentary_allowed = False
         attunement_allowed = (
             surface_allows
-            and governance.privacy_sensitivity_hint == "normal"
-            and not governance.requires_confirmation
-            and not restraint.proactive_output_suppressed
-            and not restraint.personalization_suppressed
+            and governance.privacy_sensitivity_hint in {"normal", "private"}
             and not restraint.clarification_preferred
         )
         if attunement_allowed:
             emotional_attunement = "brief"
             reasons.add("brief_steadying_allowed")
-        elif restraint.proactive_output_suppressed:
+        elif (
+            governance.privacy_sensitivity_hint == "sensitive"
+            or restraint.clarification_preferred
+        ):
             emotional_attunement = "none"
         else:
             emotional_attunement = "minimal"
-        silence_preferred = restraint.proactive_output_suppressed
+        silence_preferred = False
         posture = (
-            "silent_or_minimal"
-            if silence_preferred
-            else "brief"
+            "brief"
             if restraint.brevity_preferred
             or restraint.personalization_suppressed
+            or restraint.proactive_output_suppressed
             or governance.privacy_sensitivity_hint != "normal"
             or not surface_allows
             else "supportive"
@@ -220,9 +217,7 @@ def _evaluate_policy(body: SituatedPresenceEvaluateRequest) -> SituatedPresenceR
         elif commentary_allowed:
             reasons.add("low_risk_commentary_allowed")
         silence_preferred = not commentary_allowed and (
-            restraint.proactive_output_suppressed
-            or restraint.clarification_preferred
-            or not surface_allows
+            restraint.clarification_preferred or not surface_allows
         )
         return SituatedPresenceResult(
             commentary_allowed=commentary_allowed,
