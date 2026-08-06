@@ -8,7 +8,8 @@ from itertools import count
 import pytest
 from fastapi.testclient import TestClient
 from main import app
-from models import EvidenceAcquisitionPremise
+from models import EvidenceAcquisitionPremise, EvidenceNextStepResult
+from pydantic import ValidationError
 from services import evidence_next_steps
 from services.evidence_planning import evidence_acquisition_premise_digest
 
@@ -25,6 +26,9 @@ def _start_runtime(
     *,
     question_anchor: str = _DEFAULT_QUESTION,
     premise: dict[str, object] | None = None,
+    derive_shape: bool = False,
+    interaction_kind: str = "question",
+    shape_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ordinal = next(_runtime_counter)
     planned_premise = copy.deepcopy(premise or _premise(question=question_anchor))
@@ -51,6 +55,26 @@ def _start_runtime(
         "runtime_turn_id": body["runtime_turn"]["runtime_turn_id"],
         "acquisition_manifest_id": f"manifest-{ordinal}",
     }
+    if derive_shape:
+        shape_response = client.post(
+            "/v1/runtime/evidence-shapes/derive",
+            json={
+                "request_id": f"derive-{ordinal}",
+                "owner_id": scope["owner_id"],
+                "conversation_id": scope["conversation_id"],
+                "surface": scope["surface"],
+                "runtime_session_id": scope["runtime_session_id"],
+                "runtime_turn_id": scope["runtime_turn_id"],
+                "task_text": question_anchor,
+                "interaction_kind": interaction_kind,
+                "task_context": shape_context or _shape_context(),
+            },
+        )
+        assert shape_response.status_code == 200
+        shape_result = shape_response.json()["result"]
+        assert shape_result["question_anchor"] == question_anchor
+        assert shape_result["task_shape"] == planned_premise["task_shape"]
+        scope["_shape_result"] = shape_result
     plan_response = client.post(
         "/v1/runtime/evidence-plans/compile",
         json={
@@ -144,6 +168,17 @@ def _source(
         ],
         "availability": availability,
         "authority_role": authority_role,
+    }
+
+
+def _shape_context(*, high_stakes_accuracy_required: bool = False) -> dict[str, object]:
+    return {
+        "evidence_input_kinds": [],
+        "external_verification_required": False,
+        "freshness_sensitive": False,
+        "high_stakes_accuracy_required": high_stakes_accuracy_required,
+        "continuation_of_prior_evidence_task": False,
+        "prior_task_shape": None,
     }
 
 
@@ -315,7 +350,8 @@ def test_sufficient_statuses_select_answer_without_more_acquisition(
     expected_conclusion: str,
     expected_provider: str,
 ):
-    scope = _start_runtime()
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
     evaluation = _evaluate(
         scope,
         [
@@ -425,6 +461,233 @@ def test_concrete_failure_cannot_force_clarification(outcome: str):
     result = response.json()["result"]
     assert result["selected_next_step"] == "withhold_unsupported_conclusion"
     assert result["clarification_target"] is None
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [("failed", "insufficient"), ("unknown", "unknown")],
+)
+def test_associated_low_risk_targeted_gap_withholds_conclusion_and_allows_guidance(
+    outcome: str,
+    expected_status: str,
+):
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", outcome)],
+    )
+
+    response = _select(_next_step_payload(scope, evaluation))
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["task_shape"] == "targeted_lookup"
+    assert result["sufficiency_status"] == expected_status
+    assert result["selected_next_step"] == "withhold_unsupported_conclusion"
+    assert result["conclusion_disposition"] == "requested_conclusion_withheld"
+    assert result["provider_disposition"] == "allowed"
+    assert result["reacquisition_guard"] == "not_applicable"
+    assert result["reason_codes"] == ["unsupported_conclusion_withheld"]
+    assert result["user_safe_summary"] == (
+        "The requested conclusion remains unsupported; non-authoritative "
+        "guidance is permitted without presenting it as verified."
+    )
+    event = _selection_events(scope["runtime_session_id"])[0][
+        "event_payload_json"
+    ]
+    assert event["selected_next_step"] == result["selected_next_step"]
+    assert event["conclusion_disposition"] == result["conclusion_disposition"]
+    assert event["provider_disposition"] == "allowed"
+    serialized = json.dumps(event, sort_keys=True).lower()
+    assert question.lower() not in serialized
+    assert "non-authoritative guidance" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("interaction_kind", "high_stakes"),
+    [("high_impact_decision", False), ("question", True)],
+)
+def test_associated_high_risk_targeted_gap_keeps_provider_blocked(
+    interaction_kind: str,
+    high_stakes: bool,
+):
+    question = "Can this adapter be used with that device?"
+    scope = _start_runtime(
+        question_anchor=question,
+        derive_shape=True,
+        interaction_kind=interaction_kind,
+        shape_context=_shape_context(
+            high_stakes_accuracy_required=high_stakes,
+        ),
+    )
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+
+    result = _select(_next_step_payload(scope, evaluation)).json()["result"]
+
+    assert result["selected_next_step"] == "withhold_unsupported_conclusion"
+    assert result["conclusion_disposition"] == "requested_conclusion_withheld"
+    assert result["provider_disposition"] == "blocked"
+
+
+def test_absent_associated_shape_event_keeps_provider_blocked():
+    scope = _start_runtime()
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+
+    result = _select(_next_step_payload(scope, evaluation)).json()["result"]
+
+    assert result["selected_next_step"] == "withhold_unsupported_conclusion"
+    assert result["provider_disposition"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    "event_mutation",
+    [
+        "session",
+        "turn",
+        "question_anchor",
+        "task_shape",
+        "malformed_reasons",
+        "duplicate",
+    ],
+)
+def test_mismatched_or_malformed_shape_association_keeps_provider_blocked(
+    event_mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+    original_get_runtime_session = evidence_next_steps.get_runtime_session
+
+    def _altered_diagnostics(runtime_session_id: str):
+        diagnostics = original_get_runtime_session(runtime_session_id)
+        for index, event in enumerate(diagnostics.events):
+            if event.event_type != "evidence_shape_derived":
+                continue
+            if event_mutation == "session":
+                event.event_payload_json["runtime_session_id"] = "other-session"
+            elif event_mutation == "turn":
+                event.event_payload_json["runtime_turn_id"] = "other-turn"
+            elif event_mutation == "question_anchor":
+                event.event_payload_json["question_anchor_digest"] = (
+                    _question_digest("Different question")
+                )
+            elif event_mutation == "task_shape":
+                event.event_payload_json["task_shape"] = "cross_source_comparison"
+            elif event_mutation == "malformed_reasons":
+                event.event_payload_json["reason_codes"] = ["not-a-reason"]
+            else:
+                duplicate = event.model_copy(deep=True)
+                duplicate.event_id = f"{event.event_id}-duplicate"
+                diagnostics.events.insert(index + 1, duplicate)
+            break
+        return diagnostics
+
+    monkeypatch.setattr(
+        evidence_next_steps,
+        "get_runtime_session",
+        _altered_diagnostics,
+    )
+    response = _select(_next_step_payload(scope, evaluation))
+
+    assert response.status_code == 200
+    assert response.json()["result"]["provider_disposition"] == "blocked"
+
+
+def test_changed_premise_precedes_advisory_permission():
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+
+    result = _select(
+        _next_step_payload(
+            scope,
+            evaluation,
+            proposed_acquisition_premise=_premise(
+                question="Does this other version support Python 3.14?"
+            ),
+        )
+    ).json()["result"]
+
+    assert result["selected_next_step"] == "perform_additional_acquisition"
+    assert result["provider_disposition"] == "blocked"
+    assert result["reacquisition_guard"] == "changed_premise_allowed"
+
+
+def test_exhausted_changed_premise_can_reach_advisory_fallback():
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+    proposed = _premise(
+        question="Does this other version support Python 3.14?"
+    )
+    first_payload = _next_step_payload(
+        scope,
+        evaluation,
+        proposed_acquisition_premise=proposed,
+    )
+    first = _select(first_payload).json()["result"]
+    repeated = _select(
+        {
+            **first_payload,
+            "request_id": f"{first_payload['request_id']}-repeated",
+        }
+    ).json()["result"]
+
+    assert first["selected_next_step"] == "perform_additional_acquisition"
+    assert first["provider_disposition"] == "blocked"
+    assert repeated["selected_next_step"] == "withhold_unsupported_conclusion"
+    assert repeated["conclusion_disposition"] == "requested_conclusion_withheld"
+    assert repeated["provider_disposition"] == "allowed"
+    assert repeated["reacquisition_guard"] == "premise_already_attempted"
+    assert repeated["reason_codes"] == [
+        "acquisition_premise_already_selected",
+        "unsupported_conclusion_withheld",
+    ]
+
+
+def test_permitted_clarification_precedes_advisory_permission():
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "unknown")],
+    )
+
+    result = _select(
+        _next_step_payload(
+            scope,
+            evaluation,
+            clarification_target="version_scope",
+        )
+    ).json()["result"]
+
+    assert result["selected_next_step"] == "ask_narrow_clarification"
+    assert result["provider_disposition"] == "blocked"
+    assert result["clarification_target"] == "version_scope"
 
 
 def test_unchanged_premise_blocks_additional_acquisition():
@@ -680,7 +943,8 @@ def test_association_identifiers_do_not_enter_premise_digest():
 
 
 def test_safe_partial_answer_requires_delivered_substantive_evidence():
-    scope = _start_runtime()
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
     evaluation = _evaluate(
         scope,
         [
@@ -752,6 +1016,144 @@ def test_unresolved_scope_selects_disclosure_and_hard_failure_selects_withholdin
     assert disclosure["provider_disposition"] == "blocked"
     assert withholding["selected_next_step"] == "withhold_unsupported_conclusion"
     assert withholding["provider_disposition"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("question", "task_shape", "requirement_kind"),
+    [
+        (
+            "Check every requirement in the complete checklist.",
+            "bounded_exhaustive_review",
+            "complete_scope_coverage",
+        ),
+        (
+            "Check whether there is no record in the declared logs.",
+            "absence_or_coverage_check",
+            "structured_absence_check",
+        ),
+        (
+            "Inspect whether these reports contradict each other.",
+            "contradiction_review",
+            "contradiction_search",
+        ),
+        (
+            "Reconstruct what happened across the records last week.",
+            "historical_reconstruction",
+            "historical_scope",
+        ),
+        (
+            "Which should I choose based on the evidence in these reports?",
+            "recommendation_or_decision_support",
+            "candidate_evidence_coverage",
+        ),
+    ],
+)
+def test_unsupported_non_targeted_shapes_keep_provider_blocked(
+    question: str,
+    task_shape: str,
+    requirement_kind: str,
+):
+    scope = _start_runtime(
+        question_anchor=question,
+        premise=_premise(question=question, task_shape=task_shape),
+        derive_shape=True,
+    )
+    evaluation = _evaluate(
+        scope,
+        [_requirement("material", requirement_kind)],
+        [_fact("material", "failed")],
+        task_shape=task_shape,
+    )
+
+    result = _select(_next_step_payload(scope, evaluation)).json()["result"]
+
+    assert result["conclusion_disposition"] == "requested_conclusion_withheld"
+    assert result["provider_disposition"] == "blocked"
+
+
+def test_advisory_selection_is_idempotent_and_records_one_event():
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+    payload = _next_step_payload(scope, evaluation)
+
+    first = _select(payload)
+    second = _select(payload)
+
+    assert first.status_code == 200
+    assert first.json() == second.json()
+    assert first.json()["result"]["provider_disposition"] == "allowed"
+    assert len(_selection_events(scope["runtime_session_id"])) == 1
+
+
+def _advisory_result_data() -> dict[str, object]:
+    return {
+        "selection_id": "selection-valid",
+        "evaluation_id": "evaluation-valid",
+        "evidence_plan_id": "plan-valid",
+        "acquisition_manifest_id": "manifest-valid",
+        "task_shape": "targeted_lookup",
+        "sufficiency_status": "insufficient",
+        "selected_next_step": "withhold_unsupported_conclusion",
+        "conclusion_disposition": "requested_conclusion_withheld",
+        "provider_disposition": "allowed",
+        "current_premise_digest": f"sha256:{'a' * 64}",
+        "proposed_premise_digest": None,
+        "reacquisition_guard": "not_applicable",
+        "clarification_target": None,
+        "unresolved_material_requirement_ids": ["material"],
+        "reason_codes": ["unsupported_conclusion_withheld"],
+        "user_safe_summary": "The conclusion is unsupported; guidance is bounded.",
+    }
+
+
+def test_strict_result_model_accepts_only_the_targeted_advisory_form():
+    result = EvidenceNextStepResult.model_validate(_advisory_result_data())
+
+    assert result.selected_next_step == "withhold_unsupported_conclusion"
+    assert result.conclusion_disposition == "requested_conclusion_withheld"
+    assert result.provider_disposition == "allowed"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"conclusion_disposition": "bounded_conclusion_allowed"},
+        {"task_shape": "bounded_exhaustive_review"},
+        {"task_shape": "absence_or_coverage_check"},
+        {"task_shape": "contradiction_review"},
+        {"task_shape": "historical_reconstruction"},
+        {"task_shape": "recommendation_or_decision_support"},
+        {"reason_codes": ["unexamined_material_scope"]},
+        {
+            "selected_next_step": "disclose_unexamined_scope",
+            "reason_codes": ["unexamined_material_scope"],
+        },
+        {
+            "selected_next_step": "ask_narrow_clarification",
+            "clarification_target": "source_scope",
+            "reason_codes": ["material_uncertainty_requires_clarification"],
+        },
+        {
+            "selected_next_step": "perform_additional_acquisition",
+            "proposed_premise_digest": f"sha256:{'b' * 64}",
+            "reacquisition_guard": "changed_premise_allowed",
+            "reason_codes": ["changed_acquisition_premise_available"],
+        },
+        {"reason_codes": ["unsupported_conclusion_withheld"] * 2},
+    ],
+)
+def test_strict_result_model_rejects_incoherent_provider_permission(
+    updates: dict[str, object],
+):
+    data = {**_advisory_result_data(), **updates}
+
+    with pytest.raises(ValidationError):
+        EvidenceNextStepResult.model_validate(data)
 
 
 @pytest.mark.parametrize(
@@ -936,6 +1338,8 @@ def test_tampered_evaluated_requirements_fail_digest_association():
         "provider_disposition",
         "selected_next_step",
         "conclusion_disposition",
+        "advisory_allowed",
+        "low_risk",
     ],
 )
 def test_caller_selected_policy_fields_are_rejected(forbidden_field: str):

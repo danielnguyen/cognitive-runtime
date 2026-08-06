@@ -115,6 +115,9 @@ def test_positive_request_is_strict_normalized_and_bounded():
         "metadata",
         "prompt",
         "source_content",
+        "advisory_allowed",
+        "low_risk",
+        "provider_disposition",
     ],
 )
 def test_caller_selected_or_unrestricted_fields_are_rejected(extra_field: str):
@@ -256,6 +259,80 @@ def test_genuine_bounded_evidence_queries_derive_targeted_lookup(task_text: str)
     assert result["derivation_status"] == "derived"
     assert result["task_shape"] == "targeted_lookup"
     assert result["evidence_scope_material"] is True
+
+
+@pytest.mark.parametrize(
+    "task_text",
+    [
+        "Will this 2001 control module work in the 2004 model?",
+        "Are these two parts interchangeable?",
+        "Does this package version support Python 3.14?",
+        "Can this adapter be used with that device?",
+        "Is this capability implemented in the current code?",
+        "Is the new validation path wired end to end?",
+        "Has this change been deployed?",
+        "Does the repository currently enforce this boundary?",
+        "Was this implementation reviewed end to end?",
+        "Were hosted checks run against the final head?",
+    ],
+)
+def test_verification_dependent_questions_derive_targeted_lookup_without_opt_in(
+    task_text: str,
+):
+    runtime = _start_runtime()
+    response = _derive(runtime, task_text=task_text)
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "targeted_lookup"
+    assert result["candidate_task_shapes"] == ["targeted_lookup"]
+    assert result["evidence_scope_material"] is True
+    assert result["clarification_required"] is False
+    assert set(result["reason_codes"]) == {
+        "external_verification_required",
+        "targeted_lookup_derived",
+    }
+
+
+@pytest.mark.parametrize(
+    "task_text",
+    [
+        "Explain how a climate control module works.",
+        "What does implementation mean?",
+        "Write a compatibility checklist.",
+        "Review this paragraph for grammar.",
+        "Could you brainstorm names that fit this theme?",
+        "Can you explain how this control module works in a system?",
+        "Did that joke work?",
+        "Tell me a joke about incompatible components.",
+    ],
+)
+def test_verification_vocabulary_near_misses_remain_not_applicable(
+    task_text: str,
+):
+    result = _derive(_start_runtime(), task_text=task_text).json()["result"]
+
+    _assert_not_applicable(result)
+    assert "external_verification_required" not in result["reason_codes"]
+
+
+def test_verification_dependent_shape_event_is_bounded_and_raw_text_free():
+    runtime = _start_runtime()
+    task_text = "Does component build 91 support runtime 14?"
+    result = _derive(runtime, task_text=task_text).json()["result"]
+    event = _shape_events(runtime["runtime_session_id"])[0]
+    payload = event["event_payload_json"]
+
+    assert payload["question_anchor_digest"] == result["question_anchor_digest"]
+    assert payload["task_shape"] == "targeted_lookup"
+    assert payload["reason_codes"] == [
+        "external_verification_required",
+        "targeted_lookup_derived",
+    ]
+    serialized = json.dumps(payload, sort_keys=True).lower()
+    assert task_text.lower() not in serialized
+    assert "component build 91" not in serialized
 
 
 def test_bounded_alternative_comparison_remains_evidence_material():

@@ -91,6 +91,35 @@ _DECISION = re.compile(
     r"choose\s+between)\b",
     re.IGNORECASE,
 )
+_NON_VERIFICATION_FRAMING = re.compile(
+    r"^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+    r"(?:explain|describe|define|write|draft|create|brainstorm|"
+    r"review|edit|proofread|tell\s+me\s+(?:a|another)\s+joke)\b",
+    re.IGNORECASE,
+)
+_COMPATIBILITY_RELATIONSHIP_QUESTION = re.compile(
+    r"\b(?:will|would|can|could|does|do|is|are)\b.{0,180}\b(?:"
+    r"compatible\s+with|interchangeable(?:\s+with)?|work\s+(?:with|in|on)|"
+    r"fit\s+(?:with|in|on|into)|supports?\b|be\s+used\s+with)\b",
+    re.IGNORECASE,
+)
+_CURRENT_STATE_QUESTION = re.compile(
+    r"\b(?:is|are|was|were|has|have|does|do)\b"
+    r"(?=.{0,180}\b(?:this|that|these|those|current|new|capabilit(?:y|ies)|"
+    r"implementations?|deployments?|changes?|paths?|repositories?|code|"
+    r"boundar(?:y|ies))\b)"
+    r".{0,180}\b(?:implemented|wired\s+end[ -]to[ -]end|deployed|enforces?)\b",
+    re.IGNORECASE,
+)
+_PERFORMED_VALIDATION_QUESTION = re.compile(
+    r"\b(?:was|were|has|have|did)\b"
+    r"(?=.{0,180}\b(?:implementations?|code|request\s+paths?|"
+    r"validation\s+paths?|changes?|repositories?|deployments?|"
+    r"hosted\s+checks?|final\s+heads?)\b)"
+    r".{0,180}\b(?:review(?:ed)?|validat(?:e|ed)|test(?:ed)?|"
+    r"checks?\s+run|run\s+against)\b",
+    re.IGNORECASE,
+)
 
 _SPECIALIZED_REASON: dict[EvidenceTaskShape, EvidenceShapeReasonCode] = {
     "bounded_exhaustive_review": "exhaustive_scope_requested",
@@ -156,16 +185,30 @@ def _specialized_shapes(text: str) -> set[EvidenceTaskShape]:
     return shapes
 
 
+def _verification_dependent_request(text: str) -> bool:
+    if _NON_VERIFICATION_FRAMING.search(text):
+        return False
+    return any(
+        pattern.search(text)
+        for pattern in (
+            _COMPATIBILITY_RELATIONSHIP_QUESTION,
+            _CURRENT_STATE_QUESTION,
+            _PERFORMED_VALIDATION_QUESTION,
+        )
+    )
+
+
 def _materiality_reasons(
     body: EvidenceShapeDeriveRequest,
     *,
     explicit_evidence: bool,
+    verification_dependent: bool,
 ) -> set[EvidenceShapeReasonCode]:
     context = body.task_context
     reasons: set[EvidenceShapeReasonCode] = set()
     if context.evidence_input_kinds:
         reasons.add("source_context_present")
-    if context.external_verification_required:
+    if context.external_verification_required or verification_dependent:
         reasons.add("external_verification_required")
     if context.freshness_sensitive:
         reasons.add("freshness_sensitive")
@@ -268,9 +311,14 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         body.task_text,
         specialized=specialized,
     )
-    distinct_evidence_request = explicit_evidence
+    verification_dependent = _verification_dependent_request(body.task_text)
+    distinct_evidence_request = explicit_evidence or verification_dependent
     context = body.task_context
-    reasons = _materiality_reasons(body, explicit_evidence=explicit_evidence)
+    reasons = _materiality_reasons(
+        body,
+        explicit_evidence=explicit_evidence,
+        verification_dependent=verification_dependent,
+    )
     context_material = bool(
         context.evidence_input_kinds
         or context.external_verification_required
@@ -278,7 +326,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         or context.high_stakes_accuracy_required
         or context.continuation_of_prior_evidence_task
     )
-    evidence_material = context_material or explicit_evidence
+    evidence_material = context_material or distinct_evidence_request
     non_evidence_interaction = body.interaction_kind in {
         "joke_or_playful",
         "vent_or_expression",
@@ -320,7 +368,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
     elif context.continuation_of_prior_evidence_task:
         selected = context.prior_task_shape
         reasons.add("prior_shape_inherited")
-    elif body.interaction_kind == "ambiguous" and not explicit_evidence:
+    elif body.interaction_kind == "ambiguous" and not distinct_evidence_request:
         reasons.add("ambiguous_interaction_without_shape_signal")
         return _build_result(
             body,
@@ -329,7 +377,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
             candidates=[],
             reasons=reasons,
         )
-    elif body.interaction_kind == "brainstorm" and not explicit_evidence:
+    elif body.interaction_kind == "brainstorm" and not distinct_evidence_request:
         reasons.add("ambiguous_interaction_without_shape_signal")
         return _build_result(
             body,

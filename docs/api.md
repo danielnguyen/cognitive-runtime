@@ -181,6 +181,14 @@ product-specific intent catalog, call a model provider, inspect source
 inventories, compile an evidence plan, retrieve evidence, persist a plan or
 acquisition manifest, or generate or enforce the final answer.
 
+The derivation may identify a bounded targeted lookup from task semantics when
+the requested conclusion depends on external verification of a specific
+compatibility relationship, exact current implementation or deployment state,
+or whether material review or validation was performed. This admission does not
+make evidence planning universal. Ordinary casual, creative, explanatory,
+writing, brainstorming, and playful requests remain outside the path unless
+they contain a distinct material verification request.
+
 Evidence planning accepts an already-resolved broad task shape, a bounded
 declared scope, and a normalized governed source inventory. It declares bounded
 evidence requirements, derives completeness and contradiction expectations, and
@@ -239,6 +247,16 @@ session is not selected again. A qualified partial answer requires delivered
 context plus substantive satisfied or partial evidence; administrative
 conditions alone are insufficient. Remaining scope gaps select bounded
 unexamined-scope disclosure, while other unsupported conclusions are withheld.
+After clarification and changed-premise acquisition opportunities are exhausted
+or unavailable, an insufficient or unknown low-risk targeted lookup may withhold
+the requested conclusion while permitting the provider to offer bounded,
+non-authoritative guidance. Provider permission is not conclusion permission:
+the factual conclusion remains unsupported and may not be presented as
+verified. Missing or mismatched associated shape evidence remains conservative,
+as do high-impact, high-stakes, exhaustive, absence-sensitive,
+contradiction-sensitive, historical-completeness, decision-support, and
+clarification-dependent branches. Cognitive Runtime returns only the policy
+disposition and a bounded summary; it does not generate advisory prose.
 
 Selections are deterministic and idempotent. Their retained runtime events
 contain association identifiers, premise digests, bounded dispositions, counts,

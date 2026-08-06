@@ -1306,13 +1306,105 @@ class EvidenceNextStepResult(BaseModel):
     user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
 
     @model_validator(mode="after")
-    def validate_deterministic_result_lists(self) -> EvidenceNextStepResult:
+    def validate_deterministic_result(self) -> EvidenceNextStepResult:
         if self.unresolved_material_requirement_ids != sorted(
             set(self.unresolved_material_requirement_ids)
         ):
             raise ValueError("unordered_unresolved_material_requirements")
         if len(set(self.reason_codes)) != len(self.reason_codes):
             raise ValueError("duplicate_next_step_reason_code")
+
+        if self.sufficiency_status == "sufficient_for_declared_scope":
+            if (
+                self.selected_next_step != "answer_within_declared_scope"
+                or self.conclusion_disposition != "bounded_conclusion_allowed"
+                or self.provider_disposition != "allowed"
+                or self.unresolved_material_requirement_ids
+            ):
+                raise ValueError("incoherent_sufficient_next_step")
+        elif self.sufficiency_status == "sufficient_with_limitations":
+            if (
+                self.selected_next_step != "provide_qualified_partial_answer"
+                or self.conclusion_disposition != "qualified_partial_only"
+                or self.provider_disposition != "allowed"
+                or self.unresolved_material_requirement_ids
+            ):
+                raise ValueError("incoherent_limited_next_step")
+        elif self.conclusion_disposition == "bounded_conclusion_allowed":
+            raise ValueError("unsupported_bounded_conclusion")
+
+        if self.selected_next_step == "provide_qualified_partial_answer":
+            if (
+                self.conclusion_disposition != "qualified_partial_only"
+                or self.provider_disposition != "allowed"
+            ):
+                raise ValueError("incoherent_qualified_partial_next_step")
+            required_reason = (
+                "optional_limitations_remain"
+                if self.sufficiency_status == "sufficient_with_limitations"
+                else "substantive_partial_evidence_available"
+            )
+            if required_reason not in self.reason_codes:
+                raise ValueError("qualified_partial_reason_required")
+        elif self.selected_next_step == "withhold_unsupported_conclusion":
+            if self.conclusion_disposition != "requested_conclusion_withheld":
+                raise ValueError("incoherent_withheld_conclusion")
+            if "unsupported_conclusion_withheld" not in self.reason_codes:
+                raise ValueError("withheld_conclusion_reason_required")
+            if self.provider_disposition == "allowed" and (
+                self.task_shape != "targeted_lookup"
+                or self.sufficiency_status not in {"insufficient", "unknown"}
+            ):
+                raise ValueError("incoherent_advisory_provider_permission")
+        elif self.selected_next_step != "answer_within_declared_scope" and (
+            self.conclusion_disposition != "requested_conclusion_withheld"
+            or self.provider_disposition != "blocked"
+        ):
+            raise ValueError("incoherent_blocked_next_step")
+
+        required_step_reason = {
+            "answer_within_declared_scope": "declared_scope_sufficient",
+            "perform_additional_acquisition": (
+                "changed_acquisition_premise_available"
+            ),
+            "ask_narrow_clarification": (
+                "material_uncertainty_requires_clarification"
+            ),
+            "disclose_unexamined_scope": "unexamined_material_scope",
+        }.get(self.selected_next_step)
+        if (
+            required_step_reason is not None
+            and required_step_reason not in self.reason_codes
+        ):
+            raise ValueError("selected_next_step_reason_required")
+
+        if self.selected_next_step == "ask_narrow_clarification":
+            if self.clarification_target is None:
+                raise ValueError("clarification_target_required")
+        elif self.clarification_target is not None:
+            raise ValueError("clarification_target_not_allowed")
+
+        if self.reacquisition_guard == "not_applicable":
+            if self.proposed_premise_digest is not None:
+                raise ValueError("proposed_premise_not_allowed")
+        elif self.proposed_premise_digest is None:
+            raise ValueError("proposed_premise_required")
+        elif self.reacquisition_guard == "changed_premise_allowed":
+            if (
+                self.selected_next_step != "perform_additional_acquisition"
+                or self.proposed_premise_digest == self.current_premise_digest
+            ):
+                raise ValueError("incoherent_changed_premise")
+        elif self.reacquisition_guard == "unchanged_premise_blocked" and (
+            self.proposed_premise_digest != self.current_premise_digest
+        ):
+            raise ValueError("incoherent_unchanged_premise")
+
+        if (
+            self.selected_next_step == "perform_additional_acquisition"
+            and self.reacquisition_guard != "changed_premise_allowed"
+        ):
+            raise ValueError("changed_premise_guard_required")
         return self
 
 

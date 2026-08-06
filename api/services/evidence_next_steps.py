@@ -45,6 +45,36 @@ _TASK_SHAPES = {
     "historical_reconstruction",
     "recommendation_or_decision_support",
 }
+_INTERACTION_KINDS = {
+    "command",
+    "question",
+    "brainstorm",
+    "joke_or_playful",
+    "vent_or_expression",
+    "mistake_or_failure_report",
+    "tense_debugging",
+    "high_impact_decision",
+    "ambiguous",
+}
+_SHAPE_REASON_CODES = {
+    "source_context_present",
+    "external_verification_required",
+    "freshness_sensitive",
+    "high_stakes_accuracy_required",
+    "explicit_evidence_language",
+    "targeted_lookup_derived",
+    "exhaustive_scope_requested",
+    "comparison_requested",
+    "contradiction_requested",
+    "absence_scope_requested",
+    "historical_reconstruction_requested",
+    "decision_support_requested",
+    "prior_shape_inherited",
+    "ordinary_chat_without_material_evidence_scope",
+    "non_evidence_interaction",
+    "ambiguous_interaction_without_shape_signal",
+    "multiple_incompatible_shapes",
+}
 _ANSWER_CONSTRAINTS = {
     "qualify_conclusion",
     "disclose_limitations",
@@ -205,16 +235,86 @@ def _associated_plan_event(
         and event.event_payload_json.get("runtime_turn_id") == body.runtime_turn_id
         and event.event_payload_json.get("task_shape") == task_shape
     ]
-    if not matches:
+    if len(matches) != 1:
         raise RuntimeError("current_acquisition_premise_mismatch")
     payload = matches[0].event_payload_json
     premise_digest = payload.get("acquisition_premise_digest")
+    question_anchor_digest = payload.get("question_anchor_digest")
     if (
         not isinstance(premise_digest, str)
         or re.fullmatch(r"sha256:[0-9a-f]{64}", premise_digest) is None
+        or not isinstance(question_anchor_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", question_anchor_digest) is None
     ):
         raise RuntimeError("current_acquisition_premise_mismatch")
     return payload
+
+
+def _associated_shape_allows_advisory(
+    events: list[RuntimeEvent],
+    body: EvidenceNextStepSelectRequest,
+    *,
+    plan_event: dict[str, Any],
+    task_shape: EvidenceTaskShape,
+) -> bool:
+    if task_shape != "targeted_lookup":
+        return False
+
+    plan_positions = [
+        index
+        for index, event in enumerate(events)
+        if event.event_type == "evidence_plan_compiled"
+        and event.runtime_session_id == body.runtime_session_id
+        and event.runtime_turn_id == body.runtime_turn_id
+        and event.event_payload_json.get("runtime_session_id")
+        == body.runtime_session_id
+        and event.event_payload_json.get("runtime_turn_id") == body.runtime_turn_id
+        and event.event_payload_json.get("plan_id") == body.evidence_plan_id
+    ]
+    if len(plan_positions) != 1:
+        return False
+
+    question_anchor_digest = plan_event["question_anchor_digest"]
+    associated_shapes = [
+        event
+        for index, event in enumerate(events)
+        if index < plan_positions[0]
+        and event.event_type == "evidence_shape_derived"
+        and event.runtime_session_id == body.runtime_session_id
+        and event.runtime_turn_id == body.runtime_turn_id
+        and event.event_payload_json.get("runtime_session_id")
+        == body.runtime_session_id
+        and event.event_payload_json.get("runtime_turn_id") == body.runtime_turn_id
+        and event.event_payload_json.get("question_anchor_digest")
+        == question_anchor_digest
+    ]
+    if len(associated_shapes) != 1:
+        return False
+
+    payload = associated_shapes[0].event_payload_json
+    derivation_id = payload.get("derivation_id")
+    interaction_kind = payload.get("interaction_kind")
+    reason_codes = payload.get("reason_codes")
+    if (
+        not isinstance(derivation_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", derivation_id)
+        is None
+        or interaction_kind not in _INTERACTION_KINDS
+        or payload.get("derivation_status") != "derived"
+        or payload.get("task_shape") != "targeted_lookup"
+        or payload.get("candidate_task_shapes") != ["targeted_lookup"]
+        or payload.get("evidence_scope_material") is not True
+        or payload.get("clarification_required") is not False
+        or not isinstance(reason_codes, list)
+        or reason_codes != sorted(set(reason_codes))
+        or any(reason not in _SHAPE_REASON_CODES for reason in reason_codes)
+        or "targeted_lookup_derived" not in reason_codes
+    ):
+        return False
+    return (
+        interaction_kind != "high_impact_decision"
+        and "high_stakes_accuracy_required" not in reason_codes
+    )
 
 
 def _unresolved_material_requirements(
@@ -297,6 +397,7 @@ def _fallback_selection(
     evaluations: list[EvidenceRequirementEvaluation],
     *,
     guard_reason: EvidenceNextStepReasonCode | None = None,
+    advisory_allowed: bool = False,
 ) -> tuple[
     EvidenceNextStep,
     EvidenceConclusionDisposition,
@@ -329,9 +430,15 @@ def _fallback_selection(
     return (
         "withhold_unsupported_conclusion",
         "requested_conclusion_withheld",
-        "blocked",
+        "allowed" if advisory_allowed else "blocked",
         _ordered_reason_codes(reasons),
-        "The requested conclusion remains withheld because material evidence is unsupported.",
+        (
+            "The requested conclusion remains unsupported; non-authoritative "
+            "guidance is permitted without presenting it as verified."
+            if advisory_allowed
+            else "The requested conclusion remains withheld because material "
+            "evidence is unsupported."
+        ),
     )
 
 
@@ -343,6 +450,7 @@ def _selection(
     current_premise_digest: str,
     proposed_premise_digest: str | None,
     proposed_premise_was_selected: bool,
+    advisory_allowed: bool,
 ) -> tuple[
     EvidenceNextStep,
     EvidenceConclusionDisposition,
@@ -383,12 +491,14 @@ def _selection(
             fallback = _fallback_selection(
                 evaluations,
                 guard_reason="unchanged_acquisition_premise",
+                advisory_allowed=advisory_allowed,
             )
             return (*fallback[:3], "unchanged_premise_blocked", *fallback[3:])
         if proposed_premise_was_selected:
             fallback = _fallback_selection(
                 evaluations,
                 guard_reason="acquisition_premise_already_selected",
+                advisory_allowed=advisory_allowed,
             )
             return (*fallback[:3], "premise_already_attempted", *fallback[3:])
         return (
@@ -399,7 +509,10 @@ def _selection(
             ["changed_acquisition_premise_available"],
             "Additional acquisition is permitted only under the changed evidence premise.",
         )
-    fallback = _fallback_selection(evaluations)
+    fallback = _fallback_selection(
+        evaluations,
+        advisory_allowed=advisory_allowed,
+    )
     return (*fallback[:3], "not_applicable", *fallback[3:])
 
 
@@ -443,6 +556,10 @@ def select_evidence_next_step(
     current_premise_digest = _premise_digest(body.current_premise)
     if current_premise_digest != plan_event["acquisition_premise_digest"]:
         raise RuntimeError("current_acquisition_premise_mismatch")
+    if body.current_premise.question_anchor_digest != plan_event[
+        "question_anchor_digest"
+    ]:
+        raise RuntimeError("current_acquisition_premise_mismatch")
     supplied_proposed_premise_digest = (
         _premise_digest(body.proposed_acquisition_premise)
         if body.proposed_acquisition_premise is not None
@@ -471,6 +588,12 @@ def select_evidence_next_step(
             selection_id=selection_id,
         )
     )
+    advisory_allowed = _associated_shape_allows_advisory(
+        events,
+        body,
+        plan_event=plan_event,
+        task_shape=task_shape,
+    )
     (
         selected_next_step,
         conclusion_disposition,
@@ -485,6 +608,7 @@ def select_evidence_next_step(
         current_premise_digest=current_premise_digest,
         proposed_premise_digest=proposed_premise_digest,
         proposed_premise_was_selected=proposed_was_selected,
+        advisory_allowed=advisory_allowed,
     )
     selected_clarification_target = (
         clarification_target
