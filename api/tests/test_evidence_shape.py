@@ -264,10 +264,13 @@ def test_genuine_bounded_evidence_queries_derive_targeted_lookup(task_text: str)
 @pytest.mark.parametrize(
     "task_text",
     [
+        "Will this part fit?",
         "Will this 2001 control module work in the 2004 model?",
         "Are these two parts interchangeable?",
         "Does this package version support Python 3.14?",
         "Can this adapter be used with that device?",
+        "Is this component compatible with that model?",
+        "Will these two modules work together?",
         "Is this capability implemented in the current code?",
         "Is the new validation path wired end to end?",
         "Has this change been deployed?",
@@ -298,6 +301,16 @@ def test_verification_dependent_questions_derive_targeted_lookup_without_opt_in(
 @pytest.mark.parametrize(
     "task_text",
     [
+        "Does this sentence work in the paragraph?",
+        "Does this name fit in the theme?",
+        "Can this joke work in the presentation?",
+        "Would this color work with the layout?",
+        "Does this explanation work in context?",
+        "Is this argument compatible with the premise?",
+        "Does this workflow support collaboration?",
+        "Can this schedule work with my availability?",
+        "Does this plan work in theory?",
+        "Will this wording fit in the introduction?",
         "Explain how a climate control module works.",
         "What does implementation mean?",
         "Write a compatibility checklist.",

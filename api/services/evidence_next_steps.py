@@ -276,7 +276,7 @@ def _associated_shape_allows_advisory(
 
     question_anchor_digest = plan_event["question_anchor_digest"]
     associated_shapes = [
-        event
+        (index, event)
         for index, event in enumerate(events)
         if index < plan_positions[0]
         and event.event_type == "evidence_shape_derived"
@@ -291,7 +291,8 @@ def _associated_shape_allows_advisory(
     if len(associated_shapes) != 1:
         return False
 
-    payload = associated_shapes[0].event_payload_json
+    shape_position, shape_event = associated_shapes[0]
+    payload = shape_event.event_payload_json
     derivation_id = payload.get("derivation_id")
     interaction_kind = payload.get("interaction_kind")
     reason_codes = payload.get("reason_codes")
@@ -311,8 +312,29 @@ def _associated_shape_allows_advisory(
         or "targeted_lookup_derived" not in reason_codes
     ):
         return False
+
+    associated_governance = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.event_type == "interaction_governance_evaluated"
+        and event.runtime_session_id == body.runtime_session_id
+        and event.runtime_turn_id == body.runtime_turn_id
+    ]
+    if len(associated_governance) != 1:
+        return False
+
+    governance_position, governance_event = associated_governance[0]
+    governance_interaction_kind = governance_event.event_payload_json.get(
+        "interaction_kind"
+    )
+    if (
+        governance_position >= shape_position
+        or governance_interaction_kind not in _INTERACTION_KINDS
+        or governance_interaction_kind != interaction_kind
+    ):
+        return False
     return (
-        interaction_kind != "high_impact_decision"
+        governance_interaction_kind != "high_impact_decision"
         and "high_stakes_accuracy_required" not in reason_codes
     )
 

@@ -27,8 +27,10 @@ def _start_runtime(
     question_anchor: str = _DEFAULT_QUESTION,
     premise: dict[str, object] | None = None,
     derive_shape: bool = False,
-    interaction_kind: str = "question",
+    interaction_kind: str | None = None,
     shape_context: dict[str, object] | None = None,
+    include_governance: bool = True,
+    governance_text: str | None = None,
 ) -> dict[str, object]:
     ordinal = next(_runtime_counter)
     planned_premise = copy.deepcopy(premise or _premise(question=question_anchor))
@@ -56,6 +58,29 @@ def _start_runtime(
         "acquisition_manifest_id": f"manifest-{ordinal}",
     }
     if derive_shape:
+        governance_result: dict[str, object] | None = None
+        if include_governance:
+            governance_response = client.post(
+                "/v1/runtime/interaction-governance/evaluate",
+                json={
+                    "request_id": f"governance-{ordinal}",
+                    "owner_id": scope["owner_id"],
+                    "conversation_id": scope["conversation_id"],
+                    "surface": scope["surface"],
+                    "runtime_session_id": scope["runtime_session_id"],
+                    "runtime_turn_id": scope["runtime_turn_id"],
+                    "current_user_text": governance_text or question_anchor,
+                    "recent_messages": [],
+                },
+            )
+            assert governance_response.status_code == 200
+            governance_result = governance_response.json()["result"]
+            scope["_governance_result"] = governance_result
+        shape_interaction_kind = interaction_kind or (
+            governance_result["interaction_kind"]
+            if governance_result is not None
+            else "question"
+        )
         shape_response = client.post(
             "/v1/runtime/evidence-shapes/derive",
             json={
@@ -66,7 +91,7 @@ def _start_runtime(
                 "runtime_session_id": scope["runtime_session_id"],
                 "runtime_turn_id": scope["runtime_turn_id"],
                 "task_text": question_anchor,
-                "interaction_kind": interaction_kind,
+                "interaction_kind": shape_interaction_kind,
                 "task_context": shape_context or _shape_context(),
             },
         )
@@ -298,6 +323,27 @@ def _select(payload: dict[str, object]):
     return client.post("/v1/runtime/evidence-next-steps/select", json=payload)
 
 
+def _govern(
+    scope: dict[str, object],
+    *,
+    current_user_text: str,
+    request_suffix: str,
+):
+    return client.post(
+        "/v1/runtime/interaction-governance/evaluate",
+        json={
+            "request_id": f"governance-{request_suffix}-{scope['request_id']}",
+            "owner_id": scope["owner_id"],
+            "conversation_id": scope["conversation_id"],
+            "surface": scope["surface"],
+            "runtime_session_id": scope["runtime_session_id"],
+            "runtime_turn_id": scope["runtime_turn_id"],
+            "current_user_text": current_user_text,
+            "recent_messages": [],
+        },
+    )
+
+
 def _selection_events(runtime_session_id: object) -> list[dict[str, object]]:
     response = client.get(f"/v1/runtime/sessions/{runtime_session_id}")
     assert response.status_code == 200
@@ -305,6 +351,16 @@ def _selection_events(runtime_session_id: object) -> list[dict[str, object]]:
         event
         for event in response.json()["events"]
         if event["event_type"] == "evidence_next_step_selected"
+    ]
+
+
+def _governance_events(runtime_session_id: object) -> list[dict[str, object]]:
+    response = client.get(f"/v1/runtime/sessions/{runtime_session_id}")
+    assert response.status_code == 200
+    return [
+        event
+        for event in response.json()["events"]
+        if event["event_type"] == "interaction_governance_evaluated"
     ]
 
 
@@ -352,6 +408,8 @@ def test_sufficient_statuses_select_answer_without_more_acquisition(
 ):
     question = "Does this package version support Python 3.14?"
     scope = _start_runtime(question_anchor=question, derive_shape=True)
+    assert scope["_governance_result"]["interaction_kind"] == "question"
+    assert scope["_shape_result"]["task_shape"] == "targeted_lookup"
     evaluation = _evaluate(
         scope,
         [
@@ -473,6 +531,8 @@ def test_associated_low_risk_targeted_gap_withholds_conclusion_and_allows_guidan
 ):
     question = "Does this package version support Python 3.14?"
     scope = _start_runtime(question_anchor=question, derive_shape=True)
+    assert scope["_governance_result"]["interaction_kind"] == "question"
+    assert scope["_shape_result"]["task_shape"] == "targeted_lookup"
     evaluation = _evaluate(
         scope,
         [_requirement("targeted", "targeted_evidence")],
@@ -503,23 +563,24 @@ def test_associated_low_risk_targeted_gap_withholds_conclusion_and_allows_guidan
     serialized = json.dumps(event, sort_keys=True).lower()
     assert question.lower() not in serialized
     assert "non-authoritative guidance" not in serialized
+    governance_events = _governance_events(scope["runtime_session_id"])
+    assert len(governance_events) == 1
+    assert governance_events[0]["event_payload_json"]["interaction_kind"] == (
+        "question"
+    )
+    assert question.lower() not in json.dumps(
+        governance_events[0]["event_payload_json"],
+        sort_keys=True,
+    ).lower()
 
 
-@pytest.mark.parametrize(
-    ("interaction_kind", "high_stakes"),
-    [("high_impact_decision", False), ("question", True)],
-)
-def test_associated_high_risk_targeted_gap_keeps_provider_blocked(
-    interaction_kind: str,
-    high_stakes: bool,
-):
+def test_associated_high_stakes_targeted_gap_keeps_provider_blocked():
     question = "Can this adapter be used with that device?"
     scope = _start_runtime(
         question_anchor=question,
         derive_shape=True,
-        interaction_kind=interaction_kind,
         shape_context=_shape_context(
-            high_stakes_accuracy_required=high_stakes,
+            high_stakes_accuracy_required=True,
         ),
     )
     evaluation = _evaluate(
@@ -535,8 +596,99 @@ def test_associated_high_risk_targeted_gap_keeps_provider_blocked(
     assert result["provider_disposition"] == "blocked"
 
 
+def test_matching_high_impact_governance_keeps_provider_blocked():
+    question = "Does this payroll module support version 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
+
+    assert scope["_governance_result"]["interaction_kind"] == (
+        "high_impact_decision"
+    )
+    assert scope["_shape_result"]["task_shape"] == "targeted_lookup"
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+
+    result = _select(_next_step_payload(scope, evaluation)).json()["result"]
+
+    assert result["selected_next_step"] == "withhold_unsupported_conclusion"
+    assert result["conclusion_disposition"] == "requested_conclusion_withheld"
+    assert result["provider_disposition"] == "blocked"
+
+
+def test_caller_cannot_downgrade_high_impact_governance_for_advisory_authority():
+    question = "Does this payroll module support version 3.14?"
+    scope = _start_runtime(
+        question_anchor=question,
+        derive_shape=True,
+        interaction_kind="question",
+    )
+
+    assert scope["_governance_result"]["interaction_kind"] == (
+        "high_impact_decision"
+    )
+    assert scope["_shape_result"]["task_shape"] == "targeted_lookup"
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+
+    result = _select(_next_step_payload(scope, evaluation)).json()["result"]
+
+    assert result["selected_next_step"] == "withhold_unsupported_conclusion"
+    assert result["conclusion_disposition"] == "requested_conclusion_withheld"
+    assert result["provider_disposition"] == "blocked"
+
+
 def test_absent_associated_shape_event_keeps_provider_blocked():
     scope = _start_runtime()
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+
+    result = _select(_next_step_payload(scope, evaluation)).json()["result"]
+
+    assert result["selected_next_step"] == "withhold_unsupported_conclusion"
+    assert result["provider_disposition"] == "blocked"
+
+
+def test_absent_associated_governance_event_keeps_provider_blocked():
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(
+        question_anchor=question,
+        derive_shape=True,
+        include_governance=False,
+    )
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+
+    result = _select(_next_step_payload(scope, evaluation)).json()["result"]
+
+    assert result["selected_next_step"] == "withhold_unsupported_conclusion"
+    assert result["provider_disposition"] == "blocked"
+
+
+def test_governance_event_after_shape_and_plan_keeps_provider_blocked():
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(
+        question_anchor=question,
+        derive_shape=True,
+        include_governance=False,
+    )
+    late_governance = _govern(
+        scope,
+        current_user_text=question,
+        request_suffix="late",
+    )
+    assert late_governance.status_code == 200
+    assert late_governance.json()["result"]["interaction_kind"] == "question"
     evaluation = _evaluate(
         scope,
         [_requirement("targeted", "targeted_evidence")],
@@ -594,6 +746,45 @@ def test_mismatched_or_malformed_shape_association_keeps_provider_blocked(
                 duplicate = event.model_copy(deep=True)
                 duplicate.event_id = f"{event.event_id}-duplicate"
                 diagnostics.events.insert(index + 1, duplicate)
+            break
+        return diagnostics
+
+    monkeypatch.setattr(
+        evidence_next_steps,
+        "get_runtime_session",
+        _altered_diagnostics,
+    )
+    response = _select(_next_step_payload(scope, evaluation))
+
+    assert response.status_code == 200
+    assert response.json()["result"]["provider_disposition"] == "blocked"
+
+
+@pytest.mark.parametrize("event_mutation", ["duplicate", "malformed"])
+def test_duplicate_or_malformed_governance_event_keeps_provider_blocked(
+    event_mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    question = "Does this package version support Python 3.14?"
+    scope = _start_runtime(question_anchor=question, derive_shape=True)
+    evaluation = _evaluate(
+        scope,
+        [_requirement("targeted", "targeted_evidence")],
+        [_fact("targeted", "failed")],
+    )
+    original_get_runtime_session = evidence_next_steps.get_runtime_session
+
+    def _altered_diagnostics(runtime_session_id: str):
+        diagnostics = original_get_runtime_session(runtime_session_id)
+        for index, event in enumerate(diagnostics.events):
+            if event.event_type != "interaction_governance_evaluated":
+                continue
+            if event_mutation == "duplicate":
+                duplicate = event.model_copy(deep=True)
+                duplicate.event_id = f"{event.event_id}-duplicate"
+                diagnostics.events.insert(index + 1, duplicate)
+            else:
+                event.event_payload_json["interaction_kind"] = "not-a-kind"
             break
         return diagnostics
 

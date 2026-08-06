@@ -99,8 +99,31 @@ _NON_VERIFICATION_FRAMING = re.compile(
 )
 _COMPATIBILITY_RELATIONSHIP_QUESTION = re.compile(
     r"\b(?:will|would|can|could|does|do|is|are)\b.{0,180}\b(?:"
-    r"compatible\s+with|interchangeable(?:\s+with)?|work\s+(?:with|in|on)|"
-    r"fit\s+(?:with|in|on|into)|supports?\b|be\s+used\s+with)\b",
+    r"compatible\s+with|interchangeable(?:\s+with)?|"
+    r"work\s+(?:with|in|on|together)|fit(?:\s+(?:with|in|on|into))?|"
+    r"supports?\b|be\s+used\s+with)\b",
+    re.IGNORECASE,
+)
+_COMPATIBILITY_ARTIFACT = re.compile(
+    r"\b(?:parts?|components?|modules?|models?|packages?|versions?|adapters?|"
+    r"devices?|runtimes?|platforms?)\b",
+    re.IGNORECASE,
+)
+_DIRECT_FIT_ENDING = re.compile(
+    r"\bfit\b\s*[?.!]*$",
+    re.IGNORECASE,
+)
+_PAIRED_COMPATIBILITY = re.compile(
+    r"\b(?:two|both|these|those)\b.{0,100}\b(?:"
+    r"interchangeable|work\s+together)\b",
+    re.IGNORECASE,
+)
+_SUPPORT_RELATIONSHIP = re.compile(
+    r"\bsupports?\b",
+    re.IGNORECASE,
+)
+_VERSIONED_TARGET = re.compile(
+    r"\b(?:[A-Za-z][A-Za-z0-9.+-]*\s+)?\d+(?:\.\d+)+\b",
     re.IGNORECASE,
 )
 _CURRENT_STATE_QUESTION = re.compile(
@@ -188,13 +211,38 @@ def _specialized_shapes(text: str) -> set[EvidenceTaskShape]:
 def _verification_dependent_request(text: str) -> bool:
     if _NON_VERIFICATION_FRAMING.search(text):
         return False
-    return any(
-        pattern.search(text)
-        for pattern in (
-            _COMPATIBILITY_RELATIONSHIP_QUESTION,
-            _CURRENT_STATE_QUESTION,
-            _PERFORMED_VALIDATION_QUESTION,
+    compatibility_question = _COMPATIBILITY_RELATIONSHIP_QUESTION.search(text)
+    compatibility_artifacts = list(_COMPATIBILITY_ARTIFACT.finditer(text))
+    concrete_compatibility = False
+    if compatibility_question is not None and compatibility_artifacts:
+        direct_fit = _DIRECT_FIT_ENDING.search(text)
+        support_relationship = _SUPPORT_RELATIONSHIP.search(text)
+        concrete_compatibility = (
+            len(compatibility_artifacts) >= 2
+            or (
+                direct_fit is not None
+                and any(
+                    artifact.start() < direct_fit.start()
+                    for artifact in compatibility_artifacts
+                )
+            )
+            or bool(_PAIRED_COMPATIBILITY.search(text))
+            or (
+                support_relationship is not None
+                and any(
+                    artifact.start() < support_relationship.start()
+                    for artifact in compatibility_artifacts
+                )
+                and _VERSIONED_TARGET.search(
+                    text,
+                    pos=support_relationship.end(),
+                )
+                is not None
+            )
         )
+    return concrete_compatibility or any(
+        pattern.search(text)
+        for pattern in (_CURRENT_STATE_QUESTION, _PERFORMED_VALIDATION_QUESTION)
     )
 
 
