@@ -61,6 +61,12 @@ from models import (
     RepairSimulateResponse,
     RestraintEvaluateRequest,
     RestraintEvaluateResponse,
+    RetirementReservationCancelRequest,
+    RetirementReservationCancelResponse,
+    RetirementReservationFinalizeRequest,
+    RetirementReservationFinalizeResponse,
+    RetirementReservationRequest,
+    RetirementReservationResponse,
     RuntimeIdentityResolveRequest,
     RuntimeIdentityResolveResponse,
     RuntimeOverlayResponse,
@@ -146,9 +152,12 @@ from services.restraint import evaluate_restraint
 from services.runtime_identity import resolve_runtime_identity
 from services.runtime_state import (
     build_overlay,
+    cancel_runtime_retirement,
     complete_turn,
+    finalize_runtime_retirement,
     get_runtime_session,
     record_runtime_event,
+    reserve_runtime_retirement,
     reset_state,
     resolve_runtime_session,
     resolve_runtime_thread,
@@ -274,7 +283,12 @@ _EVIDENCE_SHAPE_ERROR_STATUS = {
 }
 
 _RUNTIME_STATE_ERROR_STATUS = {
+    "runtime_retirement_reservation_conflict": 409,
+    "runtime_retirement_reservation_invariant_conflict": 409,
+    "runtime_retirement_reservation_not_found": 404,
+    "runtime_retirement_reservation_revision_conflict": 409,
     "runtime_thread_contended": 409,
+    "runtime_thread_retirement_reserved": 409,
     "runtime_thread_revision_conflict": 409,
     "runtime_thread_unavailable": 503,
     "runtime_turn_not_current": 409,
@@ -364,6 +378,46 @@ async def select_runtime_continuation_endpoint(
 ) -> ContinuationSelectionResponse:
     try:
         return select_runtime_continuation(body)
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
+
+
+@app.post(
+    "/v1/runtime/retirements/reserve",
+    response_model=RetirementReservationResponse,
+    response_model_exclude_none=True,
+)
+async def reserve_runtime_retirement_endpoint(
+    body: RetirementReservationRequest,
+) -> RetirementReservationResponse:
+    try:
+        return reserve_runtime_retirement(body)
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
+
+
+@app.post(
+    "/v1/runtime/retirements/cancel",
+    response_model=RetirementReservationCancelResponse,
+)
+async def cancel_runtime_retirement_endpoint(
+    body: RetirementReservationCancelRequest,
+) -> RetirementReservationCancelResponse:
+    try:
+        return cancel_runtime_retirement(body)
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
+
+
+@app.post(
+    "/v1/runtime/retirements/finalize",
+    response_model=RetirementReservationFinalizeResponse,
+)
+async def finalize_runtime_retirement_endpoint(
+    body: RetirementReservationFinalizeRequest,
+) -> RetirementReservationFinalizeResponse:
+    try:
+        return finalize_runtime_retirement(body)
     except Exception as exc:
         raise _runtime_state_http_error(exc) from None
 

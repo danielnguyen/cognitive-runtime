@@ -358,6 +358,179 @@ class ContinuationSelectionResponse(BaseModel):
     result: ContinuationSelectionResult
 
 
+RetirementReservationOutcome = Literal["reserved", "wait", "decline"]
+RetirementReservationReason = Literal[
+    "safe_idle_retirement_reserved",
+    "existing_retirement_reservation",
+    "candidate_not_open",
+    "durable_activity_not_over_horizon",
+    "runtime_activity_not_over_horizon",
+    "runtime_state_missing",
+    "runtime_state_inconsistent",
+    "runtime_thread_active",
+    "runtime_thread_contended",
+    "runtime_thread_unavailable",
+]
+
+
+def _parse_retirement_datetime(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("retirement_timestamp_invalid") from exc
+    raise ValueError("retirement_timestamp_invalid")
+
+
+def _require_retirement_timezone(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("retirement_timestamp_timezone_required")
+    return value
+
+
+class RetirementReservationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    lifecycle_state: ContinuationCandidateLifecycle
+    durable_updated_at: datetime
+    retirement_before: datetime
+
+    @field_validator("durable_updated_at", "retirement_before", mode="before")
+    @classmethod
+    def validate_datetime_input(cls, value: Any) -> Any:
+        return _parse_retirement_datetime(value)
+
+    @field_validator("durable_updated_at", "retirement_before")
+    @classmethod
+    def validate_timezone(cls, value: datetime) -> datetime:
+        return _require_retirement_timezone(value)
+
+
+class RetirementReservationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    outcome: RetirementReservationOutcome
+    reservation_id: str | None = Field(default=None, min_length=1, max_length=120)
+    reserved_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+    reserved_durable_updated_at: datetime | None = None
+    reason_codes: list[RetirementReservationReason] = Field(min_length=1, max_length=1)
+    policy_version: Literal["conversation-retirement-safety.v1"] = (
+        "conversation-retirement-safety.v1"
+    )
+
+    @field_validator("reserved_durable_updated_at", mode="before")
+    @classmethod
+    def validate_datetime_input(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        return _parse_retirement_datetime(value)
+
+    @field_validator("reserved_durable_updated_at")
+    @classmethod
+    def validate_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return value
+        return _require_retirement_timezone(value)
+
+    @model_validator(mode="after")
+    def validate_coherence(self) -> "RetirementReservationResult":
+        reserved_reasons = {
+            "safe_idle_retirement_reserved",
+            "existing_retirement_reservation",
+        }
+        reason = self.reason_codes[0]
+        if self.outcome == "reserved":
+            if (
+                self.reservation_id is None
+                or self.reserved_thread_revision is None
+                or self.reserved_durable_updated_at is None
+                or reason not in reserved_reasons
+            ):
+                raise ValueError("retirement_reservation_result_inconsistent")
+        elif (
+            self.reservation_id is not None
+            or self.reserved_thread_revision is not None
+            or self.reserved_durable_updated_at is not None
+            or reason in reserved_reasons
+        ):
+            raise ValueError("retirement_nonreserved_result_inconsistent")
+        if self.outcome == "wait" and reason != "runtime_thread_active":
+            raise ValueError("retirement_wait_result_inconsistent")
+        if self.outcome == "decline" and reason == "runtime_thread_active":
+            raise ValueError("retirement_decline_result_inconsistent")
+        return self
+
+
+class RetirementReservationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["runtime-retirement-reservation.v1"] = (
+        "runtime-retirement-reservation.v1"
+    )
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    result: RetirementReservationResult
+
+
+class _RetirementReservationMutationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    reservation_id: str = Field(min_length=1, max_length=120)
+    reserved_thread_revision: int = Field(ge=0, strict=True)
+
+
+class RetirementReservationCancelRequest(_RetirementReservationMutationRequest):
+    pass
+
+
+class RetirementReservationFinalizeRequest(_RetirementReservationMutationRequest):
+    pass
+
+
+class RetirementReservationCancelResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["runtime-retirement-cancellation.v1"] = (
+        "runtime-retirement-cancellation.v1"
+    )
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    reservation_id: str = Field(min_length=1, max_length=120)
+    thread_revision: int = Field(ge=0, strict=True)
+    outcome: Literal["cancelled"] = "cancelled"
+
+
+class RetirementReservationFinalizeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["runtime-retirement-finalization.v1"] = (
+        "runtime-retirement-finalization.v1"
+    )
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    reservation_id: str = Field(min_length=1, max_length=120)
+    previous_thread_revision: int = Field(ge=0, strict=True)
+    fenced_thread_revision: int = Field(ge=1, strict=True)
+    outcome: Literal["finalized"] = "finalized"
+
+    @model_validator(mode="after")
+    def validate_revision_fence(self) -> "RetirementReservationFinalizeResponse":
+        if self.fenced_thread_revision != self.previous_thread_revision + 1:
+            raise ValueError("retirement_finalization_revision_inconsistent")
+        return self
+
+
 class RuntimeTurnUpdateRequest(BaseModel):
     request_id: str = Field(max_length=120)
     runtime_session_id: str = Field(max_length=120)

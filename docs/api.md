@@ -21,6 +21,9 @@ Session and turn operations provide a durable local runtime lifecycle:
 | --- | --- |
 | Resolve a shared conversation projection | `POST /v1/runtime/threads/resolve` |
 | Select a bounded continuation candidate | `POST /v1/runtime/continuations/select` |
+| Reserve safe retirement coordination | `POST /v1/runtime/retirements/reserve` |
+| Cancel retirement coordination | `POST /v1/runtime/retirements/cancel` |
+| Finalize retirement coordination | `POST /v1/runtime/retirements/finalize` |
 | Resolve a session | `POST /v1/runtime/sessions/resolve` |
 | Read session diagnostics | `GET /v1/runtime/sessions/{runtime_session_id}` |
 | Start a turn | `POST /v1/runtime/turns/start` |
@@ -102,6 +105,59 @@ activity timestamp. Cognitive Runtime does not call a durable store, provider,
 semantic retrieval system, model, or adapter while evaluating candidates. The
 current surface is response context only; it is not treated as a permission,
 presence, attention, or preferred-device signal.
+
+`POST /v1/runtime/retirements/reserve` accepts only `request_id`, `owner_id`,
+`conversation_id`, durable lifecycle, `durable_updated_at`, and an absolute
+`retirement_before` cutoff. Both timestamps must carry a timezone or UTC
+offset. The durable lifecycle must be `open`, `closed`, or `superseded`. A new
+reservation is possible only for an `open` candidate whose durable activity
+and existing runtime thread activity are both strictly earlier than the
+cutoff. Equality is not over the horizon. Missing, inconsistent, contended, or
+unavailable runtime state declines; an active runtime thread waits. The
+request accepts no content, client, surface, provider, model, retrieval, or
+adapter fields.
+
+A successful reserve response uses schema
+`runtime-retirement-reservation.v1` and policy
+`conversation-retirement-safety.v1`. It returns an internal reservation ID,
+the exact inspected thread revision, and the durable activity instant captured
+for later durable compare-and-set enforcement. A reservation is persistent,
+unique per owner and conversation, and has no TTL, expiry, background cleanup,
+or autonomous release. A valid existing reservation is returned without being
+replaced, even when a later request carries a different durable activity fact.
+Wait and decline results expose none of the reservation ID, captured revision,
+or captured durable activity fields.
+The durable store remains responsible for deciding whether that captured fact
+still permits a lifecycle transition.
+
+Reservation acquisition, turn admission, and session resolution serialize at
+the same SQLite writer boundary. While a reservation exists,
+`POST /v1/runtime/turns/start` and
+`POST /v1/runtime/sessions/resolve` fail with
+`runtime_thread_retirement_reserved` before creating or changing a session,
+turn, event, thread revision, or thread activity.
+
+`POST /v1/runtime/retirements/cancel` requires the exact live reservation ID
+and captured thread revision for the owner and conversation. It removes the
+coordination fence without changing thread state, revision, or activity.
+`POST /v1/runtime/retirements/finalize` also requires the exact live
+reservation and a still-consistent idle thread with no nonterminal turn. In
+one transaction it advances the thread revision exactly once, leaves
+`last_activity_at` unchanged, and removes the reservation. That revision
+advance invalidates admission decisions bound to the pre-retirement revision.
+
+After cancellation or successful finalization removes the reservation, a
+repeated cancel or finalize returns a bounded missing-reservation error and
+makes no inference from the current thread revision. There is no finalization
+receipt or permanent runtime retirement marker. An ambiguous finalize
+transport outcome remains safe: either the live reservation continues to
+block admission, or the successful revision fence rejects an admission bound
+to the earlier revision.
+
+These endpoints coordinate runtime admission only. Cognitive Runtime neither
+calls the durable store nor marks a conversation closed. The durable store
+remains lifecycle authority, and the reservation ID is not a client- or
+adapter-visible conversation identity.
 
 ## Runtime policy evaluation
 
