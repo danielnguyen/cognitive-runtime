@@ -12,6 +12,12 @@ from models import (
     ContinuationSelectionRequest,
     ContinuationSelectionResponse,
     ContinuationSelectionResult,
+    RetirementReservationCancelResponse,
+    RetirementReservationFinalizeRequest,
+    RetirementReservationFinalizeResponse,
+    RetirementReservationRequest,
+    RetirementReservationResponse,
+    RetirementReservationResult,
 )
 from pydantic import ValidationError
 from services.runtime_state import RuntimeStateRepository, clear_states_for_tests
@@ -123,6 +129,122 @@ def _select_continuation(
             "candidate_set_complete": candidate_set_complete,
             "stale_after_seconds": stale_after_seconds,
             "candidates": candidates,
+        },
+    )
+
+
+def _retirement_rows(db_path: Path) -> tuple[tuple[object, ...], ...]:
+    with sqlite3.connect(db_path) as conn:
+        return tuple(
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM conversation_runtime_retirement_reservations
+                ORDER BY id;
+                """
+            ).fetchall()
+        )
+
+
+def _set_thread_activity(
+    db_path: Path,
+    *,
+    owner_id: str,
+    conversation_id: str,
+    activity: datetime,
+) -> None:
+    with sqlite3.connect(db_path) as conn:
+        updated = conn.execute(
+            """
+            UPDATE conversation_runtime_threads
+            SET last_activity_at = ?, updated_at = ?
+            WHERE owner_id = ? AND conversation_id = ?;
+            """,
+            (activity.isoformat(), activity.isoformat(), owner_id, conversation_id),
+        )
+    assert updated.rowcount == 1
+
+
+def _prepare_idle_retirement_thread(
+    client: TestClient,
+    db_path: Path,
+    *,
+    owner_id: str,
+    conversation_id: str,
+    activity: datetime,
+) -> dict[str, object]:
+    response = _thread(client, owner_id, conversation_id)
+    assert response.status_code == 200
+    _set_thread_activity(
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=activity,
+    )
+    return _thread(client, owner_id, conversation_id).json()
+
+
+def _reserve_retirement(
+    client: TestClient,
+    *,
+    owner_id: str,
+    conversation_id: str,
+    durable_updated_at: datetime,
+    retirement_before: datetime,
+    lifecycle_state: str = "open",
+    request_id: str = "retirement-reserve",
+):
+    return client.post(
+        "/v1/runtime/retirements/reserve",
+        json={
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "lifecycle_state": lifecycle_state,
+            "durable_updated_at": durable_updated_at.isoformat(),
+            "retirement_before": retirement_before.isoformat(),
+        },
+    )
+
+
+def _cancel_retirement(
+    client: TestClient,
+    *,
+    owner_id: str,
+    conversation_id: str,
+    reservation_id: str,
+    reserved_thread_revision: int,
+    request_id: str = "retirement-cancel",
+):
+    return client.post(
+        "/v1/runtime/retirements/cancel",
+        json={
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "reservation_id": reservation_id,
+            "reserved_thread_revision": reserved_thread_revision,
+        },
+    )
+
+
+def _finalize_retirement(
+    client: TestClient,
+    *,
+    owner_id: str,
+    conversation_id: str,
+    reservation_id: str,
+    reserved_thread_revision: int,
+    request_id: str = "retirement-finalize",
+):
+    return client.post(
+        "/v1/runtime/retirements/finalize",
+        json={
+            "request_id": request_id,
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "reservation_id": reservation_id,
+            "reserved_thread_revision": reserved_thread_revision,
         },
     )
 
@@ -2373,3 +2495,1288 @@ def test_selection_persistence_failure_is_bounded(monkeypatch):
     assert response.status_code == 503
     assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
     assert "private storage detail" not in response.text
+
+
+def test_retirement_api_contracts_are_strict_bounded_and_timezone_aware(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-contract.sqlite3")
+    client = TestClient(app)
+    valid_reserve = {
+        "request_id": "reserve-contract",
+        "owner_id": "owner-contract",
+        "conversation_id": "conversation-contract",
+        "lifecycle_state": "open",
+        "durable_updated_at": "2026-01-01T07:00:00-05:00",
+        "retirement_before": "2026-01-02T07:00:00-05:00",
+    }
+
+    accepted = client.post("/v1/runtime/retirements/reserve", json=valid_reserve)
+    assert accepted.status_code == 200
+    assert accepted.json()["result"] == {
+        "outcome": "decline",
+        "reason_codes": ["runtime_state_missing"],
+        "policy_version": "conversation-retirement-safety.v1",
+    }
+
+    invalid_reserve_payloads = [
+        {**valid_reserve, "extra": "forbidden"},
+        {**valid_reserve, "request_id": ""},
+        {**valid_reserve, "owner_id": 42},
+        {**valid_reserve, "lifecycle_state": "retired"},
+        {**valid_reserve, "durable_updated_at": "not-a-time"},
+        {**valid_reserve, "durable_updated_at": "2026-01-01T12:00:00"},
+        {**valid_reserve, "retirement_before": "not-a-time"},
+        {**valid_reserve, "retirement_before": "2026-01-02T12:00:00"},
+    ]
+    for payload in invalid_reserve_payloads:
+        assert client.post("/v1/runtime/retirements/reserve", json=payload).status_code == 422
+
+    action = {
+        "request_id": "reservation-action",
+        "owner_id": "owner-contract",
+        "conversation_id": "conversation-contract",
+        "reservation_id": "reservation-contract",
+        "reserved_thread_revision": 0,
+    }
+    for endpoint in ("cancel", "finalize"):
+        assert client.post(
+            f"/v1/runtime/retirements/{endpoint}",
+            json={**action, "extra": "forbidden"},
+        ).status_code == 422
+        assert client.post(
+            f"/v1/runtime/retirements/{endpoint}",
+            json={**action, "reservation_id": ""},
+        ).status_code == 422
+        assert client.post(
+            f"/v1/runtime/retirements/{endpoint}",
+            json={**action, "reserved_thread_revision": True},
+        ).status_code == 422
+
+    valid_reserved_result = {
+        "outcome": "reserved",
+        "reservation_id": "reservation-contract",
+        "reserved_thread_revision": 0,
+        "reserved_durable_updated_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "reason_codes": ["safe_idle_retirement_reserved"],
+        "policy_version": "conversation-retirement-safety.v1",
+    }
+    with pytest.raises(ValidationError):
+        RetirementReservationResult.model_validate(
+            {**valid_reserved_result, "extra": "forbidden"}
+        )
+    with pytest.raises(ValidationError):
+        RetirementReservationResult.model_validate(
+            {
+                **valid_reserved_result,
+                "outcome": "decline",
+            }
+        )
+    with pytest.raises(ValidationError):
+        RetirementReservationResponse.model_validate(
+            {
+                "schema_version": "runtime-retirement-reservation.v1",
+                "request_id": "reserve-contract",
+                "owner_id": "owner-contract",
+                "conversation_id": "conversation-contract",
+                "result": valid_reserved_result,
+                "extra": "forbidden",
+            }
+        )
+    action_response = {
+        "request_id": "reservation-action",
+        "owner_id": "owner-contract",
+        "conversation_id": "conversation-contract",
+        "reservation_id": "reservation-contract",
+    }
+    with pytest.raises(ValidationError):
+        RetirementReservationCancelResponse.model_validate(
+            {
+                "schema_version": "runtime-retirement-cancellation.v1",
+                **action_response,
+                "thread_revision": 0,
+                "outcome": "cancelled",
+                "extra": "forbidden",
+            }
+        )
+    with pytest.raises(ValidationError):
+        RetirementReservationFinalizeResponse.model_validate(
+            {
+                "schema_version": "runtime-retirement-finalization.v1",
+                **action_response,
+                "previous_thread_revision": 0,
+                "fenced_thread_revision": 1,
+                "outcome": "finalized",
+                "extra": "forbidden",
+            }
+        )
+    with pytest.raises(ValidationError):
+        RetirementReservationFinalizeResponse.model_validate(
+            {
+                "schema_version": "runtime-retirement-finalization.v1",
+                **action_response,
+                "previous_thread_revision": 0,
+                "fenced_thread_revision": 2,
+                "outcome": "finalized",
+            }
+        )
+    assert _runtime_rows(db_path) == ((), (), (), ())
+    assert _retirement_rows(db_path) == ()
+
+
+def test_safe_idle_retirement_reservation_is_persistent_and_nonmutating(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-safe-idle.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-safe-idle"
+    conversation_id = "conversation-safe-idle"
+    retirement_before = datetime(2026, 1, 2, 7, tzinfo=UTC)
+    runtime_activity = retirement_before - timedelta(microseconds=1)
+    durable_activity = datetime.fromisoformat("2026-01-01T01:00:00-05:00")
+    initial = _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=runtime_activity,
+    )
+    before = _runtime_rows(db_path)
+
+    response = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=durable_activity,
+        retirement_before=retirement_before,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    result = body["result"]
+    assert body["schema_version"] == "runtime-retirement-reservation.v1"
+    assert result["outcome"] == "reserved"
+    assert result["reservation_id"].startswith("rtreservation_")
+    assert result["reserved_thread_revision"] == initial["revision"] == 0
+    serialized_durable = result["reserved_durable_updated_at"].replace("Z", "+00:00")
+    assert datetime.fromisoformat(serialized_durable) == (
+        durable_activity.astimezone(UTC)
+    )
+    assert result["reason_codes"] == ["safe_idle_retirement_reserved"]
+    assert _runtime_rows(db_path) == before
+
+    rows = _retirement_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0][1] == result["reservation_id"]
+    assert rows[0][2:5] == (owner_id, conversation_id, 0)
+    assert datetime.fromisoformat(rows[0][5]) == durable_activity.astimezone(UTC)
+    assert datetime.fromisoformat(rows[0][6]) == retirement_before
+    assert datetime.fromisoformat(rows[0][5]).utcoffset() == timedelta(0)
+    assert datetime.fromisoformat(rows[0][6]).utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    ("offset_microseconds", "expected_outcome", "expected_reason"),
+    [
+        (-1, "reserved", "safe_idle_retirement_reserved"),
+        (0, "decline", "durable_activity_not_over_horizon"),
+        (1, "decline", "durable_activity_not_over_horizon"),
+    ],
+)
+def test_retirement_durable_activity_boundary_is_strict(
+    tmp_path: Path,
+    offset_microseconds: int,
+    expected_outcome: str,
+    expected_reason: str,
+):
+    db_path = _use_database(
+        tmp_path,
+        f"retirement-durable-boundary-{offset_microseconds}.sqlite3",
+    )
+    client = TestClient(app)
+    cutoff = datetime(2026, 2, 1, tzinfo=UTC)
+    conversation_id = f"conversation-durable-{offset_microseconds}"
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id="owner-durable-boundary",
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+
+    response = _reserve_retirement(
+        client,
+        owner_id="owner-durable-boundary",
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff + timedelta(microseconds=offset_microseconds),
+        retirement_before=cutoff,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["outcome"] == expected_outcome
+    assert response.json()["result"]["reason_codes"] == [expected_reason]
+    assert len(_retirement_rows(db_path)) == (1 if expected_outcome == "reserved" else 0)
+
+
+@pytest.mark.parametrize(
+    ("offset_microseconds", "expected_outcome", "expected_reason"),
+    [
+        (-1, "reserved", "safe_idle_retirement_reserved"),
+        (0, "decline", "runtime_activity_not_over_horizon"),
+        (1, "decline", "runtime_activity_not_over_horizon"),
+    ],
+)
+def test_retirement_runtime_activity_boundary_is_strict(
+    tmp_path: Path,
+    offset_microseconds: int,
+    expected_outcome: str,
+    expected_reason: str,
+):
+    db_path = _use_database(
+        tmp_path,
+        f"retirement-runtime-boundary-{offset_microseconds}.sqlite3",
+    )
+    client = TestClient(app)
+    cutoff = datetime(2026, 3, 1, tzinfo=UTC)
+    conversation_id = f"conversation-runtime-{offset_microseconds}"
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id="owner-runtime-boundary",
+        conversation_id=conversation_id,
+        activity=cutoff + timedelta(microseconds=offset_microseconds),
+    )
+
+    response = _reserve_retirement(
+        client,
+        owner_id="owner-runtime-boundary",
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=1),
+        retirement_before=cutoff,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["outcome"] == expected_outcome
+    assert response.json()["result"]["reason_codes"] == [expected_reason]
+    assert len(_retirement_rows(db_path)) == (1 if expected_outcome == "reserved" else 0)
+
+
+@pytest.mark.parametrize("equal_source", ["durable", "runtime"])
+def test_retirement_boundaries_compare_nonutc_offsets_as_instants(
+    tmp_path: Path,
+    equal_source: str,
+):
+    db_path = _use_database(
+        tmp_path,
+        f"retirement-offset-equality-{equal_source}.sqlite3",
+    )
+    client = TestClient(app)
+    cutoff = datetime(2026, 3, 1, 12, tzinfo=UTC)
+    equal_with_offset = datetime.fromisoformat("2026-03-01T07:00:00-05:00")
+    owner_id = "owner-offset-equality"
+    conversation_id = f"conversation-offset-{equal_source}"
+    runtime_activity = (
+        equal_with_offset
+        if equal_source == "runtime"
+        else cutoff - timedelta(days=1)
+    )
+    durable_activity = (
+        equal_with_offset
+        if equal_source == "durable"
+        else cutoff - timedelta(days=1)
+    )
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=runtime_activity,
+    )
+
+    response = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=durable_activity,
+        retirement_before=cutoff,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["outcome"] == "decline"
+    assert response.json()["result"]["reason_codes"] == [
+        f"{equal_source}_activity_not_over_horizon"
+    ]
+    assert _retirement_rows(db_path) == ()
+
+
+@pytest.mark.parametrize("lifecycle_state", ["closed", "superseded"])
+def test_nonopen_durable_lifecycle_cannot_reserve_retirement(
+    tmp_path: Path,
+    lifecycle_state: str,
+):
+    db_path = _use_database(tmp_path, f"retirement-{lifecycle_state}.sqlite3")
+    client = TestClient(app)
+    cutoff = datetime(2026, 4, 1, tzinfo=UTC)
+    conversation_id = f"conversation-{lifecycle_state}"
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id="owner-nonopen",
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    before = _runtime_rows(db_path)
+
+    response = _reserve_retirement(
+        client,
+        owner_id="owner-nonopen",
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=1),
+        retirement_before=cutoff,
+        lifecycle_state=lifecycle_state,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["outcome"] == "decline"
+    assert response.json()["result"]["reason_codes"] == ["candidate_not_open"]
+    assert _retirement_rows(db_path) == ()
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize(
+    ("runtime_case", "expected_outcome", "expected_reason"),
+    [
+        ("missing", "decline", "runtime_state_missing"),
+        ("inconsistent_idle", "decline", "runtime_state_inconsistent"),
+        ("inconsistent_active", "decline", "runtime_state_inconsistent"),
+        ("active", "wait", "runtime_thread_active"),
+        ("contended", "decline", "runtime_thread_contended"),
+        ("unavailable", "decline", "runtime_thread_unavailable"),
+    ],
+)
+def test_unsafe_runtime_states_never_create_retirement_reservations(
+    tmp_path: Path,
+    runtime_case: str,
+    expected_outcome: str,
+    expected_reason: str,
+):
+    db_path = _use_database(tmp_path, f"retirement-{runtime_case}.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-runtime-state"
+    conversation_id = f"conversation-{runtime_case}"
+    cutoff = datetime.now(UTC) + timedelta(days=1)
+    old_activity = cutoff - timedelta(days=2)
+
+    if runtime_case == "active":
+        admitted = _start(
+            client,
+            request_id="active-before-retirement",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface="surface-active",
+        )
+        assert admitted.status_code == 200
+    elif runtime_case != "missing":
+        _prepare_idle_retirement_thread(
+            client,
+            db_path,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            activity=old_activity,
+        )
+        with sqlite3.connect(db_path) as conn:
+            if runtime_case == "inconsistent_idle":
+                conn.execute(
+                    """
+                    UPDATE conversation_runtime_threads
+                    SET active_runtime_turn_id = 'private-missing-turn'
+                    WHERE owner_id = ? AND conversation_id = ?;
+                    """,
+                    (owner_id, conversation_id),
+                )
+            elif runtime_case == "inconsistent_active":
+                conn.execute(
+                    """
+                    UPDATE conversation_runtime_threads
+                    SET state = 'active'
+                    WHERE owner_id = ? AND conversation_id = ?;
+                    """,
+                    (owner_id, conversation_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE conversation_runtime_threads
+                    SET state = ?
+                    WHERE owner_id = ? AND conversation_id = ?;
+                    """,
+                    (runtime_case, owner_id, conversation_id),
+                )
+
+    before = _runtime_rows(db_path)
+    response = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=old_activity,
+        retirement_before=cutoff,
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["outcome"] == expected_outcome
+    assert result["reason_codes"] == [expected_reason]
+    assert "reservation_id" not in result
+    assert "reserved_thread_revision" not in result
+    assert "reserved_durable_updated_at" not in result
+    assert "private-missing-turn" not in response.text
+    assert _retirement_rows(db_path) == ()
+    assert _runtime_rows(db_path) == before
+
+
+def test_existing_retirement_reservation_is_recovered_without_replacement(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-existing.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-existing"
+    conversation_id = "conversation-existing"
+    cutoff = datetime(2026, 5, 1, tzinfo=UTC)
+    original_durable = cutoff - timedelta(days=2)
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+
+    first = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=original_durable,
+        retirement_before=cutoff,
+        request_id="reserve-original",
+    )
+    rows_after_first = _retirement_rows(db_path)
+    second = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=original_durable + timedelta(hours=3),
+        retirement_before=cutoff + timedelta(days=10),
+        request_id="reserve-recovery",
+    )
+
+    assert first.status_code == second.status_code == 200
+    first_result = first.json()["result"]
+    second_result = second.json()["result"]
+    assert second_result["outcome"] == "reserved"
+    assert second_result["reason_codes"] == ["existing_retirement_reservation"]
+    assert second_result["reservation_id"] == first_result["reservation_id"]
+    assert second_result["reserved_thread_revision"] == first_result[
+        "reserved_thread_revision"
+    ]
+    assert second_result["reserved_durable_updated_at"] == first_result[
+        "reserved_durable_updated_at"
+    ]
+    assert _retirement_rows(db_path) == rows_after_first
+
+
+def test_drifted_existing_reservation_is_not_replaced_or_disclosed(tmp_path: Path):
+    db_path = _use_database(tmp_path, "retirement-existing-drift.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-existing-drift"
+    conversation_id = "conversation-existing-drift"
+    cutoff = datetime(2026, 5, 1, tzinfo=UTC)
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reserved = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    ).json()["result"]
+    original_rows = _retirement_rows(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE conversation_runtime_threads
+            SET revision = revision + 1
+            WHERE owner_id = ? AND conversation_id = ?;
+            """,
+            (owner_id, conversation_id),
+        )
+
+    response = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=3),
+        retirement_before=cutoff,
+        request_id="reserve-after-drift",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["outcome"] == "decline"
+    assert response.json()["result"]["reason_codes"] == [
+        "runtime_state_inconsistent"
+    ]
+    assert "reservation_id" not in response.json()["result"]
+    assert reserved["reservation_id"] not in response.text
+    assert _retirement_rows(db_path) == original_rows
+
+
+def test_retirement_reservation_blocks_turn_admission_before_any_mutation(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-blocks-start.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-blocked-start"
+    conversation_id = "conversation-blocked-start"
+    cutoff = datetime(2026, 6, 1, tzinfo=UTC)
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reservation = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    ).json()["result"]
+    before_runtime = _runtime_rows(db_path)
+    before_reservation = _retirement_rows(db_path)
+
+    blocked = _start(
+        client,
+        request_id="blocked-by-retirement",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-new",
+        expected_thread_revision=reservation["reserved_thread_revision"],
+    )
+
+    assert (blocked.status_code, blocked.json()) == (
+        409,
+        {"detail": "runtime_thread_retirement_reserved"},
+    )
+    assert _runtime_rows(db_path) == before_runtime
+    assert _retirement_rows(db_path) == before_reservation
+
+
+def test_retirement_reservation_blocks_session_activity_before_any_mutation(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-blocks-session.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-blocked-session"
+    conversation_id = "conversation-blocked-session"
+    cutoff = datetime(2026, 6, 1, tzinfo=UTC)
+    initial_session = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": "initial-session",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": "surface-existing",
+        },
+    )
+    assert initial_session.status_code == 200
+    _set_thread_activity(
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    )
+    before_runtime = _runtime_rows(db_path)
+    before_reservation = _retirement_rows(db_path)
+
+    blocked = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": "blocked-session",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": "surface-new",
+            "surface_session_id": "private-surface-session",
+        },
+    )
+
+    assert (blocked.status_code, blocked.json()) == (
+        409,
+        {"detail": "runtime_thread_retirement_reserved"},
+    )
+    assert "private-surface-session" not in blocked.text
+    assert _runtime_rows(db_path) == before_runtime
+    assert _retirement_rows(db_path) == before_reservation
+
+
+def test_turn_admission_winning_first_prevents_retirement_reservation(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-start-first.sqlite3")
+    client = TestClient(app)
+    cutoff = datetime.now(UTC) + timedelta(days=1)
+    admitted = _start(
+        client,
+        request_id="turn-wins-first",
+        owner_id="owner-start-first",
+        conversation_id="conversation-start-first",
+        surface="surface-active",
+    )
+    assert admitted.status_code == 200
+    before = _runtime_rows(db_path)
+
+    reservation = _reserve_retirement(
+        client,
+        owner_id="owner-start-first",
+        conversation_id="conversation-start-first",
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    )
+
+    assert reservation.status_code == 200
+    assert reservation.json()["result"]["outcome"] == "wait"
+    assert reservation.json()["result"]["reason_codes"] == [
+        "runtime_thread_active"
+    ]
+    assert _retirement_rows(db_path) == ()
+    assert _runtime_rows(db_path) == before
+
+
+def test_session_resolution_winning_first_refreshes_activity_and_declines_reservation(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-session-first.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-session-first"
+    conversation_id = "conversation-session-first"
+    cutoff = datetime.now(UTC)
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+
+    resolved = client.post(
+        "/v1/runtime/sessions/resolve",
+        json={
+            "request_id": "session-wins-first",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "surface": "surface-current",
+        },
+    )
+    assert resolved.status_code == 200
+    before = _runtime_rows(db_path)
+    reservation = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    )
+
+    assert reservation.status_code == 200
+    assert reservation.json()["result"]["outcome"] == "decline"
+    assert reservation.json()["result"]["reason_codes"] == [
+        "runtime_activity_not_over_horizon"
+    ]
+    assert _retirement_rows(db_path) == ()
+    assert _runtime_rows(db_path) == before
+
+
+def test_cancellation_requires_the_exact_live_reservation_and_restores_admission(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-cancel.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-cancel"
+    conversation_id = "conversation-cancel"
+    cutoff = datetime(2026, 7, 1, tzinfo=UTC)
+    initial = _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reservation = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    ).json()["result"]
+    reserved_runtime = _runtime_rows(db_path)
+    reserved_rows = _retirement_rows(db_path)
+
+    wrong_id = _cancel_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id="wrong-reservation",
+        reserved_thread_revision=initial["revision"],
+    )
+    wrong_revision = _cancel_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id=reservation["reservation_id"],
+        reserved_thread_revision=initial["revision"] + 1,
+    )
+    assert (wrong_id.status_code, wrong_id.json()) == (
+        409,
+        {"detail": "runtime_retirement_reservation_conflict"},
+    )
+    assert (wrong_revision.status_code, wrong_revision.json()) == (
+        409,
+        {"detail": "runtime_retirement_reservation_revision_conflict"},
+    )
+    assert _runtime_rows(db_path) == reserved_runtime
+    assert _retirement_rows(db_path) == reserved_rows
+
+    cancelled = _cancel_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id=reservation["reservation_id"],
+        reserved_thread_revision=initial["revision"],
+    )
+    assert (cancelled.status_code, cancelled.json()) == (
+        200,
+        {
+            "schema_version": "runtime-retirement-cancellation.v1",
+            "request_id": "retirement-cancel",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "reservation_id": reservation["reservation_id"],
+            "thread_revision": initial["revision"],
+            "outcome": "cancelled",
+        },
+    )
+    after_cancel = _thread(client, owner_id, conversation_id).json()
+    assert after_cancel["state"] == initial["state"] == "idle"
+    assert after_cancel["revision"] == initial["revision"]
+    assert after_cancel["last_activity_at"] == initial["last_activity_at"]
+    assert _retirement_rows(db_path) == ()
+
+    repeated = _cancel_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id=reservation["reservation_id"],
+        reserved_thread_revision=initial["revision"],
+        request_id="retirement-cancel-repeat",
+    )
+    assert (repeated.status_code, repeated.json()) == (
+        404,
+        {"detail": "runtime_retirement_reservation_not_found"},
+    )
+    assert _thread(client, owner_id, conversation_id).json() == after_cancel
+
+    admitted = _start(
+        client,
+        request_id="admit-after-cancel",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-after-cancel",
+        expected_thread_revision=initial["revision"],
+    )
+    assert admitted.status_code == 200
+
+
+def test_finalization_requires_a_live_exact_reservation_and_fences_revision(
+    tmp_path: Path,
+):
+    db_path = _use_database(tmp_path, "retirement-finalize.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-finalize"
+    conversation_id = "conversation-finalize"
+    cutoff = datetime(2026, 8, 1, tzinfo=UTC)
+    initial = _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reservation = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    ).json()["result"]
+    before_wrong = _runtime_rows(db_path)
+    reservation_rows = _retirement_rows(db_path)
+
+    wrong = _finalize_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id="wrong-reservation",
+        reserved_thread_revision=initial["revision"],
+    )
+    assert (wrong.status_code, wrong.json()) == (
+        409,
+        {"detail": "runtime_retirement_reservation_conflict"},
+    )
+    assert _runtime_rows(db_path) == before_wrong
+    assert _retirement_rows(db_path) == reservation_rows
+
+    finalized = _finalize_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id=reservation["reservation_id"],
+        reserved_thread_revision=initial["revision"],
+    )
+    assert (finalized.status_code, finalized.json()) == (
+        200,
+        {
+            "schema_version": "runtime-retirement-finalization.v1",
+            "request_id": "retirement-finalize",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "reservation_id": reservation["reservation_id"],
+            "previous_thread_revision": initial["revision"],
+            "fenced_thread_revision": initial["revision"] + 1,
+            "outcome": "finalized",
+        },
+    )
+    fenced = _thread(client, owner_id, conversation_id).json()
+    assert fenced["state"] == "idle"
+    assert fenced["revision"] == initial["revision"] + 1
+    assert fenced["last_activity_at"] == initial["last_activity_at"]
+    assert fenced["active_runtime_session_id"] is None
+    assert fenced["active_runtime_turn_id"] is None
+    assert _retirement_rows(db_path) == ()
+
+    before_retry = _runtime_rows(db_path)
+    repeated = _finalize_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id=reservation["reservation_id"],
+        reserved_thread_revision=initial["revision"],
+        request_id="retirement-finalize-repeat",
+    )
+    assert (repeated.status_code, repeated.json()) == (
+        404,
+        {"detail": "runtime_retirement_reservation_not_found"},
+    )
+    assert _runtime_rows(db_path) == before_retry
+    assert _thread(client, owner_id, conversation_id).json() == fenced
+    assert _retirement_rows(db_path) == ()
+
+    stale_admission = _start(
+        client,
+        request_id="stale-after-finalize",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-after-finalize",
+        expected_thread_revision=initial["revision"],
+    )
+    assert (stale_admission.status_code, stale_admission.json()) == (
+        409,
+        {"detail": "runtime_thread_revision_conflict"},
+    )
+    assert _thread(client, owner_id, conversation_id).json() == fenced
+
+
+def test_both_ambiguous_finalization_states_block_stale_admission(tmp_path: Path):
+    db_path = _use_database(tmp_path, "retirement-ambiguous-safety.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-ambiguous-finalize"
+    conversation_id = "conversation-ambiguous-finalize"
+    cutoff = datetime(2026, 8, 1, tzinfo=UTC)
+    initial = _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reservation = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    ).json()["result"]
+
+    before_finalize = _start(
+        client,
+        request_id="stale-before-finalize",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-before-finalize",
+        expected_thread_revision=initial["revision"],
+    )
+    assert before_finalize.json() == {"detail": "runtime_thread_retirement_reserved"}
+    assert _retirement_rows(db_path)
+
+    finalized = _finalize_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id=reservation["reservation_id"],
+        reserved_thread_revision=initial["revision"],
+    )
+    assert finalized.status_code == 200
+    assert _retirement_rows(db_path) == ()
+
+    after_finalize = _start(
+        client,
+        request_id="stale-after-finalize",
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface="surface-after-finalize",
+        expected_thread_revision=initial["revision"],
+    )
+    assert after_finalize.json() == {"detail": "runtime_thread_revision_conflict"}
+
+
+def test_wrong_owner_cannot_observe_or_release_another_reservation(tmp_path: Path):
+    db_path = _use_database(tmp_path, "retirement-owner-isolation.sqlite3")
+    client = TestClient(app)
+    cutoff = datetime(2026, 9, 1, tzinfo=UTC)
+    conversation_id = "conversation-owner-isolation"
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id="owner-a",
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reservation = _reserve_retirement(
+        client,
+        owner_id="owner-a",
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    ).json()["result"]
+    before_runtime = _runtime_rows(db_path)
+    before_reservation = _retirement_rows(db_path)
+
+    other_reserve = _reserve_retirement(
+        client,
+        owner_id="owner-b",
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    )
+    assert other_reserve.status_code == 200
+    assert other_reserve.json()["result"]["reason_codes"] == [
+        "runtime_state_missing"
+    ]
+    assert "reservation_id" not in other_reserve.json()["result"]
+    assert reservation["reservation_id"] not in other_reserve.text
+
+    for action in (_cancel_retirement, _finalize_retirement):
+        response = action(
+            client,
+            owner_id="owner-b",
+            conversation_id=conversation_id,
+            reservation_id=reservation["reservation_id"],
+            reserved_thread_revision=reservation["reserved_thread_revision"],
+        )
+        assert response.status_code == 404
+        assert response.json() == {
+            "detail": "runtime_retirement_reservation_not_found"
+        }
+        assert reservation["reservation_id"] not in response.text
+
+    assert _runtime_rows(db_path) == before_runtime
+    assert _retirement_rows(db_path) == before_reservation
+
+
+def test_retirement_reservation_survives_repository_recreation(tmp_path: Path):
+    db_path = tmp_path / "retirement-restart.sqlite3"
+    owner_id = "owner-restart-retirement"
+    conversation_id = "conversation-restart-retirement"
+    cutoff = datetime(2026, 10, 1, tzinfo=UTC)
+    first = RuntimeStateRepository(db_path)
+    first.resolve_thread(owner_id=owner_id, conversation_id=conversation_id)
+    _set_thread_activity(
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    request = RetirementReservationRequest.model_validate(
+        {
+            "request_id": "reserve-before-restart",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "lifecycle_state": "open",
+            "durable_updated_at": cutoff - timedelta(days=2),
+            "retirement_before": cutoff,
+        }
+    )
+    reservation = first.reserve_retirement(request).result
+    assert reservation.reservation_id is not None
+    assert reservation.reserved_thread_revision is not None
+
+    reopened = RuntimeStateRepository(db_path)
+    with pytest.raises(RuntimeError, match="^runtime_thread_retirement_reserved$"):
+        reopened.start_turn(
+            request_id="restart-blocked-turn",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface="surface-restart",
+            expected_thread_revision=reservation.reserved_thread_revision,
+        )
+    with pytest.raises(RuntimeError, match="^runtime_thread_retirement_reserved$"):
+        reopened.resolve_session(
+            request_id="restart-blocked-session",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface="surface-restart",
+        )
+    assert len(_retirement_rows(db_path)) == 1
+
+    finalized = reopened.finalize_retirement_reservation(
+        RetirementReservationFinalizeRequest(
+            request_id="finalize-after-restart",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            reservation_id=reservation.reservation_id,
+            reserved_thread_revision=reservation.reserved_thread_revision,
+        )
+    )
+    assert finalized.fenced_thread_revision == reservation.reserved_thread_revision + 1
+    assert _retirement_rows(db_path) == ()
+
+
+@pytest.mark.parametrize("action_name", ["cancel", "finalize"])
+def test_reservation_actions_reject_a_drifted_thread_invariant(
+    tmp_path: Path,
+    action_name: str,
+):
+    db_path = _use_database(tmp_path, f"retirement-drift-{action_name}.sqlite3")
+    client = TestClient(app)
+    owner_id = "owner-action-drift"
+    conversation_id = f"conversation-{action_name}-drift"
+    cutoff = datetime(2026, 11, 1, tzinfo=UTC)
+    _prepare_idle_retirement_thread(
+        client,
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reservation = _reserve_retirement(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        durable_updated_at=cutoff - timedelta(days=2),
+        retirement_before=cutoff,
+    ).json()["result"]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE conversation_runtime_threads
+            SET revision = revision + 1
+            WHERE owner_id = ? AND conversation_id = ?;
+            """,
+            (owner_id, conversation_id),
+        )
+    before_runtime = _runtime_rows(db_path)
+    before_reservation = _retirement_rows(db_path)
+    action = _cancel_retirement if action_name == "cancel" else _finalize_retirement
+
+    response = action(
+        client,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        reservation_id=reservation["reservation_id"],
+        reserved_thread_revision=reservation["reserved_thread_revision"],
+    )
+
+    assert (response.status_code, response.json()) == (
+        409,
+        {"detail": "runtime_retirement_reservation_invariant_conflict"},
+    )
+    assert _runtime_rows(db_path) == before_runtime
+    assert _retirement_rows(db_path) == before_reservation
+
+
+def test_retirement_reservation_and_turn_admission_serialize_across_connections(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "retirement-concurrent.sqlite3"
+    owner_id = "owner-retirement-concurrent"
+    conversation_id = "conversation-retirement-concurrent"
+    cutoff = datetime(2026, 12, 1, tzinfo=UTC)
+    repositories = [RuntimeStateRepository(db_path), RuntimeStateRepository(db_path)]
+    repositories[0].resolve_thread(owner_id=owner_id, conversation_id=conversation_id)
+    _set_thread_activity(
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reserve_request = RetirementReservationRequest.model_validate(
+        {
+            "request_id": "concurrent-reservation",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "lifecycle_state": "open",
+            "durable_updated_at": cutoff - timedelta(days=2),
+            "retirement_before": cutoff,
+        }
+    )
+    barrier = threading.Barrier(2)
+
+    def reserve_attempt():
+        barrier.wait(timeout=5)
+        result = repositories[0].reserve_retirement(reserve_request).result
+        return "reserve", result.outcome, result.reason_codes
+
+    def admission_attempt():
+        barrier.wait(timeout=5)
+        try:
+            result = repositories[1].start_turn(
+                request_id="concurrent-admission",
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                surface="surface-concurrent",
+                expected_thread_revision=0,
+            )
+            return "admission", "admitted", result[1].runtime_turn_id
+        except RuntimeError as exc:
+            return "admission", str(exc), None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(reserve_attempt), executor.submit(admission_attempt)]
+        outcomes = {result[0]: result[1:] for result in (future.result() for future in futures)}
+
+    with sqlite3.connect(db_path) as conn:
+        turn_count = conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_turns;"
+        ).fetchone()[0]
+        reservation_count = conn.execute(
+            "SELECT COUNT(*) FROM conversation_runtime_retirement_reservations;"
+        ).fetchone()[0]
+        thread = conn.execute(
+            """
+            SELECT state, revision FROM conversation_runtime_threads
+            WHERE owner_id = ? AND conversation_id = ?;
+            """,
+            (owner_id, conversation_id),
+        ).fetchone()
+
+    if outcomes["reserve"][0] == "reserved":
+        assert outcomes["admission"][0] == "runtime_thread_retirement_reserved"
+        assert (reservation_count, turn_count, tuple(thread)) == (1, 0, ("idle", 0))
+    else:
+        assert outcomes["reserve"] == ("wait", ["runtime_thread_active"])
+        assert outcomes["admission"][0] == "admitted"
+        assert (reservation_count, turn_count, tuple(thread)) == (0, 1, ("active", 1))
+    assert not (reservation_count and turn_count)
+
+
+def test_reservation_schema_has_no_expiry_lifecycle_mirror_or_receipt(tmp_path: Path):
+    db_path = tmp_path / "retirement-schema.sqlite3"
+    owner_id = "owner-retirement-schema"
+    conversation_id = "conversation-retirement-schema"
+    cutoff = datetime(2027, 1, 1, tzinfo=UTC)
+    repository = RuntimeStateRepository(db_path)
+    repository.resolve_thread(owner_id=owner_id, conversation_id=conversation_id)
+    _set_thread_activity(
+        db_path,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        activity=cutoff - timedelta(days=1),
+    )
+    reservation = repository.reserve_retirement(
+        RetirementReservationRequest(
+            request_id="reserve-schema",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            lifecycle_state="open",
+            durable_updated_at=cutoff - timedelta(days=2),
+            retirement_before=cutoff,
+        )
+    ).result
+    assert reservation.reservation_id is not None
+    assert reservation.reserved_thread_revision is not None
+
+    reopened = RuntimeStateRepository(db_path)
+    assert len(_retirement_rows(db_path)) == 1
+    with sqlite3.connect(db_path) as conn:
+        table_names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table';"
+            ).fetchall()
+        }
+        reservation_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(conversation_runtime_retirement_reservations);"
+            ).fetchall()
+        }
+        thread_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(conversation_runtime_threads);"
+            ).fetchall()
+        }
+    assert reservation_columns == {
+        "id",
+        "reservation_id",
+        "owner_id",
+        "conversation_id",
+        "thread_revision",
+        "durable_updated_at",
+        "retirement_before",
+        "created_at",
+    }
+    assert not {"expires_at", "status", "lifecycle_state"} & reservation_columns
+    assert not {"closed", "retired", "lifecycle_state"} & thread_columns
+    assert not any("receipt" in name or "finalized" in name for name in table_names)
+
+    finalized = reopened.finalize_retirement_reservation(
+        RetirementReservationFinalizeRequest(
+            request_id="finalize-schema",
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            reservation_id=reservation.reservation_id,
+            reserved_thread_revision=reservation.reserved_thread_revision,
+        )
+    )
+    assert finalized.outcome == "finalized"
+    assert _retirement_rows(db_path) == ()
+    with sqlite3.connect(db_path) as conn:
+        state = conn.execute(
+            """
+            SELECT state FROM conversation_runtime_threads
+            WHERE owner_id = ? AND conversation_id = ?;
+            """,
+            (owner_id, conversation_id),
+        ).fetchone()[0]
+    assert state == "idle"

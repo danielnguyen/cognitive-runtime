@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from models import (
     AttentionFocus,
@@ -14,6 +15,13 @@ from models import (
     ContinuationSelectionRequest,
     ContinuationSelectionResponse,
     ContinuationSelectionResult,
+    RetirementReservationCancelRequest,
+    RetirementReservationCancelResponse,
+    RetirementReservationFinalizeRequest,
+    RetirementReservationFinalizeResponse,
+    RetirementReservationRequest,
+    RetirementReservationResponse,
+    RetirementReservationResult,
     RuntimeEvent,
     RuntimeOverlay,
     RuntimeSession,
@@ -68,6 +76,10 @@ def _turn_id(runtime_session_id: str, request_id: str, created_at: str) -> str:
 
 def _event_id(runtime_session_id: str, event_type: str, created_at: str, ordinal: int) -> str:
     return _digest("rtevent", f"{runtime_session_id}:{event_type}:{created_at}:{ordinal}")
+
+
+def _retirement_reservation_id() -> str:
+    return _digest("rtreservation", uuid4().hex)
 
 
 def runtime_state_db_path() -> Path:
@@ -171,6 +183,20 @@ class RuntimeStateRepository:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(runtime_session_id)
                         REFERENCES conversation_runtime_sessions(runtime_session_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS conversation_runtime_retirement_reservations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reservation_id TEXT NOT NULL UNIQUE,
+                    owner_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    thread_revision INTEGER NOT NULL CHECK(thread_revision >= 0),
+                    durable_updated_at TEXT NOT NULL,
+                    retirement_before TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(owner_id, conversation_id),
+                    FOREIGN KEY(owner_id, conversation_id)
+                        REFERENCES conversation_runtime_threads(owner_id, conversation_id)
                 );
                 """
             )
@@ -289,6 +315,265 @@ class RuntimeStateRepository:
             outcome="create_new",
             eligible_candidate_count=0,
             reason_codes=reasons,
+        )
+
+    def reserve_retirement(
+        self,
+        request: RetirementReservationRequest,
+    ) -> RetirementReservationResponse:
+        durable_updated_at = request.durable_updated_at.astimezone(UTC)
+        retirement_before = request.retirement_before.astimezone(UTC)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            existing = self._retirement_reservation_by_key(
+                conn,
+                owner_id=request.owner_id,
+                conversation_id=request.conversation_id,
+            )
+            if existing is not None:
+                if not self._retirement_reservation_invariant_holds(conn, existing):
+                    return self._retirement_reservation_response(
+                        request,
+                        outcome="decline",
+                        reason="runtime_state_inconsistent",
+                    )
+                try:
+                    reserved_durable_updated_at = datetime.fromisoformat(
+                        existing["durable_updated_at"]
+                    )
+                    if (
+                        reserved_durable_updated_at.tzinfo is None
+                        or reserved_durable_updated_at.utcoffset() is None
+                    ):
+                        raise ValueError("retirement_reservation_timestamp_invalid")
+                except (TypeError, ValueError):
+                    return self._retirement_reservation_response(
+                        request,
+                        outcome="decline",
+                        reason="runtime_state_inconsistent",
+                    )
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="reserved",
+                    reason="existing_retirement_reservation",
+                    reservation_id=existing["reservation_id"],
+                    reserved_thread_revision=existing["thread_revision"],
+                    reserved_durable_updated_at=reserved_durable_updated_at.astimezone(UTC),
+                )
+
+            if request.lifecycle_state != "open":
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="decline",
+                    reason="candidate_not_open",
+                )
+            if not durable_updated_at < retirement_before:
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="decline",
+                    reason="durable_activity_not_over_horizon",
+                )
+
+            inspection = self._inspect_continuation_thread(
+                conn,
+                owner_id=request.owner_id,
+                conversation_id=request.conversation_id,
+            )
+            state = inspection["state"]
+            if state == "missing":
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="decline",
+                    reason="runtime_state_missing",
+                )
+            if state == "inconsistent":
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="decline",
+                    reason="runtime_state_inconsistent",
+                )
+            if state == "active":
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="wait",
+                    reason="runtime_thread_active",
+                )
+            if state == "contended":
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="decline",
+                    reason="runtime_thread_contended",
+                )
+            if state == "unavailable":
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="decline",
+                    reason="runtime_thread_unavailable",
+                )
+
+            runtime_activity = inspection["last_activity_at"]
+            if runtime_activity is None or not runtime_activity < retirement_before:
+                return self._retirement_reservation_response(
+                    request,
+                    outcome="decline",
+                    reason="runtime_activity_not_over_horizon",
+                )
+
+            thread_revision = inspection["revision"]
+            assert isinstance(thread_revision, int) and thread_revision >= 0
+            created_at = _now()
+            durable_value = durable_updated_at.isoformat()
+            retirement_value = retirement_before.isoformat()
+            reservation_id = _retirement_reservation_id()
+            conn.execute(
+                """
+                INSERT INTO conversation_runtime_retirement_reservations (
+                    reservation_id, owner_id, conversation_id, thread_revision,
+                    durable_updated_at, retirement_before, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    reservation_id,
+                    request.owner_id,
+                    request.conversation_id,
+                    thread_revision,
+                    durable_value,
+                    retirement_value,
+                    created_at,
+                ),
+            )
+            return self._retirement_reservation_response(
+                request,
+                outcome="reserved",
+                reason="safe_idle_retirement_reserved",
+                reservation_id=reservation_id,
+                reserved_thread_revision=thread_revision,
+                reserved_durable_updated_at=durable_updated_at,
+            )
+
+    def cancel_retirement_reservation(
+        self,
+        request: RetirementReservationCancelRequest,
+    ) -> RetirementReservationCancelResponse:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            reservation = self._required_retirement_reservation(
+                conn,
+                owner_id=request.owner_id,
+                conversation_id=request.conversation_id,
+            )
+            self._validate_retirement_reservation_identity(
+                reservation,
+                reservation_id=request.reservation_id,
+                reserved_thread_revision=request.reserved_thread_revision,
+            )
+            if not self._retirement_reservation_invariant_holds(conn, reservation):
+                raise RuntimeError("runtime_retirement_reservation_invariant_conflict")
+            deleted = conn.execute(
+                """
+                DELETE FROM conversation_runtime_retirement_reservations
+                WHERE owner_id = ? AND conversation_id = ?
+                  AND reservation_id = ? AND thread_revision = ?;
+                """,
+                (
+                    request.owner_id,
+                    request.conversation_id,
+                    request.reservation_id,
+                    request.reserved_thread_revision,
+                ),
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError("runtime_retirement_reservation_invariant_conflict")
+            return RetirementReservationCancelResponse(
+                request_id=request.request_id,
+                owner_id=request.owner_id,
+                conversation_id=request.conversation_id,
+                reservation_id=request.reservation_id,
+                thread_revision=request.reserved_thread_revision,
+            )
+
+    def finalize_retirement_reservation(
+        self,
+        request: RetirementReservationFinalizeRequest,
+    ) -> RetirementReservationFinalizeResponse:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            reservation = self._required_retirement_reservation(
+                conn,
+                owner_id=request.owner_id,
+                conversation_id=request.conversation_id,
+            )
+            self._validate_retirement_reservation_identity(
+                reservation,
+                reservation_id=request.reservation_id,
+                reserved_thread_revision=request.reserved_thread_revision,
+            )
+            if not self._retirement_reservation_invariant_holds(conn, reservation):
+                raise RuntimeError("runtime_retirement_reservation_invariant_conflict")
+
+            fenced_revision = request.reserved_thread_revision + 1
+            updated = conn.execute(
+                """
+                UPDATE conversation_runtime_threads
+                SET revision = ?, updated_at = ?
+                WHERE owner_id = ? AND conversation_id = ?
+                  AND state = 'idle' AND revision = ?;
+                """,
+                (
+                    fenced_revision,
+                    _now(),
+                    request.owner_id,
+                    request.conversation_id,
+                    request.reserved_thread_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("runtime_retirement_reservation_invariant_conflict")
+            deleted = conn.execute(
+                """
+                DELETE FROM conversation_runtime_retirement_reservations
+                WHERE owner_id = ? AND conversation_id = ?
+                  AND reservation_id = ? AND thread_revision = ?;
+                """,
+                (
+                    request.owner_id,
+                    request.conversation_id,
+                    request.reservation_id,
+                    request.reserved_thread_revision,
+                ),
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError("runtime_retirement_reservation_invariant_conflict")
+            return RetirementReservationFinalizeResponse(
+                request_id=request.request_id,
+                owner_id=request.owner_id,
+                conversation_id=request.conversation_id,
+                reservation_id=request.reservation_id,
+                previous_thread_revision=request.reserved_thread_revision,
+                fenced_thread_revision=fenced_revision,
+            )
+
+    @staticmethod
+    def _retirement_reservation_response(
+        request: RetirementReservationRequest,
+        *,
+        outcome: str,
+        reason: str,
+        reservation_id: str | None = None,
+        reserved_thread_revision: int | None = None,
+        reserved_durable_updated_at: datetime | None = None,
+    ) -> RetirementReservationResponse:
+        return RetirementReservationResponse(
+            request_id=request.request_id,
+            owner_id=request.owner_id,
+            conversation_id=request.conversation_id,
+            result=RetirementReservationResult(
+                outcome=outcome,
+                reservation_id=reservation_id,
+                reserved_thread_revision=reserved_thread_revision,
+                reserved_durable_updated_at=reserved_durable_updated_at,
+                reason_codes=[reason],
+            ),
         )
 
     def _evaluate_continuation_candidate(
@@ -692,6 +977,11 @@ class RuntimeStateRepository:
     ) -> RuntimeSession:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE;")
+            self._raise_if_retirement_reserved(
+                conn,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
             self._ensure_thread(
                 conn,
                 owner_id=owner_id,
@@ -848,6 +1138,11 @@ class RuntimeStateRepository:
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE;")
+            self._raise_if_retirement_reserved(
+                conn,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
             thread = self._ensure_thread(
                 conn,
                 owner_id=owner_id,
@@ -1304,6 +1599,82 @@ class RuntimeStateRepository:
     def list_events_for_tests(self, runtime_session_id: str) -> list[RuntimeEvent]:
         return self.diagnostics(runtime_session_id).events
 
+    def _retirement_reservation_by_key(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        conversation_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT * FROM conversation_runtime_retirement_reservations
+            WHERE owner_id = ? AND conversation_id = ?
+            LIMIT 1;
+            """,
+            (owner_id, conversation_id),
+        ).fetchone()
+
+    def _required_retirement_reservation(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        conversation_id: str,
+    ) -> sqlite3.Row:
+        reservation = self._retirement_reservation_by_key(
+            conn,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+        )
+        if reservation is None:
+            raise RuntimeError("runtime_retirement_reservation_not_found")
+        return reservation
+
+    @staticmethod
+    def _validate_retirement_reservation_identity(
+        reservation: sqlite3.Row,
+        *,
+        reservation_id: str,
+        reserved_thread_revision: int,
+    ) -> None:
+        if reservation["reservation_id"] != reservation_id:
+            raise RuntimeError("runtime_retirement_reservation_conflict")
+        if reservation["thread_revision"] != reserved_thread_revision:
+            raise RuntimeError("runtime_retirement_reservation_revision_conflict")
+
+    def _retirement_reservation_invariant_holds(
+        self,
+        conn: sqlite3.Connection,
+        reservation: sqlite3.Row,
+    ) -> bool:
+        inspection = self._inspect_continuation_thread(
+            conn,
+            owner_id=reservation["owner_id"],
+            conversation_id=reservation["conversation_id"],
+        )
+        return (
+            inspection["state"] == "idle"
+            and inspection["revision"] == reservation["thread_revision"]
+        )
+
+    def _raise_if_retirement_reserved(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        conversation_id: str,
+    ) -> None:
+        if (
+            self._retirement_reservation_by_key(
+                conn,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+            )
+            is not None
+        ):
+            raise RuntimeError("runtime_thread_retirement_reserved")
+
     def _thread_by_key(
         self,
         conn: sqlite3.Connection,
@@ -1587,6 +1958,24 @@ def select_runtime_continuation(
     request: ContinuationSelectionRequest,
 ) -> ContinuationSelectionResponse:
     return runtime_state_repository().select_continuation(request)
+
+
+def reserve_runtime_retirement(
+    request: RetirementReservationRequest,
+) -> RetirementReservationResponse:
+    return runtime_state_repository().reserve_retirement(request)
+
+
+def cancel_runtime_retirement(
+    request: RetirementReservationCancelRequest,
+) -> RetirementReservationCancelResponse:
+    return runtime_state_repository().cancel_retirement_reservation(request)
+
+
+def finalize_runtime_retirement(
+    request: RetirementReservationFinalizeRequest,
+) -> RetirementReservationFinalizeResponse:
+    return runtime_state_repository().finalize_retirement_reservation(request)
 
 
 def resolve_state(*, owner_id: str, conversation_id: str, surface: str) -> RuntimeState:
