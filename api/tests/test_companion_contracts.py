@@ -71,7 +71,7 @@ def test_repository_resolves_seeded_records(tmp_path):
     surface_binding = repository.surface_binding("vscode")
 
     assert profile.profile_id == "default_companion_profile"
-    assert profile.version == 1
+    assert profile.version == 2
     assert scene is not None
     assert scene.scene_id == "coding_build"
     assert contract.contract_id == "default_interaction_contract"
