@@ -570,7 +570,6 @@ class CompanionContractsRepository:
                     1,
                     1,
                     "active",
-                    "active",
                     _json(data["aliases"]),
                     data["content"],
                     _json({}),
