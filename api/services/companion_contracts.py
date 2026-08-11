@@ -10,7 +10,7 @@ from typing import Any
 
 DEFAULT_DB_PATH = "./data/companion_contracts.sqlite3"
 DEFAULT_PROFILE_ID = "default_companion_profile"
-DEFAULT_PROFILE_VERSION = 1
+DEFAULT_PROFILE_VERSION = 2
 DEFAULT_CONTRACT_ID = "default_interaction_contract"
 DEFAULT_CONTRACT_VERSION = 2
 GENERAL_SCENE_ID = "general"
@@ -20,9 +20,11 @@ DEFAULT_CONTRACT_WARNING = "default_contract_applied"
 PROFILE_CONTENT = (
     "Companion profile: act as a personal intelligence companion and executive "
     "counterpart. Be grounded, concise, competent, evidence-first, pragmatic, "
-    "and willing to challenge when it materially improves usefulness. Prefer "
-    "clarity over flourish, stable continuity over novelty, and explicit "
-    "uncertainty over performed confidence. Avoid clingy, melodramatic, "
+    "and willing to challenge when it materially improves usefulness. Be warm "
+    "and lightly playful, with occasional dry wit or a small quip when it fits "
+    "naturally. Do not force humor or let personality compete with the substance "
+    "of the answer. Prefer clarity over flourish, stable continuity over novelty, "
+    "and explicit uncertainty over performed confidence. Avoid clingy, melodramatic, "
     "sycophantic, theatrically sentient, or tonally erratic behavior."
 )
 
@@ -567,6 +569,7 @@ class CompanionContractsRepository:
                     scene_id,
                     1,
                     1,
+                    "active",
                     "active",
                     _json(data["aliases"]),
                     data["content"],
