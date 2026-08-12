@@ -4,7 +4,14 @@ import re
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 AttentionStatus = Literal["active", "paused", "resolved"]
 BoundedLabel = Annotated[str, Field(min_length=1, max_length=64)]
@@ -924,6 +931,104 @@ EvidenceShapeReasonCode = Literal[
     "ambiguous_interaction_without_shape_signal",
     "multiple_incompatible_shapes",
 ]
+SourceInventoryStatus = Literal["complete", "partial", "unknown", "unavailable"]
+SourceCapability = Literal["profile", "search", "fetch", "context"]
+SourceAvailability = Literal["available", "unavailable", "disabled", "unknown"]
+SourceAuthorityRole = Literal["authoritative", "supplemental", "unknown"]
+SourceMatchStatus = Literal[
+    "matched",
+    "no_match",
+    "ambiguous",
+    "inventory_unavailable",
+]
+SourceMatchReasonCode = Literal[
+    "source_id_match",
+    "display_name_match",
+    "domain_tag_match",
+    "scope_reference_match",
+    "multiple_explicit_source_matches",
+    "multiple_possible_source_matches",
+    "no_source_specific_match",
+    "generic_source_signal_rejected",
+    "inventory_partial",
+    "inventory_unknown",
+    "inventory_unavailable",
+]
+
+
+class SourceDiscoveryScopeReferences(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    time: EvidenceSufficiencyIdentifier | None = None
+    version: EvidenceSufficiencyIdentifier | None = None
+    domain: EvidenceSufficiencyIdentifier | None = None
+    project: EvidenceSufficiencyIdentifier | None = None
+
+    @model_validator(mode="after")
+    def validate_supplied_values(self) -> SourceDiscoveryScopeReferences:
+        if not self.model_fields_set:
+            raise ValueError("source_discovery_scope_refs_empty")
+        if any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("source_discovery_scope_ref_null")
+        return self
+
+
+class SourceDiscoveryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: EvidenceSufficiencyIdentifier
+    display_name: Annotated[str, Field(min_length=1, max_length=240)]
+    connector: EvidenceSufficiencyIdentifier
+    domain_tags: list[EvidenceSufficiencyIdentifier] = Field(max_length=8)
+    scope_refs: SourceDiscoveryScopeReferences | None = None
+    capabilities: list[SourceCapability] = Field(max_length=4)
+    availability: SourceAvailability
+    authority_role: SourceAuthorityRole
+
+    @model_validator(mode="after")
+    def validate_unique_values(self) -> SourceDiscoveryEntry:
+        if len(set(self.domain_tags)) != len(self.domain_tags):
+            raise ValueError("duplicate_source_discovery_domain_tag")
+        if len(set(self.capabilities)) != len(self.capabilities):
+            raise ValueError("duplicate_source_discovery_capability")
+        if "scope_refs" in self.model_fields_set and self.scope_refs is None:
+            raise ValueError("source_discovery_scope_refs_null")
+        return self
+
+
+class SourceDiscoveryContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inventory_status: SourceInventoryStatus
+    sources: list[SourceDiscoveryEntry] = Field(max_length=32)
+
+    @model_validator(mode="after")
+    def validate_unique_sources(self) -> SourceDiscoveryContext:
+        source_ids = [source.source_id for source in self.sources]
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("duplicate_source_discovery_source_id")
+        return self
+
+
+class SourceMatchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: SourceMatchStatus
+    matched_source_ids: list[EvidenceSufficiencyIdentifier] = Field(max_length=32)
+    reason_codes: list[SourceMatchReasonCode] = Field(min_length=1, max_length=11)
+
+    @model_validator(mode="after")
+    def validate_match_outcome(self) -> SourceMatchResult:
+        if self.matched_source_ids != sorted(set(self.matched_source_ids)):
+            raise ValueError("source_match_ids_not_sorted_unique")
+        if len(set(self.reason_codes)) != len(self.reason_codes):
+            raise ValueError("duplicate_source_match_reason_code")
+        if self.status == "matched":
+            if not self.matched_source_ids:
+                raise ValueError("matched_source_id_required")
+        elif self.matched_source_ids:
+            raise ValueError("matched_source_ids_not_allowed")
+        return self
 
 
 class EvidenceShapeContext(BaseModel):
@@ -935,6 +1040,7 @@ class EvidenceShapeContext(BaseModel):
     high_stakes_accuracy_required: bool
     continuation_of_prior_evidence_task: bool
     prior_task_shape: EvidenceTaskShape | None = None
+    source_discovery: SourceDiscoveryContext | None = None
 
     @model_validator(mode="after")
     def validate_continuation_context(self) -> EvidenceShapeContext:
@@ -984,6 +1090,14 @@ class EvidenceShapeResult(BaseModel):
     clarification_required: bool
     reason_codes: list[EvidenceShapeReasonCode] = Field(max_length=17)
     user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+    source_match: SourceMatchResult | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_source_match(self, handler):
+        serialized = handler(self)
+        if self.source_match is None:
+            serialized.pop("source_match", None)
+        return serialized
 
     @model_validator(mode="after")
     def validate_derivation_outcome(self) -> EvidenceShapeResult:

@@ -42,8 +42,9 @@ def _context(
     high_stakes_accuracy_required: bool = False,
     continuation_of_prior_evidence_task: bool = False,
     prior_task_shape: str | None = None,
+    source_discovery: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    context: dict[str, object] = {
         "evidence_input_kinds": evidence_input_kinds or [],
         "external_verification_required": external_verification_required,
         "freshness_sensitive": freshness_sensitive,
@@ -51,6 +52,41 @@ def _context(
         "continuation_of_prior_evidence_task": continuation_of_prior_evidence_task,
         "prior_task_shape": prior_task_shape,
     }
+    if source_discovery is not None:
+        context["source_discovery"] = source_discovery
+    return context
+
+
+def _discovery_source(
+    source_id: str,
+    display_name: str,
+    *,
+    connector: str = "google_sheets",
+    domain_tags: list[str] | None = None,
+    scope_refs: dict[str, str] | None = None,
+    capabilities: list[str] | None = None,
+    availability: str = "available",
+    authority_role: str = "authoritative",
+) -> dict[str, object]:
+    source: dict[str, object] = {
+        "source_id": source_id,
+        "display_name": display_name,
+        "connector": connector,
+        "domain_tags": domain_tags or [],
+        "capabilities": capabilities or ["search", "fetch"],
+        "availability": availability,
+        "authority_role": authority_role,
+    }
+    if scope_refs is not None:
+        source["scope_refs"] = scope_refs
+    return source
+
+
+def _discovery(
+    *sources: dict[str, object],
+    inventory_status: str = "complete",
+) -> dict[str, object]:
+    return {"inventory_status": inventory_status, "sources": list(sources)}
 
 
 def _derive(
@@ -1012,3 +1048,409 @@ def test_runtime_event_is_exact_private_and_consistent_with_the_result():
         "exception",
     ):
         assert excluded not in serialized
+
+
+def test_legacy_response_and_event_omit_source_match_entirely():
+    runtime = _start_runtime()
+    response = _derive(runtime, task_text="How are you today?")
+
+    assert response.status_code == 200
+    serialized = response.text
+    assert "source_match" not in response.json()["result"]
+    assert '"source_match":null' not in serialized
+    assert "source_match_status" not in _shape_events(
+        runtime["runtime_session_id"]
+    )[0]["event_payload_json"]
+
+
+def test_natural_display_name_match_makes_ordinary_question_targeted():
+    discovery = _discovery(
+        _discovery_source(
+            "trail_vehicle_primary",
+            "Trail Vehicle Primary",
+            domain_tags=["vehicle", "fuel_economy"],
+        ),
+        _discovery_source(
+            "household_calendar",
+            "Household Calendar",
+            connector="ics_calendar",
+            domain_tags=["household"],
+        ),
+        _discovery_source(
+            "work_schedule",
+            "Work Schedule",
+            connector="ics_calendar",
+            domain_tags=["work"],
+        ),
+    )
+    result = _derive(
+        _start_runtime(),
+        task_text="What was the median fuel economy for Trail Vehicle Primary?",
+        task_context=_context(source_discovery=discovery),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == [
+        "trail_vehicle_primary"
+    ]
+    assert result["task_shape"] == "targeted_lookup"
+    assert result["evidence_scope_material"] is True
+    assert "source_context_present" in result["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    ("task_text", "source", "expected_reason"),
+    [
+        (
+            "Use north-hub for this question.",
+            _discovery_source("north_hub", "Northern Archive"),
+            "source_id_match",
+        ),
+        (
+            "What is the total for Alpine Metrics?",
+            _discovery_source("metric_primary", "Alpine Metrics"),
+            "display_name_match",
+        ),
+        (
+            "What is the current nutrition total?",
+            _discovery_source(
+                "meal_summary", "Meal Summary", domain_tags=["nutrition"]
+            ),
+            "domain_tag_match",
+        ),
+        (
+            "What changed in release 2026?",
+            _discovery_source(
+                "release_notes",
+                "Release Notes",
+                scope_refs={"version": "release_2026"},
+            ),
+            "scope_reference_match",
+        ),
+    ],
+)
+def test_each_source_specific_metadata_field_can_establish_identity(
+    task_text: str,
+    source: dict[str, object],
+    expected_reason: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        task_context=_context(source_discovery=_discovery(source)),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == [source["source_id"]]
+    assert expected_reason in result["source_match"]["reason_codes"]
+
+
+def test_multiple_distinct_sources_match_in_sorted_order_and_preserve_shape():
+    sources = (
+        _discovery_source("harbor_metrics", "Harbor Metrics"),
+        _discovery_source("alpine_metrics", "Alpine Metrics"),
+        _discovery_source("forest_notes", "Forest Notes"),
+    )
+    result = _derive(
+        _start_runtime(),
+        task_text="Compare Harbor Metrics with Alpine Metrics.",
+        task_context=_context(source_discovery=_discovery(*sources)),
+    ).json()["result"]
+
+    assert result["task_shape"] == "cross_source_comparison"
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == [
+        "alpine_metrics",
+        "harbor_metrics",
+    ]
+    assert "multiple_explicit_source_matches" in result["source_match"][
+        "reason_codes"
+    ]
+
+
+def test_shared_weak_metadata_is_ambiguous_without_order_fallback():
+    first = _discovery_source(
+        "east_operations", "East Archive", domain_tags=["operations"]
+    )
+    second = _discovery_source(
+        "west_operations", "West Archive", domain_tags=["operations"]
+    )
+    outcomes = []
+    for sources in ((first, second), (second, first)):
+        outcomes.append(
+            _derive(
+                _start_runtime(),
+                task_text="What is the operations total?",
+                task_context=_context(source_discovery=_discovery(*sources)),
+            ).json()["result"]
+        )
+
+    assert all(item["source_match"]["status"] == "ambiguous" for item in outcomes)
+    assert all(item["source_match"]["matched_source_ids"] == [] for item in outcomes)
+    assert outcomes[0]["source_match"] == outcomes[1]["source_match"]
+    assert all(item["task_shape"] == "targeted_lookup" for item in outcomes)
+
+
+@pytest.mark.parametrize(
+    "task_text",
+    ["Look in the Google Sheet.", "Look in the calendar source."],
+)
+def test_generic_source_type_alone_never_selects_a_source(task_text: str):
+    discovery = _discovery(
+        _discovery_source("alpha_metrics", "Alpha Metrics"),
+        _discovery_source("beta_metrics", "Beta Metrics"),
+        _discovery_source(
+            "team_schedule", "Team Schedule", connector="ics_calendar"
+        ),
+    )
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        task_context=_context(source_discovery=discovery),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "no_match"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "generic_source_signal_rejected" in result["source_match"][
+        "reason_codes"
+    ]
+    _assert_not_applicable(result)
+
+
+def test_complete_inventory_no_match_does_not_make_chat_evidence_material():
+    result = _derive(
+        _start_runtime(),
+        task_text="How are you today?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("alpine_metrics", "Alpine Metrics")
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "no_match",
+        "matched_source_ids": [],
+        "reason_codes": ["no_source_specific_match"],
+    }
+    _assert_not_applicable(result)
+
+
+def test_partial_inventory_positive_matches_and_negative_is_unavailable():
+    source = _discovery_source("alpine_metrics", "Alpine Metrics")
+    positive = _derive(
+        _start_runtime(),
+        task_text="What is the Alpine Metrics total?",
+        task_context=_context(
+            source_discovery=_discovery(source, inventory_status="partial")
+        ),
+    ).json()["result"]
+    negative = _derive(
+        _start_runtime(),
+        task_text="How are you today?",
+        task_context=_context(
+            source_discovery=_discovery(source, inventory_status="partial")
+        ),
+    ).json()["result"]
+
+    assert positive["source_match"]["status"] == "matched"
+    assert positive["source_match"]["matched_source_ids"] == ["alpine_metrics"]
+    assert "inventory_partial" in positive["source_match"]["reason_codes"]
+    assert negative["source_match"]["status"] == "inventory_unavailable"
+    assert negative["source_match"]["matched_source_ids"] == []
+    assert "inventory_partial" in negative["source_match"]["reason_codes"]
+    _assert_not_applicable(negative)
+
+
+@pytest.mark.parametrize(
+    ("inventory_status", "reason"),
+    [("unknown", "inventory_unknown"), ("unavailable", "inventory_unavailable")],
+)
+def test_incomplete_inventory_cannot_establish_identity(
+    inventory_status: str,
+    reason: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="What is the Alpine Metrics total?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("alpine_metrics", "Alpine Metrics"),
+                inventory_status=inventory_status,
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "inventory_unavailable",
+        "matched_source_ids": [],
+        "reason_codes": [reason],
+    }
+
+
+@pytest.mark.parametrize("availability", ["unavailable", "disabled", "unknown"])
+def test_source_availability_does_not_redirect_identity(availability: str):
+    result = _derive(
+        _start_runtime(),
+        task_text="What is the Alpine Metrics total?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "alpine_metrics", "Alpine Metrics", availability=availability
+                ),
+                _discovery_source("harbor_metrics", "Harbor Metrics"),
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["alpine_metrics"]
+
+
+def _invalid_discovery_case(case: str) -> dict[str, object]:
+    source = _discovery_source("bounded_source", "Bounded Source")
+    discovery = _discovery(source)
+    if case == "too_many_sources":
+        discovery["sources"] = [
+            _discovery_source(f"source_{index}", f"Source {index}")
+            for index in range(33)
+        ]
+    elif case == "duplicate_source_ids":
+        discovery["sources"] = [source, dict(source)]
+    elif case == "overlong_source_id":
+        source["source_id"] = "s" * 121
+    elif case == "overlong_display_name":
+        source["display_name"] = "d" * 241
+    elif case == "invalid_domain_tag":
+        source["domain_tags"] = ["invalid tag"]
+    elif case == "too_many_domain_tags":
+        source["domain_tags"] = [f"tag_{index}" for index in range(9)]
+    elif case == "duplicate_domain_tags":
+        source["domain_tags"] = ["shared", "shared"]
+    elif case == "unsupported_capability":
+        source["capabilities"] = ["delete"]
+    elif case == "duplicate_capability":
+        source["capabilities"] = ["search", "search"]
+    elif case == "extra_discovery_field":
+        discovery["metadata"] = "rejected"
+    elif case == "extra_source_field":
+        source["description"] = "rejected"
+    elif case == "extra_scope_field":
+        source["scope_refs"] = {"tenant": "rejected"}
+    elif case == "invalid_scope_ref":
+        source["scope_refs"] = {"project": "invalid ref"}
+    elif case == "empty_scope_refs":
+        source["scope_refs"] = {}
+    else:
+        raise AssertionError(case)
+    return discovery
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "too_many_sources",
+        "duplicate_source_ids",
+        "overlong_source_id",
+        "overlong_display_name",
+        "invalid_domain_tag",
+        "too_many_domain_tags",
+        "duplicate_domain_tags",
+        "unsupported_capability",
+        "duplicate_capability",
+        "extra_discovery_field",
+        "extra_source_field",
+        "extra_scope_field",
+        "invalid_scope_ref",
+        "empty_scope_refs",
+    ],
+)
+def test_source_discovery_contract_rejects_unbounded_or_malformed_input(case: str):
+    response = _derive(
+        _start_runtime(),
+        task_context=_context(source_discovery=_invalid_discovery_case(case)),
+    )
+
+    assert response.status_code == 422
+
+
+def test_discovery_inventory_order_is_canonical_for_result_and_identity():
+    runtime = _start_runtime()
+    first_source = _discovery_source(
+        "alpine_metrics",
+        "Alpine Metrics",
+        domain_tags=["fuel_economy", "vehicle"],
+        capabilities=["fetch", "search"],
+        scope_refs={"project": "ridge_project", "version": "release_2026"},
+    )
+    second_source = _discovery_source(
+        "harbor_metrics",
+        "Harbor Metrics",
+        domain_tags=["maritime", "finance"],
+        capabilities=["context", "profile"],
+    )
+    reversed_first = {
+        **first_source,
+        "domain_tags": list(reversed(first_source["domain_tags"])),
+        "capabilities": list(reversed(first_source["capabilities"])),
+    }
+    reversed_second = {
+        **second_source,
+        "domain_tags": list(reversed(second_source["domain_tags"])),
+        "capabilities": list(reversed(second_source["capabilities"])),
+    }
+    first = _derive(
+        runtime,
+        task_text="What is the Alpine Metrics total?",
+        task_context=_context(
+            source_discovery=_discovery(first_source, second_source)
+        ),
+    ).json()["result"]
+    second = _derive(
+        runtime,
+        task_text="What is the Alpine Metrics total?",
+        task_context=_context(
+            source_discovery=_discovery(reversed_second, reversed_first)
+        ),
+    ).json()["result"]
+
+    assert first["source_match"] == second["source_match"]
+    assert first["derivation_id"] == second["derivation_id"]
+
+
+def test_source_discovery_event_contains_only_bounded_structural_facts():
+    runtime = _start_runtime()
+    result = _derive(
+        runtime,
+        task_text="PRIVATE_TASK_SENTINEL Alpine Metrics",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "alpine_metrics",
+                    "PRIVATE_DISPLAY_SENTINEL Alpine Metrics",
+                    domain_tags=["PRIVATE_TAG_SENTINEL"],
+                    scope_refs={"project": "PRIVATE_SCOPE_SENTINEL"},
+                )
+            )
+        ),
+    ).json()["result"]
+    payload = _shape_events(runtime["runtime_session_id"])[0]["event_payload_json"]
+
+    assert payload["source_match_status"] == "matched"
+    assert payload["matched_source_ids"] == result["source_match"][
+        "matched_source_ids"
+    ]
+    assert payload["source_match_reason_codes"] == result["source_match"][
+        "reason_codes"
+    ]
+    assert payload["configured_inventory_status"] == "complete"
+    assert payload["configured_source_count"] == 1
+    serialized = json.dumps(payload, sort_keys=True).lower()
+    for sentinel in (
+        "private_task_sentinel",
+        "private_display_sentinel",
+        "private_tag_sentinel",
+        "private_scope_sentinel",
+        "google_sheets",
+    ):
+        assert sentinel not in serialized

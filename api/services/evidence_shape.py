@@ -11,6 +11,8 @@ from models import (
     EvidenceShapeReasonCode,
     EvidenceShapeResult,
     EvidenceTaskShape,
+    SourceDiscoveryEntry,
+    SourceMatchResult,
 )
 from services.runtime_state import (
     record_runtime_event,
@@ -144,6 +146,47 @@ _PERFORMED_VALIDATION_QUESTION = re.compile(
     re.IGNORECASE,
 )
 
+_IDENTITY_TOKEN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_IDENTITY_NOISE = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "look",
+        "my",
+        "of",
+        "on",
+        "or",
+        "our",
+        "the",
+        "to",
+        "with",
+    }
+)
+_GENERIC_SOURCE_TOKENS = frozenset(
+    {
+        "calendar",
+        "data",
+        "google",
+        "ics",
+        "log",
+        "logs",
+        "record",
+        "records",
+        "sheet",
+        "sheets",
+        "source",
+        "sources",
+        "spreadsheet",
+    }
+)
+
 _SPECIALIZED_REASON: dict[EvidenceTaskShape, EvidenceShapeReasonCode] = {
     "bounded_exhaustive_review": "exhaustive_scope_requested",
     "cross_source_comparison": "comparison_requested",
@@ -166,6 +209,155 @@ _COMPATIBLE_COMBINATIONS: dict[frozenset[EvidenceTaskShape], EvidenceTaskShape] 
         "absence_or_coverage_check"
     ),
 }
+
+
+def _normalized_tokens(value: str) -> tuple[str, ...]:
+    return tuple(token.lower() for token in _IDENTITY_TOKEN.findall(value))
+
+
+def _specific_tokens(value: str) -> set[str]:
+    return set(_normalized_tokens(value)) - _IDENTITY_NOISE - _GENERIC_SOURCE_TOKENS
+
+
+def _contains_token_sequence(
+    task_tokens: tuple[str, ...],
+    candidate_tokens: tuple[str, ...],
+) -> bool:
+    if not candidate_tokens or len(candidate_tokens) > len(task_tokens):
+        return False
+    width = len(candidate_tokens)
+    return any(
+        task_tokens[index : index + width] == candidate_tokens
+        for index in range(len(task_tokens) - width + 1)
+    )
+
+
+def _source_identity_fields(source: SourceDiscoveryEntry) -> dict[str, set[str]]:
+    scope_values = (
+        []
+        if source.scope_refs is None
+        else [
+            value
+            for field in ("time", "version", "domain", "project")
+            if (value := getattr(source.scope_refs, field)) is not None
+        ]
+    )
+    return {
+        "source_id_match": _specific_tokens(source.source_id),
+        "display_name_match": _specific_tokens(source.display_name),
+        "domain_tag_match": set().union(
+            *(_specific_tokens(value) for value in source.domain_tags),
+            set(),
+        ),
+        "scope_reference_match": set().union(
+            *(_specific_tokens(value) for value in scope_values),
+            set(),
+        ),
+    }
+
+
+def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult | None:
+    discovery = body.task_context.source_discovery
+    if discovery is None:
+        return None
+    if discovery.inventory_status == "unknown":
+        return SourceMatchResult(
+            status="inventory_unavailable",
+            matched_source_ids=[],
+            reason_codes=["inventory_unknown"],
+        )
+    if discovery.inventory_status == "unavailable":
+        return SourceMatchResult(
+            status="inventory_unavailable",
+            matched_source_ids=[],
+            reason_codes=["inventory_unavailable"],
+        )
+
+    task_tokens = _normalized_tokens(body.task_text)
+    task_specific = set(task_tokens) - _IDENTITY_NOISE - _GENERIC_SOURCE_TOKENS
+    sources = sorted(discovery.sources, key=lambda source: source.source_id)
+    fields_by_source = {
+        source.source_id: _source_identity_fields(source) for source in sources
+    }
+    token_sources: dict[str, set[str]] = {}
+    for source_id, fields in fields_by_source.items():
+        for token in set().union(*fields.values(), set()):
+            token_sources.setdefault(token, set()).add(source_id)
+
+    candidates: list[dict[str, object]] = []
+    for source in sources:
+        fields = fields_by_source[source.source_id]
+        matched_by_field = {
+            reason: tokens & task_specific
+            for reason, tokens in fields.items()
+            if tokens & task_specific
+        }
+        matched_tokens = set().union(*matched_by_field.values(), set())
+        exact_source_id = bool(fields["source_id_match"]) and _contains_token_sequence(
+            task_tokens,
+            _normalized_tokens(source.source_id),
+        )
+        exact_display_name = bool(fields["display_name_match"]) and (
+            _contains_token_sequence(task_tokens, _normalized_tokens(source.display_name))
+        )
+        unique_match = any(
+            len(token_sources[token]) == 1 for token in matched_tokens
+        )
+        exact_match = exact_source_id or exact_display_name
+        strong = exact_match or unique_match or len(matched_tokens) >= 2
+        if matched_tokens:
+            candidates.append(
+                {
+                    "source_id": source.source_id,
+                    "strong": strong,
+                    "distinct": exact_match or unique_match,
+                    "reasons": set(matched_by_field),
+                }
+            )
+
+    strong_candidates = [candidate for candidate in candidates if candidate["strong"]]
+    reasons: set[str] = set()
+    status = "no_match"
+    matched_source_ids: list[str] = []
+    if len(strong_candidates) == 1:
+        status = "matched"
+        matched_source_ids = [str(strong_candidates[0]["source_id"])]
+        reasons.update(strong_candidates[0]["reasons"])
+    elif len(strong_candidates) > 1:
+        if all(candidate["distinct"] for candidate in strong_candidates):
+            status = "matched"
+            matched_source_ids = sorted(
+                str(candidate["source_id"]) for candidate in strong_candidates
+            )
+            reasons.add("multiple_explicit_source_matches")
+            for candidate in strong_candidates:
+                reasons.update(candidate["reasons"])
+        else:
+            status = "ambiguous"
+            reasons.add("multiple_possible_source_matches")
+    elif len(candidates) > 1:
+        status = "ambiguous"
+        reasons.add("multiple_possible_source_matches")
+    else:
+        reasons.add("no_source_specific_match")
+        connector_tokens = set().union(
+            *(_normalized_tokens(source.connector) for source in sources),
+            set(),
+        )
+        if (set(task_tokens) & _GENERIC_SOURCE_TOKENS) or (
+            set(task_tokens) & connector_tokens
+        ):
+            reasons.add("generic_source_signal_rejected")
+
+    if discovery.inventory_status == "partial":
+        reasons.add("inventory_partial")
+        if status == "no_match":
+            status = "inventory_unavailable"
+    return SourceMatchResult(
+        status=status,
+        matched_source_ids=matched_source_ids,
+        reason_codes=sorted(reasons),
+    )
 
 
 def _explicit_evidence_language(
@@ -296,6 +488,16 @@ def _derivation_identity(
 ) -> str:
     context = body.task_context.model_dump(mode="json")
     context["evidence_input_kinds"] = sorted(context["evidence_input_kinds"])
+    discovery = context.get("source_discovery")
+    if discovery is None:
+        context.pop("source_discovery", None)
+    else:
+        for source in discovery["sources"]:
+            source["domain_tags"] = sorted(source["domain_tags"])
+            source["capabilities"] = sorted(source["capabilities"])
+        discovery["sources"] = sorted(
+            discovery["sources"], key=lambda source: source["source_id"]
+        )
     material = {
         "request_id": body.request_id,
         "owner_id": body.owner_id,
@@ -324,6 +526,7 @@ def _build_result(
     task_shape: EvidenceTaskShape | None,
     candidates: list[EvidenceTaskShape],
     reasons: set[EvidenceShapeReasonCode],
+    source_match: SourceMatchResult | None,
 ) -> EvidenceShapeResult:
     sorted_candidates = sorted(set(candidates))
     sorted_reasons = sorted(reasons)
@@ -350,10 +553,16 @@ def _build_result(
         clarification_required=clarification,
         reason_codes=sorted_reasons,
         user_safe_summary=_safe_summary(status),
+        source_match=source_match,
     )
 
 
 def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
+    source_match = _derive_source_match(body)
+    source_context_material = source_match is not None and source_match.status in {
+        "matched",
+        "ambiguous",
+    }
     specialized = _specialized_shapes(body.task_text)
     explicit_evidence = _explicit_evidence_language(
         body.task_text,
@@ -367,6 +576,8 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         explicit_evidence=explicit_evidence,
         verification_dependent=verification_dependent,
     )
+    if source_context_material:
+        reasons.add("source_context_present")
     context_material = bool(
         context.evidence_input_kinds
         or context.external_verification_required
@@ -374,12 +585,18 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         or context.high_stakes_accuracy_required
         or context.continuation_of_prior_evidence_task
     )
-    evidence_material = context_material or distinct_evidence_request
+    evidence_material = (
+        context_material or distinct_evidence_request or source_context_material
+    )
     non_evidence_interaction = body.interaction_kind in {
         "joke_or_playful",
         "vent_or_expression",
     }
-    if non_evidence_interaction and not distinct_evidence_request:
+    if (
+        non_evidence_interaction
+        and not distinct_evidence_request
+        and not source_context_material
+    ):
         evidence_material = False
         reasons.clear()
 
@@ -393,6 +610,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
             task_shape=None,
             candidates=[],
             reasons=reasons,
+            source_match=source_match,
         )
 
     for shape in specialized:
@@ -409,6 +627,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
                 task_shape=None,
                 candidates=candidates,
                 reasons=reasons,
+                source_match=source_match,
             )
         selected = compatible
     elif len(specialized) == 1:
@@ -416,7 +635,11 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
     elif context.continuation_of_prior_evidence_task:
         selected = context.prior_task_shape
         reasons.add("prior_shape_inherited")
-    elif body.interaction_kind == "ambiguous" and not distinct_evidence_request:
+    elif (
+        body.interaction_kind == "ambiguous"
+        and not distinct_evidence_request
+        and not source_context_material
+    ):
         reasons.add("ambiguous_interaction_without_shape_signal")
         return _build_result(
             body,
@@ -424,8 +647,13 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
             task_shape=None,
             candidates=[],
             reasons=reasons,
+            source_match=source_match,
         )
-    elif body.interaction_kind == "brainstorm" and not distinct_evidence_request:
+    elif (
+        body.interaction_kind == "brainstorm"
+        and not distinct_evidence_request
+        and not source_context_material
+    ):
         reasons.add("ambiguous_interaction_without_shape_signal")
         return _build_result(
             body,
@@ -433,6 +661,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
             task_shape=None,
             candidates=[],
             reasons=reasons,
+            source_match=source_match,
         )
     else:
         selected = "targeted_lookup"
@@ -444,6 +673,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         task_shape=selected,
         candidates=[selected],
         reasons=reasons,
+        source_match=source_match,
     )
 
 
@@ -465,28 +695,46 @@ def derive_evidence_shape(
     )
 
     result = _derive_result(body)
+    event_payload = {
+        "request_id": body.request_id,
+        "runtime_session_id": body.runtime_session_id,
+        "runtime_turn_id": body.runtime_turn_id,
+        "derivation_id": result.derivation_id,
+        "question_anchor_digest": result.question_anchor_digest,
+        "interaction_kind": body.interaction_kind,
+        "derivation_status": result.derivation_status,
+        "task_shape": result.task_shape,
+        "candidate_task_shapes": result.candidate_task_shapes,
+        "evidence_scope_material": result.evidence_scope_material,
+        "clarification_required": result.clarification_required,
+        "evidence_input_count": len(body.task_context.evidence_input_kinds),
+        "continuation_of_prior_evidence_task": (
+            body.task_context.continuation_of_prior_evidence_task
+        ),
+        "reason_codes": result.reason_codes,
+    }
+    if body.task_context.source_discovery is not None:
+        event_payload.update(
+            {
+                "source_match_status": result.source_match.status,
+                "source_match_reason_codes": result.source_match.reason_codes,
+                "configured_inventory_status": (
+                    body.task_context.source_discovery.inventory_status
+                ),
+                "configured_source_count": len(
+                    body.task_context.source_discovery.sources
+                ),
+            }
+        )
+        if result.source_match.status == "matched":
+            event_payload["matched_source_ids"] = (
+                result.source_match.matched_source_ids
+            )
     record_runtime_event(
         runtime_session_id=body.runtime_session_id,
         runtime_turn_id=body.runtime_turn_id,
         event_type="evidence_shape_derived",
-        event_payload_json={
-            "request_id": body.request_id,
-            "runtime_session_id": body.runtime_session_id,
-            "runtime_turn_id": body.runtime_turn_id,
-            "derivation_id": result.derivation_id,
-            "question_anchor_digest": result.question_anchor_digest,
-            "interaction_kind": body.interaction_kind,
-            "derivation_status": result.derivation_status,
-            "task_shape": result.task_shape,
-            "candidate_task_shapes": result.candidate_task_shapes,
-            "evidence_scope_material": result.evidence_scope_material,
-            "clarification_required": result.clarification_required,
-            "evidence_input_count": len(body.task_context.evidence_input_kinds),
-            "continuation_of_prior_evidence_task": (
-                body.task_context.continuation_of_prior_evidence_task
-            ),
-            "reason_codes": result.reason_codes,
-        },
+        event_payload_json=event_payload,
     )
     return EvidenceShapeDeriveResponse(
         request_id=body.request_id,
