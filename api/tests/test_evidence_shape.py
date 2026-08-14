@@ -89,6 +89,32 @@ def _discovery(
     return {"inventory_status": inventory_status, "sources": list(sources)}
 
 
+def _source_kind_topology() -> tuple[dict[str, object], ...]:
+    return (
+        _discovery_source(
+            "maintenance_log_primary",
+            "Maintenance Log - Primary",
+            domain_tags=["vehicle", "maintenance"],
+            scope_refs={"domain": "vehicle-maintenance", "project": "trail-unit"},
+        ),
+        _discovery_source(
+            "scheduled_actions_trail_unit",
+            "Scheduled Actions - Trail Unit",
+            domain_tags=["vehicle", "maintenance"],
+            scope_refs={"domain": "vehicle-maintenance", "project": "trail-unit"},
+        ),
+        _discovery_source(
+            "maintenance_log_electric",
+            "Maintenance Log - Electric",
+            domain_tags=["vehicle", "maintenance"],
+            scope_refs={
+                "domain": "vehicle-maintenance",
+                "project": "electric-platform",
+            },
+        ),
+    )
+
+
 def _derive(
     runtime: dict[str, object],
     *,
@@ -1168,6 +1194,170 @@ def test_multiple_distinct_sources_match_in_sorted_order_and_preserve_shape():
     ]
 
 
+def test_source_kind_disambiguates_only_already_strong_candidates():
+    outcomes = []
+    sources = _source_kind_topology()
+    for ordered_sources in (sources, tuple(reversed(sources))):
+        outcomes.append(
+            _derive(
+                _start_runtime(),
+                task_text=(
+                    "What is the most recent entry in my vehicle log for Trail Unit?"
+                ),
+                task_context=_context(
+                    source_discovery=_discovery(*ordered_sources)
+                ),
+            ).json()["result"]
+        )
+
+    for result in outcomes:
+        assert result["source_match"]["status"] == "matched"
+        assert result["source_match"]["matched_source_ids"] == [
+            "maintenance_log_primary"
+        ]
+        assert "scheduled_actions_trail_unit" not in result["source_match"][
+            "matched_source_ids"
+        ]
+        assert "maintenance_log_electric" not in result["source_match"][
+            "matched_source_ids"
+        ]
+        assert result["task_shape"] == "targeted_lookup"
+        assert result["evidence_scope_material"] is True
+    assert outcomes[0]["source_match"] == outcomes[1]["source_match"]
+
+
+def test_source_kind_does_not_narrow_intentional_multiple_source_match():
+    result = _derive(
+        _start_runtime(),
+        task_text="Compare Harbor Activity Log with Alpine Metrics.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("harbor_activity_log", "Harbor Activity Log"),
+                _discovery_source("alpine_metrics", "Alpine Metrics"),
+                _discovery_source("forest_notes", "Forest Notes"),
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == [
+        "alpine_metrics",
+        "harbor_activity_log",
+    ]
+    assert "multiple_explicit_source_matches" in result["source_match"][
+        "reason_codes"
+    ]
+
+
+def test_calendar_kind_disambiguates_already_strong_project_candidates():
+    result = _derive(
+        _start_runtime(),
+        task_text="What is scheduled for Harbor Project on the calendar?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "harbor_calendar",
+                    "Harbor Calendar",
+                    connector="ics_calendar",
+                    domain_tags=["planning"],
+                    scope_refs={"project": "harbor-project"},
+                ),
+                _discovery_source(
+                    "harbor_actions",
+                    "Harbor Actions",
+                    domain_tags=["planning"],
+                    scope_refs={"project": "harbor-project"},
+                ),
+                _discovery_source(
+                    "electric_calendar",
+                    "Electric Calendar",
+                    connector="ics_calendar",
+                    domain_tags=["planning"],
+                    scope_refs={"project": "electric-platform"},
+                ),
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["harbor_calendar"]
+
+
+def test_same_kind_strong_candidates_remain_ambiguous_without_order_fallback():
+    first = _discovery_source(
+        "harbor_activity_log",
+        "Harbor Activity Log",
+        scope_refs={"project": "harbor-project"},
+    )
+    second = _discovery_source(
+        "harbor_maintenance_log",
+        "Harbor Maintenance Log",
+        scope_refs={"project": "harbor-project"},
+    )
+    outcomes = [
+        _derive(
+            _start_runtime(),
+            task_text="What is the latest log entry for Harbor Project?",
+            task_context=_context(source_discovery=_discovery(*sources)),
+        ).json()["result"]
+        for sources in ((first, second), (second, first))
+    ]
+
+    assert all(item["source_match"]["status"] == "ambiguous" for item in outcomes)
+    assert all(item["source_match"]["matched_source_ids"] == [] for item in outcomes)
+    assert outcomes[0]["source_match"] == outcomes[1]["source_match"]
+
+
+def test_transport_terms_do_not_break_strong_source_ambiguity():
+    result = _derive(
+        _start_runtime(),
+        task_text="What is the latest Google Sheet entry for Harbor Project?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "harbor_primary",
+                    "Harbor Primary",
+                    connector="google_sheets",
+                    scope_refs={"project": "harbor-project"},
+                ),
+                _discovery_source(
+                    "harbor_secondary",
+                    "Harbor Secondary",
+                    connector="ics_calendar",
+                    scope_refs={"project": "harbor-project"},
+                ),
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+
+
+def test_source_kind_cannot_promote_weak_candidates():
+    result = _derive(
+        _start_runtime(),
+        task_text="What changed in the vehicle log?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "east_vehicle_log",
+                    "East Vehicle Log",
+                    domain_tags=["vehicle"],
+                ),
+                _discovery_source(
+                    "west_vehicle_log",
+                    "West Vehicle Log",
+                    domain_tags=["vehicle"],
+                ),
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+
+
 def test_shared_weak_metadata_is_ambiguous_without_order_fallback():
     first = _discovery_source(
         "east_operations", "East Archive", domain_tags=["operations"]
@@ -1193,12 +1383,16 @@ def test_shared_weak_metadata_is_ambiguous_without_order_fallback():
 
 @pytest.mark.parametrize(
     "task_text",
-    ["Look in the Google Sheet.", "Look in the calendar source."],
+    [
+        "Look in the Google Sheet.",
+        "Look in the calendar source.",
+        "Look in the log.",
+    ],
 )
 def test_generic_source_type_alone_never_selects_a_source(task_text: str):
     discovery = _discovery(
-        _discovery_source("alpha_metrics", "Alpha Metrics"),
-        _discovery_source("beta_metrics", "Beta Metrics"),
+        _discovery_source("alpha_record_log", "Alpha Record Log"),
+        _discovery_source("beta_record_log", "Beta Record Log"),
         _discovery_source(
             "team_schedule", "Team Schedule", connector="ics_calendar"
         ),

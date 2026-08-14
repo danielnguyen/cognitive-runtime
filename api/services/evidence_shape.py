@@ -186,6 +186,13 @@ _GENERIC_SOURCE_TOKENS = frozenset(
         "spreadsheet",
     }
 )
+_SOURCE_KIND_TOKENS = {
+    "calendar": "calendar",
+    "log": "log",
+    "logs": "log",
+    "record": "record",
+    "records": "record",
+}
 
 _SPECIALIZED_REASON: dict[EvidenceTaskShape, EvidenceShapeReasonCode] = {
     "bounded_exhaustive_review": "exhaustive_scope_requested",
@@ -217,6 +224,14 @@ def _normalized_tokens(value: str) -> tuple[str, ...]:
 
 def _specific_tokens(value: str) -> set[str]:
     return set(_normalized_tokens(value)) - _IDENTITY_NOISE - _GENERIC_SOURCE_TOKENS
+
+
+def _source_kind_tokens(value: str) -> set[str]:
+    return {
+        canonical
+        for token in _normalized_tokens(value)
+        if (canonical := _SOURCE_KIND_TOKENS.get(token)) is not None
+    }
 
 
 def _contains_token_sequence(
@@ -256,6 +271,12 @@ def _source_identity_fields(source: SourceDiscoveryEntry) -> dict[str, set[str]]
     }
 
 
+def _source_identity_kinds(source: SourceDiscoveryEntry) -> set[str]:
+    return _source_kind_tokens(source.source_id) | _source_kind_tokens(
+        source.display_name
+    )
+
+
 def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult | None:
     discovery = body.task_context.source_discovery
     if discovery is None:
@@ -275,6 +296,7 @@ def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult 
 
     task_tokens = _normalized_tokens(body.task_text)
     task_specific = set(task_tokens) - _IDENTITY_NOISE - _GENERIC_SOURCE_TOKENS
+    task_source_kinds = _source_kind_tokens(body.task_text)
     sources = sorted(discovery.sources, key=lambda source: source.source_id)
     fields_by_source = {
         source.source_id: _source_identity_fields(source) for source in sources
@@ -312,6 +334,7 @@ def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult 
                     "strong": strong,
                     "distinct": exact_match or unique_match,
                     "reasons": set(matched_by_field),
+                    "source_kinds": _source_identity_kinds(source),
                 }
             )
 
@@ -333,8 +356,18 @@ def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult 
             for candidate in strong_candidates:
                 reasons.update(candidate["reasons"])
         else:
-            status = "ambiguous"
-            reasons.add("multiple_possible_source_matches")
+            kind_matches = [
+                candidate
+                for candidate in strong_candidates
+                if candidate["source_kinds"] & task_source_kinds
+            ]
+            if len(kind_matches) == 1:
+                status = "matched"
+                matched_source_ids = [str(kind_matches[0]["source_id"])]
+                reasons.update(kind_matches[0]["reasons"])
+            else:
+                status = "ambiguous"
+                reasons.add("multiple_possible_source_matches")
     elif len(candidates) > 1:
         status = "ambiguous"
         reasons.add("multiple_possible_source_matches")
