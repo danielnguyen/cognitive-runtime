@@ -355,6 +355,9 @@ def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult 
             reasons.add("multiple_explicit_source_matches")
             for candidate in strong_candidates:
                 reasons.update(candidate["reasons"])
+        elif any(candidate["distinct"] for candidate in strong_candidates):
+            status = "ambiguous"
+            reasons.add("multiple_possible_source_matches")
         else:
             kind_matches = [
                 candidate

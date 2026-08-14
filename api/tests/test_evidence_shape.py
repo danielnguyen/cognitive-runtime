@@ -1226,6 +1226,89 @@ def test_source_kind_disambiguates_only_already_strong_candidates():
     assert outcomes[0]["source_match"] == outcomes[1]["source_match"]
 
 
+def test_source_kind_cannot_override_exact_display_name_identity():
+    sources = (
+        _discovery_source(
+            "harbor_metrics",
+            "Harbor Metrics",
+            domain_tags=["planning"],
+            scope_refs={"project": "harbor-project"},
+        ),
+        _discovery_source(
+            "harbor_calendar",
+            "Harbor Calendar",
+            domain_tags=["planning"],
+            scope_refs={"project": "harbor-project"},
+        ),
+    )
+    outcomes = [
+        _derive(
+            _start_runtime(),
+            task_text="What is in Harbor Metrics calendar for Harbor Project?",
+            task_context=_context(source_discovery=_discovery(*ordered_sources)),
+        ).json()["result"]
+        for ordered_sources in (sources, tuple(reversed(sources)))
+    ]
+
+    assert all(item["source_match"]["status"] == "ambiguous" for item in outcomes)
+    assert all(item["source_match"]["matched_source_ids"] == [] for item in outcomes)
+    assert outcomes[0]["source_match"] == outcomes[1]["source_match"]
+
+
+def test_source_kind_cannot_override_exact_source_id_identity():
+    result = _derive(
+        _start_runtime(),
+        task_text=(
+            "What is in harbor_metrics_archive record for Harbor Project?"
+        ),
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "harbor_metrics_archive",
+                    "Harbor Metrics Archive",
+                    domain_tags=["planning"],
+                    scope_refs={"project": "harbor-project"},
+                ),
+                _discovery_source(
+                    "harbor_record",
+                    "Harbor Record",
+                    domain_tags=["planning"],
+                    scope_refs={"project": "harbor-project"},
+                ),
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+
+
+def test_source_kind_cannot_override_inventory_unique_identity():
+    result = _derive(
+        _start_runtime(),
+        task_text="What metrics are in the calendar for Harbor Project?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "harbor_metrics",
+                    "Harbor Metrics",
+                    domain_tags=["planning"],
+                    scope_refs={"project": "harbor-project"},
+                ),
+                _discovery_source(
+                    "harbor_calendar",
+                    "Harbor Calendar",
+                    domain_tags=["planning"],
+                    scope_refs={"project": "harbor-project"},
+                ),
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+
+
 def test_source_kind_does_not_narrow_intentional_multiple_source_match():
     result = _derive(
         _start_runtime(),
