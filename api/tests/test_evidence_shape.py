@@ -2248,6 +2248,99 @@ def test_aggregate_operation_fails_closed_without_targeted_lookup_downgrade():
     assert "semantic_operation_unsupported" in result["reason_codes"]
 
 
+def _assert_aggregate_operation_blocked(result: dict[str, object]) -> None:
+    assert result["derivation_status"] == "ambiguous"
+    assert result["task_shape"] is None
+    assert result["candidate_task_shapes"] == []
+    assert result["evidence_scope_material"] is True
+    assert result["clarification_required"] is True
+    assert "semantic_operation_hint" in result["reason_codes"]
+    assert "semantic_operation_unsupported" in result["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    ("task_text", "blocked_shape_reason"),
+    [
+        (
+            "Compare the median values from the available registers.",
+            "comparison_requested",
+        ),
+        (
+            "Reconstruct the median history from the available values.",
+            "historical_reconstruction_requested",
+        ),
+        (
+            "What was not covered in the available values?",
+            "absence_scope_requested",
+        ),
+    ],
+)
+def test_aggregate_blocks_deterministic_specialized_shapes(
+    task_text: str,
+    blocked_shape_reason: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "aggregate", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    _assert_aggregate_operation_blocked(result)
+    assert blocked_shape_reason not in result["reason_codes"]
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+
+
+def test_aggregate_blocks_inherited_continuation_shape():
+    result = _derive(
+        _start_runtime(),
+        task_text="Continue calculating the median.",
+        task_context=_context(
+            continuation_of_prior_evidence_task=True,
+            prior_task_shape="targeted_lookup",
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register")
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "aggregate", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    _assert_aggregate_operation_blocked(result)
+    assert "prior_shape_inherited" not in result["reason_codes"]
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+
+
+def test_aggregate_block_preserves_semantic_source_ambiguity():
+    result = _derive(
+        _start_runtime(),
+        task_text="Calculate the median for the available values.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "aggregate", "source_b", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    _assert_aggregate_operation_blocked(result)
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+
+
 def test_unknown_semantic_operation_has_no_materiality_or_shape_authority():
     result = _derive(
         _start_runtime(),

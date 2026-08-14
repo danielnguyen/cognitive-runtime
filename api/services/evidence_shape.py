@@ -751,6 +751,19 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
             source_match=source_match,
         )
 
+    if semantic_operation == "aggregate":
+        reasons.update(
+            {"semantic_operation_hint", "semantic_operation_unsupported"}
+        )
+        return _build_result(
+            body,
+            status="ambiguous",
+            task_shape=None,
+            candidates=[],
+            reasons=reasons,
+            source_match=source_match,
+        )
+
     for shape in specialized:
         reasons.add(_SPECIALIZED_REASON[shape])
     candidates = sorted(specialized)
@@ -773,18 +786,6 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
     elif context.continuation_of_prior_evidence_task:
         selected = context.prior_task_shape
         reasons.add("prior_shape_inherited")
-    elif semantic_operation == "aggregate":
-        reasons.update(
-            {"semantic_operation_hint", "semantic_operation_unsupported"}
-        )
-        return _build_result(
-            body,
-            status="ambiguous",
-            task_shape=None,
-            candidates=[],
-            reasons=reasons,
-            source_match=source_match,
-        )
     elif semantic_operation in _SEMANTIC_OPERATION_SHAPES:
         selected = _SEMANTIC_OPERATION_SHAPES[semantic_operation]
         reasons.add("semantic_operation_hint")
