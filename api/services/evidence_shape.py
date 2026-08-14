@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from hashlib import sha256
 
 from models import (
@@ -216,6 +217,22 @@ _COMPATIBLE_COMBINATIONS: dict[frozenset[EvidenceTaskShape], EvidenceTaskShape] 
         "absence_or_coverage_check"
     ),
 }
+_SEMANTIC_OPERATION_SHAPES: dict[str, EvidenceTaskShape] = {
+    "lookup": "targeted_lookup",
+    "latest": "targeted_lookup",
+    "comparison": "cross_source_comparison",
+    "exhaustive_review": "bounded_exhaustive_review",
+    "contradiction_review": "contradiction_review",
+    "absence_check": "absence_or_coverage_check",
+    "historical_reconstruction": "historical_reconstruction",
+    "decision_support": "recommendation_or_decision_support",
+}
+
+
+@dataclass(frozen=True)
+class _DeterministicSourceMatch:
+    result: SourceMatchResult
+    ambiguous_has_distinct_candidate: bool = False
 
 
 def _normalized_tokens(value: str) -> tuple[str, ...]:
@@ -277,21 +294,27 @@ def _source_identity_kinds(source: SourceDiscoveryEntry) -> set[str]:
     )
 
 
-def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult | None:
+def _derive_deterministic_source_match(
+    body: EvidenceShapeDeriveRequest,
+) -> _DeterministicSourceMatch | None:
     discovery = body.task_context.source_discovery
     if discovery is None:
         return None
     if discovery.inventory_status == "unknown":
-        return SourceMatchResult(
-            status="inventory_unavailable",
-            matched_source_ids=[],
-            reason_codes=["inventory_unknown"],
+        return _DeterministicSourceMatch(
+            result=SourceMatchResult(
+                status="inventory_unavailable",
+                matched_source_ids=[],
+                reason_codes=["inventory_unknown"],
+            )
         )
     if discovery.inventory_status == "unavailable":
-        return SourceMatchResult(
-            status="inventory_unavailable",
-            matched_source_ids=[],
-            reason_codes=["inventory_unavailable"],
+        return _DeterministicSourceMatch(
+            result=SourceMatchResult(
+                status="inventory_unavailable",
+                matched_source_ids=[],
+                reason_codes=["inventory_unavailable"],
+            )
         )
 
     task_tokens = _normalized_tokens(body.task_text)
@@ -389,10 +412,72 @@ def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult 
         reasons.add("inventory_partial")
         if status == "no_match":
             status = "inventory_unavailable"
+    return _DeterministicSourceMatch(
+        result=SourceMatchResult(
+            status=status,
+            matched_source_ids=matched_source_ids,
+            reason_codes=sorted(reasons),
+        ),
+        ambiguous_has_distinct_candidate=(
+            status == "ambiguous"
+            and any(candidate["distinct"] for candidate in strong_candidates)
+        ),
+    )
+
+
+def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult | None:
+    deterministic = _derive_deterministic_source_match(body)
+    if deterministic is None:
+        return None
+    advisory = body.task_context.semantic_advisory
+    discovery = body.task_context.source_discovery
+    if advisory is None:
+        return deterministic.result
+    if discovery.inventory_status in {"unknown", "unavailable"}:
+        return deterministic.result
+    if deterministic.result.status == "matched":
+        return deterministic.result
+    if (
+        deterministic.result.status == "ambiguous"
+        and deterministic.ambiguous_has_distinct_candidate
+    ):
+        return deterministic.result
+
+    partial_reasons = (
+        {"inventory_partial"}
+        if discovery.inventory_status == "partial"
+        else set()
+    )
+    if advisory.interpretation_status == "resolved":
+        return SourceMatchResult(
+            status="matched",
+            matched_source_ids=sorted(advisory.candidate_source_ids),
+            reason_codes=sorted({"semantic_candidate_validated"} | partial_reasons),
+        )
+    if advisory.interpretation_status == "ambiguous":
+        return SourceMatchResult(
+            status="ambiguous",
+            matched_source_ids=[],
+            reason_codes=sorted(
+                {"semantic_candidates_ambiguous"} | partial_reasons
+            ),
+        )
+    if deterministic.result.status == "ambiguous":
+        return SourceMatchResult(
+            status="ambiguous",
+            matched_source_ids=[],
+            reason_codes=sorted(
+                set(deterministic.result.reason_codes) | {"semantic_no_match"}
+            ),
+        )
     return SourceMatchResult(
-        status=status,
-        matched_source_ids=matched_source_ids,
-        reason_codes=sorted(reasons),
+        status=(
+            "inventory_unavailable"
+            if discovery.inventory_status == "partial"
+            else "no_match"
+        ),
+        matched_source_ids=[],
+        reason_codes=sorted({"semantic_no_match"} | partial_reasons),
     )
 
 
@@ -534,6 +619,13 @@ def _derivation_identity(
         discovery["sources"] = sorted(
             discovery["sources"], key=lambda source: source["source_id"]
         )
+    semantic_advisory = context.get("semantic_advisory")
+    if semantic_advisory is None:
+        context.pop("semantic_advisory", None)
+    else:
+        semantic_advisory["candidate_source_ids"] = sorted(
+            semantic_advisory["candidate_source_ids"]
+        )
     material = {
         "request_id": body.request_id,
         "owner_id": body.owner_id,
@@ -607,6 +699,12 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
     verification_dependent = _verification_dependent_request(body.task_text)
     distinct_evidence_request = explicit_evidence or verification_dependent
     context = body.task_context
+    semantic_operation = (
+        context.semantic_advisory.operation_hint
+        if context.semantic_advisory is not None
+        else None
+    )
+    semantic_operation_material = semantic_operation not in {None, "unknown"}
     reasons = _materiality_reasons(
         body,
         explicit_evidence=explicit_evidence,
@@ -622,7 +720,10 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         or context.continuation_of_prior_evidence_task
     )
     evidence_material = (
-        context_material or distinct_evidence_request or source_context_material
+        context_material
+        or distinct_evidence_request
+        or source_context_material
+        or semantic_operation_material
     )
     non_evidence_interaction = body.interaction_kind in {
         "joke_or_playful",
@@ -632,6 +733,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         non_evidence_interaction
         and not distinct_evidence_request
         and not source_context_material
+        and not semantic_operation_material
     ):
         evidence_material = False
         reasons.clear()
@@ -671,6 +773,25 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
     elif context.continuation_of_prior_evidence_task:
         selected = context.prior_task_shape
         reasons.add("prior_shape_inherited")
+    elif semantic_operation == "aggregate":
+        reasons.update(
+            {"semantic_operation_hint", "semantic_operation_unsupported"}
+        )
+        return _build_result(
+            body,
+            status="ambiguous",
+            task_shape=None,
+            candidates=[],
+            reasons=reasons,
+            source_match=source_match,
+        )
+    elif semantic_operation in _SEMANTIC_OPERATION_SHAPES:
+        selected = _SEMANTIC_OPERATION_SHAPES[semantic_operation]
+        reasons.add("semantic_operation_hint")
+        if selected == "targeted_lookup":
+            reasons.add("targeted_lookup_derived")
+        else:
+            reasons.add(_SPECIALIZED_REASON[selected])
     elif (
         body.interaction_kind == "ambiguous"
         and not distinct_evidence_request
@@ -766,6 +887,20 @@ def derive_evidence_shape(
             event_payload["matched_source_ids"] = (
                 result.source_match.matched_source_ids
             )
+    if body.task_context.semantic_advisory is not None:
+        event_payload.update(
+            {
+                "semantic_interpretation_status": (
+                    body.task_context.semantic_advisory.interpretation_status
+                ),
+                "semantic_operation_hint": (
+                    body.task_context.semantic_advisory.operation_hint
+                ),
+                "semantic_candidate_count": len(
+                    body.task_context.semantic_advisory.candidate_source_ids
+                ),
+            }
+        )
     record_runtime_event(
         runtime_session_id=body.runtime_session_id,
         runtime_turn_id=body.runtime_turn_id,
