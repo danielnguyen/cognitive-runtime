@@ -847,16 +847,6 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         selected = "targeted_lookup"
         reasons.add("targeted_lookup_derived")
 
-    if source_match is not None and source_match.probe_source_ids:
-        return _build_result(
-            body,
-            status="ambiguous",
-            task_shape=selected,
-            candidates=[selected],
-            reasons=reasons,
-            source_match=source_match,
-        )
-
     return _build_result(
         body,
         status="derived",

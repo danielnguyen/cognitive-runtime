@@ -2148,11 +2148,11 @@ def test_semantic_ambiguity_authorizes_bounded_two_source_probe():
         "probe_source_ids": ["source_a", "source_b"],
         "reason_codes": ["semantic_candidates_ambiguous"],
     }
-    assert result["derivation_status"] == "ambiguous"
+    assert result["derivation_status"] == "derived"
     assert result["task_shape"] == "targeted_lookup"
     assert result["candidate_task_shapes"] == ["targeted_lookup"]
     assert result["evidence_scope_material"] is True
-    assert result["clarification_required"] is True
+    assert result["clarification_required"] is False
 
 
 @pytest.mark.parametrize("operation_hint", ["lookup", "latest"])
@@ -2180,10 +2180,11 @@ def test_semantic_ambiguity_authorizes_bounded_three_source_probe(
         "probe_source_ids": ["source_a", "source_b", "source_c"],
         "reason_codes": ["semantic_candidates_ambiguous"],
     }
-    assert result["derivation_status"] == "ambiguous"
+    assert result["derivation_status"] == "derived"
     assert result["task_shape"] == "targeted_lookup"
     assert result["candidate_task_shapes"] == ["targeted_lookup"]
-    assert result["clarification_required"] is True
+    assert result["evidence_scope_material"] is True
+    assert result["clarification_required"] is False
 
 
 def test_semantic_probe_candidate_and_inventory_order_are_canonical():

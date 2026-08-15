@@ -1185,13 +1185,7 @@ class EvidenceShapeResult(BaseModel):
             if self.evidence_scope_material or self.clarification_required:
                 raise ValueError("invalid_not_applicable_shape_flags")
         else:
-            authorized_probe_shape = (
-                self.source_match is not None
-                and bool(self.source_match.probe_source_ids)
-                and self.task_shape == "targeted_lookup"
-                and self.candidate_task_shapes == ["targeted_lookup"]
-            )
-            if self.task_shape is not None and not authorized_probe_shape:
+            if self.task_shape is not None:
                 raise ValueError("invalid_ambiguous_shape_outcome")
             if not self.evidence_scope_material or not self.clarification_required:
                 raise ValueError("invalid_ambiguous_shape_flags")
