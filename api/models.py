@@ -1057,12 +1057,25 @@ class SourceMatchResult(BaseModel):
 
     status: SourceMatchStatus
     matched_source_ids: list[EvidenceSufficiencyIdentifier] = Field(max_length=32)
+    probe_source_ids: list[EvidenceSufficiencyIdentifier] = Field(
+        default_factory=list,
+        max_length=3,
+    )
     reason_codes: list[SourceMatchReasonCode] = Field(min_length=1, max_length=11)
+
+    @model_serializer(mode="wrap")
+    def omit_absent_probe_source_ids(self, handler):
+        serialized = handler(self)
+        if not self.probe_source_ids:
+            serialized.pop("probe_source_ids", None)
+        return serialized
 
     @model_validator(mode="after")
     def validate_match_outcome(self) -> SourceMatchResult:
         if self.matched_source_ids != sorted(set(self.matched_source_ids)):
             raise ValueError("source_match_ids_not_sorted_unique")
+        if self.probe_source_ids != sorted(set(self.probe_source_ids)):
+            raise ValueError("probe_source_ids_not_sorted_unique")
         if len(set(self.reason_codes)) != len(self.reason_codes):
             raise ValueError("duplicate_source_match_reason_code")
         if self.status == "matched":
@@ -1070,6 +1083,13 @@ class SourceMatchResult(BaseModel):
                 raise ValueError("matched_source_id_required")
         elif self.matched_source_ids:
             raise ValueError("matched_source_ids_not_allowed")
+        if self.probe_source_ids:
+            if len(self.probe_source_ids) not in {2, 3}:
+                raise ValueError("probe_source_ids_must_be_bounded_ambiguity")
+            if self.status != "ambiguous":
+                raise ValueError("probe_source_ids_require_ambiguous_status")
+            if "semantic_candidates_ambiguous" not in self.reason_codes:
+                raise ValueError("probe_source_ids_require_semantic_ambiguity")
         return self
 
 
