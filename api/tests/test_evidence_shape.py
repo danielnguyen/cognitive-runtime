@@ -6,7 +6,8 @@ from itertools import count
 import pytest
 from fastapi.testclient import TestClient
 from main import app
-from models import EvidenceShapeDeriveRequest
+from models import EvidenceShapeDeriveRequest, SourceMatchResult
+from pydantic import ValidationError
 from services.evidence_shape import _derive_result
 
 client = TestClient(app)
@@ -1750,6 +1751,119 @@ def test_source_discovery_event_contains_only_bounded_structural_facts():
         assert sentinel not in serialized
 
 
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"probe_source_ids": ["source_a"]},
+        {
+            "probe_source_ids": [
+                "source_a",
+                "source_b",
+                "source_c",
+                "source_d",
+            ]
+        },
+        {"probe_source_ids": ["source_a", "source_a"]},
+        {"probe_source_ids": ["source_b", "source_a"]},
+        {
+            "status": "matched",
+            "matched_source_ids": ["source_a"],
+            "probe_source_ids": ["source_a", "source_b"],
+        },
+        {"status": "no_match", "probe_source_ids": ["source_a", "source_b"]},
+        {
+            "status": "inventory_unavailable",
+            "probe_source_ids": ["source_a", "source_b"],
+        },
+        {
+            "probe_source_ids": ["source_a", "source_b"],
+            "reason_codes": ["multiple_possible_source_matches"],
+        },
+        {
+            "matched_source_ids": ["source_c"],
+            "probe_source_ids": ["source_a", "source_b"],
+        },
+    ],
+)
+def test_source_match_result_rejects_invalid_probe_authorization(
+    updates: dict[str, object],
+):
+    source_match: dict[str, object] = {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": ["source_a", "source_b"],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    source_match.update(updates)
+
+    with pytest.raises(ValidationError):
+        SourceMatchResult.model_validate(source_match)
+
+
+@pytest.mark.parametrize(
+    "source_match",
+    [
+        {
+            "status": "matched",
+            "matched_source_ids": ["source_a"],
+            "reason_codes": ["source_id_match"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "reason_codes": ["multiple_possible_source_matches"],
+        },
+        {
+            "status": "matched",
+            "matched_source_ids": ["source_a"],
+            "reason_codes": ["semantic_candidate_validated"],
+        },
+        {
+            "status": "no_match",
+            "matched_source_ids": [],
+            "reason_codes": ["semantic_no_match"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": [],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        },
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "reason_codes": [
+                "inventory_partial",
+                "semantic_candidates_ambiguous",
+            ],
+        },
+    ],
+)
+def test_source_match_result_omits_empty_probe_authorization_from_wire(
+    source_match: dict[str, object],
+):
+    result = SourceMatchResult.model_validate(source_match)
+
+    assert result.probe_source_ids == []
+    assert "probe_source_ids" not in result.model_dump(mode="json")
+
+
+def test_source_match_result_emits_non_empty_probe_authorization():
+    result = SourceMatchResult.model_validate(
+        {
+            "status": "ambiguous",
+            "matched_source_ids": [],
+            "probe_source_ids": ["source_a", "source_b"],
+            "reason_codes": ["semantic_candidates_ambiguous"],
+        }
+    )
+
+    assert result.model_dump(mode="json")["probe_source_ids"] == [
+        "source_a",
+        "source_b",
+    ]
+
+
 def test_semantic_advisory_requires_source_discovery():
     response = _derive(
         _start_runtime(),
@@ -1924,6 +2038,27 @@ def test_deterministic_match_outranks_conflicting_semantic_candidate():
     ]
 
 
+def test_deterministic_match_outranks_semantic_probe_candidates():
+    result = _derive(
+        _start_runtime(),
+        task_text="What is in Alpine Register?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+                _discovery_source("source_c", "Forest Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_b", "source_c"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+    assert "probe_source_ids" not in result["source_match"]
+
+
 def test_primary_distinct_ambiguity_outranks_semantic_candidate():
     discovery = _discovery(
         _discovery_source(
@@ -1957,7 +2092,41 @@ def test_primary_distinct_ambiguity_outranks_semantic_candidate():
     ]
 
 
-def test_semantic_ambiguity_never_exposes_candidates_or_all_sources():
+def test_primary_distinct_ambiguity_outranks_semantic_probe_candidates():
+    discovery = _discovery(
+        _discovery_source(
+            "harbor_metrics",
+            "Harbor Metrics",
+            domain_tags=["planning"],
+            scope_refs={"project": "harbor-project"},
+        ),
+        _discovery_source(
+            "harbor_calendar",
+            "Harbor Calendar",
+            domain_tags=["planning"],
+            scope_refs={"project": "harbor-project"},
+        ),
+    )
+    result = _derive(
+        _start_runtime(),
+        task_text="What is in Harbor Metrics calendar for Harbor Project?",
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "harbor_calendar", "harbor_metrics"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "semantic_candidates_ambiguous" not in result["source_match"][
+        "reason_codes"
+    ]
+    assert "probe_source_ids" not in result["source_match"]
+
+
+def test_semantic_ambiguity_authorizes_bounded_two_source_probe():
     result = _derive(
         _start_runtime(),
         task_text="Please handle this question.",
@@ -1976,9 +2145,95 @@ def test_semantic_ambiguity_never_exposes_candidates_or_all_sources():
     assert result["source_match"] == {
         "status": "ambiguous",
         "matched_source_ids": [],
+        "probe_source_ids": ["source_a", "source_b"],
         "reason_codes": ["semantic_candidates_ambiguous"],
     }
+    assert result["derivation_status"] == "ambiguous"
     assert result["task_shape"] == "targeted_lookup"
+    assert result["candidate_task_shapes"] == ["targeted_lookup"]
+    assert result["evidence_scope_material"] is True
+    assert result["clarification_required"] is True
+
+
+@pytest.mark.parametrize("operation_hint", ["lookup", "latest"])
+def test_semantic_ambiguity_authorizes_bounded_three_source_probe(
+    operation_hint: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_c", "Forest Register"),
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", operation_hint, "source_c", "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": ["source_a", "source_b", "source_c"],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    assert result["derivation_status"] == "ambiguous"
+    assert result["task_shape"] == "targeted_lookup"
+    assert result["candidate_task_shapes"] == ["targeted_lookup"]
+    assert result["clarification_required"] is True
+
+
+def test_semantic_probe_candidate_and_inventory_order_are_canonical():
+    runtime = _start_runtime()
+    source_a = _discovery_source(
+        "source_a",
+        "PRIVATE_DISPLAY_ALPHA",
+        domain_tags=["private_alpha", "alpha_domain"],
+        capabilities=["fetch", "search"],
+    )
+    source_b = _discovery_source(
+        "source_b",
+        "PRIVATE_DISPLAY_BETA",
+        domain_tags=["private_beta", "beta_domain"],
+        capabilities=["search", "context"],
+    )
+    first = _derive(
+        runtime,
+        task_text="Please handle this bounded question.",
+        task_context=_context(
+            source_discovery=_discovery(source_a, source_b),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_b", "source_a"
+            ),
+        ),
+    ).json()["result"]
+    reversed_a = {
+        **source_a,
+        "domain_tags": list(reversed(source_a["domain_tags"])),
+        "capabilities": list(reversed(source_a["capabilities"])),
+    }
+    reversed_b = {
+        **source_b,
+        "domain_tags": list(reversed(source_b["domain_tags"])),
+        "capabilities": list(reversed(source_b["capabilities"])),
+    }
+    second = _derive(
+        runtime,
+        task_text="Please handle this bounded question.",
+        task_context=_context(
+            source_discovery=_discovery(reversed_b, reversed_a),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert first["source_match"] == second["source_match"]
+    assert first["source_match"]["probe_source_ids"] == ["source_a", "source_b"]
+    assert first["derivation_id"] == second["derivation_id"]
 
 
 def test_semantic_no_match_and_deterministic_ambiguity_compose_conservatively():
@@ -2079,6 +2334,134 @@ def test_semantic_ambiguity_on_partial_inventory_remains_ambiguous():
         "matched_source_ids": [],
         "reason_codes": ["inventory_partial", "semantic_candidates_ambiguous"],
     }
+
+
+@pytest.mark.parametrize("inventory_status", ["unknown", "unavailable"])
+def test_semantic_ambiguity_does_not_authorize_probe_for_unusable_inventory(
+    inventory_status: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+                inventory_status=inventory_status,
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "inventory_unavailable"
+    assert "probe_source_ids" not in result["source_match"]
+
+
+@pytest.mark.parametrize("availability", ["unavailable", "disabled", "unknown"])
+def test_semantic_ambiguity_requires_every_probe_candidate_available(
+    availability: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "source_a", "Alpine Register", availability=availability
+                ),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "probe_source_ids" not in result["source_match"]
+
+
+def test_semantic_ambiguity_requires_every_probe_candidate_search_capable():
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "source_a",
+                    "Alpine Register",
+                    capabilities=["fetch", "context"],
+                ),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "probe_source_ids" not in result["source_match"]
+
+
+@pytest.mark.parametrize(
+    "operation_hint",
+    [
+        "comparison",
+        "exhaustive_review",
+        "contradiction_review",
+        "absence_check",
+        "historical_reconstruction",
+        "decision_support",
+        "aggregate",
+        "unknown",
+    ],
+)
+def test_non_lookup_semantic_ambiguity_does_not_authorize_probe(
+    operation_hint: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", operation_hint, "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "probe_source_ids" not in result["source_match"]
+
+
+def test_deterministic_non_lookup_shape_prevents_lookup_probe_authorization():
+    result = _derive(
+        _start_runtime(),
+        task_text="Compare the available records.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert "probe_source_ids" not in result["source_match"]
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "cross_source_comparison"
 
 
 @pytest.mark.parametrize(
@@ -2446,7 +2829,7 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
             ),
             semantic_advisory=_semantic_advisory(
                 "ambiguous",
-                "comparison",
+                "lookup",
                 "private_candidate_beta",
                 "private_candidate_alpha",
             ),
@@ -2456,9 +2839,11 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
     serialized = json.dumps(payload, sort_keys=True).lower()
 
     assert payload["semantic_interpretation_status"] == "ambiguous"
-    assert payload["semantic_operation_hint"] == "comparison"
+    assert payload["semantic_operation_hint"] == "lookup"
     assert payload["semantic_candidate_count"] == 2
+    assert payload["probe_source_count"] == 2
     assert "matched_source_ids" not in payload
+    assert "probe_source_ids" not in payload
     for sentinel in (
         "secretquestionmarker",
         "private_display_sentinel",
@@ -2468,6 +2853,35 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
         "private_candidate_beta",
     ):
         assert sentinel not in serialized
+
+
+@pytest.mark.parametrize(
+    "semantic_advisory",
+    [
+        _semantic_advisory("resolved", "lookup", "source_a"),
+        _semantic_advisory("no_match", "unknown"),
+        _semantic_advisory("ambiguous", "comparison", "source_a", "source_b"),
+    ],
+)
+def test_runtime_event_omits_probe_count_without_authorization(
+    semantic_advisory: dict[str, object],
+):
+    runtime = _start_runtime()
+    _derive(
+        runtime,
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=semantic_advisory,
+        ),
+    )
+    payload = _shape_events(runtime["runtime_session_id"])[0]["event_payload_json"]
+
+    assert "probe_source_count" not in payload
+    assert "probe_source_ids" not in payload
 
 
 def test_absent_semantic_advisory_preserves_legacy_identity_and_wire_shape():

@@ -455,9 +455,31 @@ def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult 
             reason_codes=sorted({"semantic_candidate_validated"} | partial_reasons),
         )
     if advisory.interpretation_status == "ambiguous":
+        probe_source_ids: list[str] = []
+        if (
+            discovery.inventory_status == "complete"
+            and advisory.operation_hint in {"lookup", "latest"}
+            and not _specialized_shapes(body.task_text)
+            and (
+                not body.task_context.continuation_of_prior_evidence_task
+                or body.task_context.prior_task_shape == "targeted_lookup"
+            )
+        ):
+            sources_by_id = {source.source_id: source for source in discovery.sources}
+            candidates = [
+                sources_by_id[source_id]
+                for source_id in advisory.candidate_source_ids
+            ]
+            if all(
+                source.availability == "available"
+                and "search" in source.capabilities
+                for source in candidates
+            ):
+                probe_source_ids = sorted(advisory.candidate_source_ids)
         return SourceMatchResult(
             status="ambiguous",
             matched_source_ids=[],
+            probe_source_ids=probe_source_ids,
             reason_codes=sorted(
                 {"semantic_candidates_ambiguous"} | partial_reasons
             ),
@@ -825,6 +847,16 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         selected = "targeted_lookup"
         reasons.add("targeted_lookup_derived")
 
+    if source_match is not None and source_match.probe_source_ids:
+        return _build_result(
+            body,
+            status="ambiguous",
+            task_shape=selected,
+            candidates=[selected],
+            reasons=reasons,
+            source_match=source_match,
+        )
+
     return _build_result(
         body,
         status="derived",
@@ -887,6 +919,10 @@ def derive_evidence_shape(
         if result.source_match.status == "matched":
             event_payload["matched_source_ids"] = (
                 result.source_match.matched_source_ids
+            )
+        if result.source_match.probe_source_ids:
+            event_payload["probe_source_count"] = len(
+                result.source_match.probe_source_ids
             )
     if body.task_context.semantic_advisory is not None:
         event_payload.update(
