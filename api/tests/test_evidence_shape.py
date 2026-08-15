@@ -6,6 +6,8 @@ from itertools import count
 import pytest
 from fastapi.testclient import TestClient
 from main import app
+from models import EvidenceShapeDeriveRequest
+from services.evidence_shape import _derive_result
 
 client = TestClient(app)
 _runtime_counter = count()
@@ -43,6 +45,7 @@ def _context(
     continuation_of_prior_evidence_task: bool = False,
     prior_task_shape: str | None = None,
     source_discovery: dict[str, object] | None = None,
+    semantic_advisory: dict[str, object] | None = None,
 ) -> dict[str, object]:
     context: dict[str, object] = {
         "evidence_input_kinds": evidence_input_kinds or [],
@@ -54,6 +57,8 @@ def _context(
     }
     if source_discovery is not None:
         context["source_discovery"] = source_discovery
+    if semantic_advisory is not None:
+        context["semantic_advisory"] = semantic_advisory
     return context
 
 
@@ -87,6 +92,18 @@ def _discovery(
     inventory_status: str = "complete",
 ) -> dict[str, object]:
     return {"inventory_status": inventory_status, "sources": list(sources)}
+
+
+def _semantic_advisory(
+    interpretation_status: str,
+    operation_hint: str,
+    *candidate_source_ids: str,
+) -> dict[str, object]:
+    return {
+        "interpretation_status": interpretation_status,
+        "operation_hint": operation_hint,
+        "candidate_source_ids": list(candidate_source_ids),
+    }
 
 
 def _source_kind_topology() -> tuple[dict[str, object], ...]:
@@ -1731,3 +1748,746 @@ def test_source_discovery_event_contains_only_bounded_structural_facts():
         "google_sheets",
     ):
         assert sentinel not in serialized
+
+
+def test_semantic_advisory_requires_source_discovery():
+    response = _derive(
+        _start_runtime(),
+        task_context=_context(
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "source_a"
+            )
+        ),
+    )
+
+    assert response.status_code == 422
+    assert "semantic_advisory_source_discovery_required" in response.text
+
+
+@pytest.mark.parametrize(
+    ("status", "candidates"),
+    [
+        ("resolved", []),
+        ("resolved", ["source_a", "source_b"]),
+        ("ambiguous", ["source_a"]),
+        ("ambiguous", ["source_a", "source_b", "source_c", "source_d"]),
+        ("no_match", ["source_a"]),
+        ("ambiguous", ["source_a", "source_a"]),
+    ],
+)
+def test_semantic_advisory_rejects_incoherent_candidate_sets(
+    status: str,
+    candidates: list[str],
+):
+    sources = tuple(
+        _discovery_source(source_id, source_id.replace("_", " ").title())
+        for source_id in {"source_a", "source_b", "source_c", "source_d"}
+    )
+    response = _derive(
+        _start_runtime(),
+        task_context=_context(
+            source_discovery=_discovery(*sources),
+            semantic_advisory=_semantic_advisory(
+                status, "lookup", *candidates
+            ),
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "candidate_source_id",
+    ["fabricated_source", "invalid source", "s" * 121],
+)
+def test_semantic_advisory_rejects_unknown_or_invalid_candidate_ids(
+    candidate_source_id: str,
+):
+    response = _derive(
+        _start_runtime(),
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Source A")
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", candidate_source_id
+            ),
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "advisory_update",
+    [
+        {"interpretation_status": "unsupported"},
+        {"operation_hint": "summarize_anything"},
+        {"explanation": "PRIVATE_REASONING_SENTINEL"},
+        {"metadata": {"confidence": 0.99}},
+    ],
+)
+def test_semantic_advisory_rejects_unbounded_or_unsupported_fields(
+    advisory_update: dict[str, object],
+):
+    advisory = _semantic_advisory("resolved", "lookup", "source_a")
+    advisory.update(advisory_update)
+    response = _derive(
+        _start_runtime(),
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Source A")
+            ),
+            semantic_advisory=advisory,
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+def test_semantic_candidate_can_resolve_deterministic_no_match():
+    result = _derive(
+        _start_runtime(),
+        task_text="Please answer this bounded question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "matched",
+        "matched_source_ids": ["source_a"],
+        "reason_codes": ["semantic_candidate_validated"],
+    }
+    assert result["task_shape"] == "targeted_lookup"
+    assert "semantic_operation_hint" in result["reason_codes"]
+
+
+def test_semantic_candidate_can_resolve_non_distinct_primary_ambiguity():
+    discovery = _discovery(
+        _discovery_source(
+            "east_register",
+            "East Register",
+            domain_tags=["operations"],
+            scope_refs={"project": "shared-project"},
+        ),
+        _discovery_source(
+            "west_register",
+            "West Register",
+            domain_tags=["operations"],
+            scope_refs={"project": "shared-project"},
+        ),
+    )
+    result = _derive(
+        _start_runtime(),
+        task_text="What is the operations result for Shared Project?",
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "east_register"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["east_register"]
+    assert result["source_match"]["reason_codes"] == [
+        "semantic_candidate_validated"
+    ]
+
+
+def test_deterministic_match_outranks_conflicting_semantic_candidate():
+    result = _derive(
+        _start_runtime(),
+        task_text="What is in Alpine Register?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+    assert "semantic_candidate_validated" not in result["source_match"][
+        "reason_codes"
+    ]
+
+
+def test_primary_distinct_ambiguity_outranks_semantic_candidate():
+    discovery = _discovery(
+        _discovery_source(
+            "harbor_metrics",
+            "Harbor Metrics",
+            domain_tags=["planning"],
+            scope_refs={"project": "harbor-project"},
+        ),
+        _discovery_source(
+            "harbor_calendar",
+            "Harbor Calendar",
+            domain_tags=["planning"],
+            scope_refs={"project": "harbor-project"},
+        ),
+    )
+    result = _derive(
+        _start_runtime(),
+        task_text="What is in Harbor Metrics calendar for Harbor Project?",
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "harbor_calendar"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "semantic_candidate_validated" not in result["source_match"][
+        "reason_codes"
+    ]
+
+
+def test_semantic_ambiguity_never_exposes_candidates_or_all_sources():
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+                _discovery_source("source_c", "Forest Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_b", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    assert result["task_shape"] == "targeted_lookup"
+
+
+def test_semantic_no_match_and_deterministic_ambiguity_compose_conservatively():
+    complete_no_match = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register")
+            ),
+            semantic_advisory=_semantic_advisory("no_match", "unknown"),
+        ),
+    ).json()["result"]
+    deterministic_ambiguity = _derive(
+        _start_runtime(),
+        task_text="What is the operations result?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "east_register", "East Register", domain_tags=["operations"]
+                ),
+                _discovery_source(
+                    "west_register", "West Register", domain_tags=["operations"]
+                ),
+            ),
+            semantic_advisory=_semantic_advisory("no_match", "lookup"),
+        ),
+    ).json()["result"]
+
+    assert complete_no_match["source_match"] == {
+        "status": "no_match",
+        "matched_source_ids": [],
+        "reason_codes": ["semantic_no_match"],
+    }
+    _assert_not_applicable(complete_no_match)
+    assert deterministic_ambiguity["source_match"]["status"] == "ambiguous"
+    assert deterministic_ambiguity["source_match"]["matched_source_ids"] == []
+    assert "semantic_no_match" in deterministic_ambiguity["source_match"][
+        "reason_codes"
+    ]
+
+
+def test_semantic_partial_inventory_preserves_positive_and_negative_limits():
+    discovery = _discovery(
+        _discovery_source("source_a", "Alpine Register"),
+        inventory_status="partial",
+    )
+    positive = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "source_a"
+            ),
+        ),
+    ).json()["result"]
+    negative = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory("no_match", "lookup"),
+        ),
+    ).json()["result"]
+
+    assert positive["source_match"] == {
+        "status": "matched",
+        "matched_source_ids": ["source_a"],
+        "reason_codes": ["inventory_partial", "semantic_candidate_validated"],
+    }
+    assert negative["source_match"] == {
+        "status": "inventory_unavailable",
+        "matched_source_ids": [],
+        "reason_codes": ["inventory_partial", "semantic_no_match"],
+    }
+    assert negative["evidence_scope_material"] is True
+
+
+def test_semantic_ambiguity_on_partial_inventory_remains_ambiguous():
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+                inventory_status="partial",
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_b", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "reason_codes": ["inventory_partial", "semantic_candidates_ambiguous"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("inventory_status", "reason"),
+    [("unknown", "inventory_unknown"), ("unavailable", "inventory_unavailable")],
+)
+def test_semantic_candidate_cannot_override_unusable_inventory(
+    inventory_status: str,
+    reason: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                inventory_status=inventory_status,
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "inventory_unavailable",
+        "matched_source_ids": [],
+        "reason_codes": [reason],
+    }
+
+
+@pytest.mark.parametrize("availability", ["unavailable", "disabled", "unknown"])
+def test_semantic_identity_does_not_redirect_individually_unavailable_source(
+    availability: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "source_a", "Alpine Register", availability=availability
+                ),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+
+
+@pytest.mark.parametrize(
+    ("operation_hint", "expected_shape", "expected_shape_reason"),
+    [
+        ("lookup", "targeted_lookup", "targeted_lookup_derived"),
+        ("latest", "targeted_lookup", "targeted_lookup_derived"),
+        ("comparison", "cross_source_comparison", "comparison_requested"),
+        (
+            "exhaustive_review",
+            "bounded_exhaustive_review",
+            "exhaustive_scope_requested",
+        ),
+        (
+            "contradiction_review",
+            "contradiction_review",
+            "contradiction_requested",
+        ),
+        ("absence_check", "absence_or_coverage_check", "absence_scope_requested"),
+        (
+            "historical_reconstruction",
+            "historical_reconstruction",
+            "historical_reconstruction_requested",
+        ),
+        (
+            "decision_support",
+            "recommendation_or_decision_support",
+            "decision_support_requested",
+        ),
+    ],
+)
+def test_supported_semantic_operation_supplies_governed_task_shape(
+    operation_hint: str,
+    expected_shape: str,
+    expected_shape_reason: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this bounded question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register")
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", operation_hint, "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == expected_shape
+    assert "semantic_operation_hint" in result["reason_codes"]
+    assert expected_shape_reason in result["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    ("task_text", "semantic_operation", "expected_shape"),
+    [
+        (
+            "Compare Harbor Metrics with Alpine Metrics.",
+            "lookup",
+            "cross_source_comparison",
+        ),
+        (
+            "Reconstruct the history of Alpine Metrics.",
+            "latest",
+            "historical_reconstruction",
+        ),
+    ],
+)
+def test_deterministic_task_shape_outranks_semantic_operation(
+    task_text: str,
+    semantic_operation: str,
+    expected_shape: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("alpine_metrics", "Alpine Metrics"),
+                _discovery_source("harbor_metrics", "Harbor Metrics"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", semantic_operation, "alpine_metrics"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["task_shape"] == expected_shape
+    assert "semantic_operation_hint" not in result["reason_codes"]
+
+
+def test_aggregate_operation_fails_closed_without_targeted_lookup_downgrade():
+    result = _derive(
+        _start_runtime(),
+        task_text="Please calculate this result.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register")
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "aggregate", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+    assert result["derivation_status"] == "ambiguous"
+    assert result["task_shape"] is None
+    assert result["candidate_task_shapes"] == []
+    assert result["evidence_scope_material"] is True
+    assert result["clarification_required"] is True
+    assert "semantic_operation_hint" in result["reason_codes"]
+    assert "semantic_operation_unsupported" in result["reason_codes"]
+
+
+def _assert_aggregate_operation_blocked(result: dict[str, object]) -> None:
+    assert result["derivation_status"] == "ambiguous"
+    assert result["task_shape"] is None
+    assert result["candidate_task_shapes"] == []
+    assert result["evidence_scope_material"] is True
+    assert result["clarification_required"] is True
+    assert "semantic_operation_hint" in result["reason_codes"]
+    assert "semantic_operation_unsupported" in result["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    ("task_text", "blocked_shape_reason"),
+    [
+        (
+            "Compare the median values from the available registers.",
+            "comparison_requested",
+        ),
+        (
+            "Reconstruct the median history from the available values.",
+            "historical_reconstruction_requested",
+        ),
+        (
+            "What was not covered in the available values?",
+            "absence_scope_requested",
+        ),
+    ],
+)
+def test_aggregate_blocks_deterministic_specialized_shapes(
+    task_text: str,
+    blocked_shape_reason: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "aggregate", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    _assert_aggregate_operation_blocked(result)
+    assert blocked_shape_reason not in result["reason_codes"]
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+
+
+def test_aggregate_blocks_inherited_continuation_shape():
+    result = _derive(
+        _start_runtime(),
+        task_text="Continue calculating the median.",
+        task_context=_context(
+            continuation_of_prior_evidence_task=True,
+            prior_task_shape="targeted_lookup",
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register")
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved", "aggregate", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    _assert_aggregate_operation_blocked(result)
+    assert "prior_shape_inherited" not in result["reason_codes"]
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+
+
+def test_aggregate_block_preserves_semantic_source_ambiguity():
+    result = _derive(
+        _start_runtime(),
+        task_text="Calculate the median for the available values.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "aggregate", "source_b", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    _assert_aggregate_operation_blocked(result)
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+
+
+def test_unknown_semantic_operation_has_no_materiality_or_shape_authority():
+    result = _derive(
+        _start_runtime(),
+        task_text="How are you today?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register")
+            ),
+            semantic_advisory=_semantic_advisory("no_match", "unknown"),
+        ),
+    ).json()["result"]
+
+    _assert_not_applicable(result)
+    assert "semantic_operation_hint" not in result["reason_codes"]
+
+
+def test_supported_operation_remains_material_when_semantics_find_no_source():
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this bounded question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register")
+            ),
+            semantic_advisory=_semantic_advisory("no_match", "comparison"),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "no_match"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "cross_source_comparison"
+    assert result["evidence_scope_material"] is True
+
+
+def test_semantic_candidate_and_inventory_order_are_canonical():
+    runtime = _start_runtime()
+    source_a = _discovery_source(
+        "source_a",
+        "PRIVATE_DISPLAY_ALPHA",
+        domain_tags=["private_alpha", "alpha_domain"],
+        capabilities=["fetch", "search"],
+    )
+    source_b = _discovery_source(
+        "source_b",
+        "PRIVATE_DISPLAY_BETA",
+        domain_tags=["private_beta", "beta_domain"],
+        capabilities=["context", "profile"],
+    )
+    first = _derive(
+        runtime,
+        task_text="Please compare this bounded question.",
+        task_context=_context(
+            source_discovery=_discovery(source_a, source_b),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "comparison", "source_b", "source_a"
+            ),
+        ),
+    ).json()["result"]
+    reversed_a = {
+        **source_a,
+        "domain_tags": list(reversed(source_a["domain_tags"])),
+        "capabilities": list(reversed(source_a["capabilities"])),
+    }
+    reversed_b = {
+        **source_b,
+        "domain_tags": list(reversed(source_b["domain_tags"])),
+        "capabilities": list(reversed(source_b["capabilities"])),
+    }
+    second = _derive(
+        runtime,
+        task_text="Please compare this bounded question.",
+        task_context=_context(
+            source_discovery=_discovery(reversed_b, reversed_a),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "comparison", "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert first["source_match"] == second["source_match"]
+    assert first["task_shape"] == second["task_shape"]
+    assert first["derivation_id"] == second["derivation_id"]
+
+
+def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
+    runtime = _start_runtime()
+    _derive(
+        runtime,
+        task_text="SECRETQUESTIONMARKER please answer this question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "private_candidate_alpha",
+                    "PRIVATE_DISPLAY_SENTINEL Alpha",
+                    domain_tags=["PRIVATE_TAG_SENTINEL"],
+                    scope_refs={"project": "PRIVATE_SCOPE_SENTINEL"},
+                ),
+                _discovery_source(
+                    "private_candidate_beta",
+                    "Private Beta",
+                ),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous",
+                "comparison",
+                "private_candidate_beta",
+                "private_candidate_alpha",
+            ),
+        ),
+    )
+    payload = _shape_events(runtime["runtime_session_id"])[0]["event_payload_json"]
+    serialized = json.dumps(payload, sort_keys=True).lower()
+
+    assert payload["semantic_interpretation_status"] == "ambiguous"
+    assert payload["semantic_operation_hint"] == "comparison"
+    assert payload["semantic_candidate_count"] == 2
+    assert "matched_source_ids" not in payload
+    for sentinel in (
+        "secretquestionmarker",
+        "private_display_sentinel",
+        "private_tag_sentinel",
+        "private_scope_sentinel",
+        "private_candidate_alpha",
+        "private_candidate_beta",
+    ):
+        assert sentinel not in serialized
+
+
+def test_absent_semantic_advisory_preserves_legacy_identity_and_wire_shape():
+    request = EvidenceShapeDeriveRequest.model_validate(
+        {
+            "request_id": "request-legacy-fixed",
+            "owner_id": "owner-legacy-fixed",
+            "conversation_id": "conversation-legacy-fixed",
+            "surface": "web",
+            "runtime_session_id": "session-legacy-fixed",
+            "runtime_turn_id": "turn-legacy-fixed",
+            "task_text": "How are you today?",
+            "interaction_kind": "question",
+            "task_context": _context(),
+        }
+    )
+    result = _derive_result(request)
+    serialized = result.model_dump(mode="json", exclude_none=True)
+
+    assert result.derivation_id == "evidence_shape_1cb58e5b82b64cddec197a154e54f053"
+    assert "source_match" not in serialized
+    assert "semantic_advisory" not in serialized
+    assert all(not reason.startswith("semantic_") for reason in result.reason_codes)

@@ -930,6 +930,8 @@ EvidenceShapeReasonCode = Literal[
     "non_evidence_interaction",
     "ambiguous_interaction_without_shape_signal",
     "multiple_incompatible_shapes",
+    "semantic_operation_hint",
+    "semantic_operation_unsupported",
 ]
 SourceInventoryStatus = Literal["complete", "partial", "unknown", "unavailable"]
 SourceCapability = Literal["profile", "search", "fetch", "context"]
@@ -953,6 +955,22 @@ SourceMatchReasonCode = Literal[
     "inventory_partial",
     "inventory_unknown",
     "inventory_unavailable",
+    "semantic_candidate_validated",
+    "semantic_candidates_ambiguous",
+    "semantic_no_match",
+]
+SemanticInterpretationStatus = Literal["resolved", "ambiguous", "no_match"]
+SemanticOperationHint = Literal[
+    "lookup",
+    "latest",
+    "comparison",
+    "exhaustive_review",
+    "contradiction_review",
+    "absence_check",
+    "historical_reconstruction",
+    "decision_support",
+    "aggregate",
+    "unknown",
 ]
 
 
@@ -1010,6 +1028,30 @@ class SourceDiscoveryContext(BaseModel):
         return self
 
 
+class SemanticEvidenceAdvisory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    interpretation_status: SemanticInterpretationStatus
+    operation_hint: SemanticOperationHint
+    candidate_source_ids: list[EvidenceSufficiencyIdentifier] = Field(max_length=3)
+
+    @model_validator(mode="after")
+    def validate_candidate_set(self) -> SemanticEvidenceAdvisory:
+        candidate_count = len(self.candidate_source_ids)
+        if len(set(self.candidate_source_ids)) != candidate_count:
+            raise ValueError("duplicate_semantic_candidate_source_id")
+        if self.interpretation_status == "resolved" and candidate_count != 1:
+            raise ValueError("resolved_semantic_candidate_required")
+        if self.interpretation_status == "ambiguous" and candidate_count not in {
+            2,
+            3,
+        }:
+            raise ValueError("ambiguous_semantic_candidates_required")
+        if self.interpretation_status == "no_match" and candidate_count != 0:
+            raise ValueError("semantic_no_match_candidates_not_allowed")
+        return self
+
+
 class SourceMatchResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1041,6 +1083,7 @@ class EvidenceShapeContext(BaseModel):
     continuation_of_prior_evidence_task: bool
     prior_task_shape: EvidenceTaskShape | None = None
     source_discovery: SourceDiscoveryContext | None = None
+    semantic_advisory: SemanticEvidenceAdvisory | None = None
 
     @model_validator(mode="after")
     def validate_continuation_context(self) -> EvidenceShapeContext:
@@ -1050,6 +1093,16 @@ class EvidenceShapeContext(BaseModel):
             raise ValueError("prior_task_shape_required")
         if not self.continuation_of_prior_evidence_task and self.prior_task_shape is not None:
             raise ValueError("prior_task_shape_not_allowed")
+        if self.semantic_advisory is not None:
+            if self.source_discovery is None:
+                raise ValueError("semantic_advisory_source_discovery_required")
+            inventory_source_ids = {
+                source.source_id for source in self.source_discovery.sources
+            }
+            if not set(self.semantic_advisory.candidate_source_ids).issubset(
+                inventory_source_ids
+            ):
+                raise ValueError("semantic_candidate_source_not_in_inventory")
         return self
 
 
