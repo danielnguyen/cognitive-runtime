@@ -972,6 +972,26 @@ SemanticOperationHint = Literal[
     "aggregate",
     "unknown",
 ]
+AggregateFunction = Literal[
+    "median",
+    "mean",
+    "count",
+    "sum",
+    "minimum",
+    "maximum",
+]
+ConfiguredContentField = Annotated[
+    str,
+    Field(strict=True, min_length=1, max_length=120),
+]
+
+
+def _validate_configured_content_field(value: str) -> str:
+    if value != value.strip():
+        raise ValueError("configured_content_field_has_outer_whitespace")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("configured_content_field_has_control_character")
+    return value
 
 
 class SourceDiscoveryScopeReferences(BaseModel):
@@ -999,9 +1019,35 @@ class SourceDiscoveryEntry(BaseModel):
     connector: EvidenceSufficiencyIdentifier
     domain_tags: list[EvidenceSufficiencyIdentifier] = Field(max_length=8)
     scope_refs: SourceDiscoveryScopeReferences | None = None
+    content_fields: list[ConfiguredContentField] | None = Field(
+        default=None,
+        max_length=24,
+    )
     capabilities: list[SourceCapability] = Field(max_length=4)
     availability: SourceAvailability
     authority_role: SourceAuthorityRole
+
+    @model_serializer(mode="wrap")
+    def omit_absent_content_fields(self, handler):
+        serialized = handler(self)
+        if self.content_fields is None:
+            serialized.pop("content_fields", None)
+        return serialized
+
+    @field_validator("content_fields")
+    @classmethod
+    def validate_content_fields(
+        cls,
+        value: list[ConfiguredContentField] | None,
+    ) -> list[ConfiguredContentField] | None:
+        if value is None:
+            return value
+        validated = [_validate_configured_content_field(field) for field in value]
+        if len(set(validated)) != len(validated):
+            raise ValueError("duplicate_source_discovery_content_field")
+        if validated != sorted(validated):
+            raise ValueError("source_discovery_content_fields_not_sorted")
+        return validated
 
     @model_validator(mode="after")
     def validate_unique_values(self) -> SourceDiscoveryEntry:
@@ -1011,6 +1057,8 @@ class SourceDiscoveryEntry(BaseModel):
             raise ValueError("duplicate_source_discovery_capability")
         if "scope_refs" in self.model_fields_set and self.scope_refs is None:
             raise ValueError("source_discovery_scope_refs_null")
+        if "content_fields" in self.model_fields_set and self.content_fields is None:
+            raise ValueError("source_discovery_content_fields_null")
         return self
 
 
@@ -1034,9 +1082,42 @@ class SemanticEvidenceAdvisory(BaseModel):
     interpretation_status: SemanticInterpretationStatus
     operation_hint: SemanticOperationHint
     candidate_source_ids: list[EvidenceSufficiencyIdentifier] = Field(max_length=3)
+    aggregate_function: AggregateFunction | None = None
+    aggregate_field_name: ConfiguredContentField | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_aggregate_fields(self, handler):
+        serialized = handler(self)
+        if self.aggregate_function is None:
+            serialized.pop("aggregate_function", None)
+        if self.aggregate_field_name is None:
+            serialized.pop("aggregate_field_name", None)
+        return serialized
+
+    @field_validator("aggregate_field_name")
+    @classmethod
+    def validate_aggregate_field_name(
+        cls,
+        value: ConfiguredContentField | None,
+    ) -> ConfiguredContentField | None:
+        if value is None:
+            return value
+        return _validate_configured_content_field(value)
 
     @model_validator(mode="after")
     def validate_candidate_set(self) -> SemanticEvidenceAdvisory:
+        function_supplied = "aggregate_function" in self.model_fields_set
+        field_supplied = "aggregate_field_name" in self.model_fields_set
+        if function_supplied and self.aggregate_function is None:
+            raise ValueError("aggregate_function_null")
+        if field_supplied and self.aggregate_field_name is None:
+            raise ValueError("aggregate_field_name_null")
+        if self.operation_hint != "aggregate":
+            if function_supplied or field_supplied:
+                raise ValueError("aggregate_details_require_aggregate_operation")
+        elif function_supplied != field_supplied:
+            raise ValueError("aggregate_details_must_be_supplied_together")
+
         candidate_count = len(self.candidate_source_ids)
         if len(set(self.candidate_source_ids)) != candidate_count:
             raise ValueError("duplicate_semantic_candidate_source_id")
@@ -1123,6 +1204,20 @@ class EvidenceShapeContext(BaseModel):
                 inventory_source_ids
             ):
                 raise ValueError("semantic_candidate_source_not_in_inventory")
+            if (
+                self.semantic_advisory.operation_hint == "aggregate"
+                and self.semantic_advisory.aggregate_field_name is not None
+                and self.semantic_advisory.candidate_source_ids
+            ):
+                sources_by_id = {
+                    source.source_id: source for source in self.source_discovery.sources
+                }
+                for source_id in self.semantic_advisory.candidate_source_ids:
+                    content_fields = sources_by_id[source_id].content_fields
+                    if content_fields is None:
+                        raise ValueError("aggregate_candidate_content_fields_required")
+                    if self.semantic_advisory.aggregate_field_name not in content_fields:
+                        raise ValueError("aggregate_field_not_configured_for_candidate")
         return self
 
 

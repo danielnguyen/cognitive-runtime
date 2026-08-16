@@ -6,7 +6,12 @@ from itertools import count
 import pytest
 from fastapi.testclient import TestClient
 from main import app
-from models import EvidenceShapeDeriveRequest, SourceMatchResult
+from models import (
+    EvidenceShapeDeriveRequest,
+    SemanticEvidenceAdvisory,
+    SourceDiscoveryEntry,
+    SourceMatchResult,
+)
 from pydantic import ValidationError
 from services.evidence_shape import _derive_result
 
@@ -70,6 +75,7 @@ def _discovery_source(
     connector: str = "google_sheets",
     domain_tags: list[str] | None = None,
     scope_refs: dict[str, str] | None = None,
+    content_fields: list[str] | None = None,
     capabilities: list[str] | None = None,
     availability: str = "available",
     authority_role: str = "authoritative",
@@ -85,6 +91,8 @@ def _discovery_source(
     }
     if scope_refs is not None:
         source["scope_refs"] = scope_refs
+    if content_fields is not None:
+        source["content_fields"] = content_fields
     return source
 
 
@@ -99,12 +107,19 @@ def _semantic_advisory(
     interpretation_status: str,
     operation_hint: str,
     *candidate_source_ids: str,
+    aggregate_function: str | None = None,
+    aggregate_field_name: str | None = None,
 ) -> dict[str, object]:
-    return {
+    advisory: dict[str, object] = {
         "interpretation_status": interpretation_status,
         "operation_hint": operation_hint,
         "candidate_source_ids": list(candidate_source_ids),
     }
+    if aggregate_function is not None:
+        advisory["aggregate_function"] = aggregate_function
+    if aggregate_field_name is not None:
+        advisory["aggregate_field_name"] = aggregate_field_name
+    return advisory
 
 
 def _source_kind_topology() -> tuple[dict[str, object], ...]:
@@ -2906,3 +2921,497 @@ def test_absent_semantic_advisory_preserves_legacy_identity_and_wire_shape():
     assert "source_match" not in serialized
     assert "semantic_advisory" not in serialized
     assert all(not reason.startswith("semantic_") for reason in result.reason_codes)
+
+
+def _source_entry_payload(**overrides: object) -> dict[str, object]:
+    payload = _discovery_source("source_a", "Alpine Register")
+    payload.update(overrides)
+    return payload
+
+
+def _fixed_shape_request(
+    *,
+    task_text: str,
+    source_discovery: dict[str, object],
+    semantic_advisory: dict[str, object] | None = None,
+) -> EvidenceShapeDeriveRequest:
+    return EvidenceShapeDeriveRequest.model_validate(
+        {
+            "request_id": "request-aggregate-contract-fixed",
+            "owner_id": "owner-aggregate-contract-fixed",
+            "conversation_id": "conversation-aggregate-contract-fixed",
+            "surface": "web",
+            "runtime_session_id": "session-aggregate-contract-fixed",
+            "runtime_turn_id": "turn-aggregate-contract-fixed",
+            "task_text": task_text,
+            "interaction_kind": "question",
+            "task_context": _context(
+                source_discovery=source_discovery,
+                semantic_advisory=semantic_advisory,
+            ),
+        }
+    )
+
+
+def test_source_discovery_content_fields_are_optional_and_omitted_when_absent():
+    source = SourceDiscoveryEntry.model_validate(_source_entry_payload())
+
+    assert source.content_fields is None
+    assert "content_fields" not in source.model_dump(mode="json")
+
+
+def test_source_discovery_accepts_sorted_exact_content_fields():
+    source = SourceDiscoveryEntry.model_validate(
+        _source_entry_payload(content_fields=["Date", "Fuel (L)", "Odometer"])
+    )
+
+    assert source.content_fields == ["Date", "Fuel (L)", "Odometer"]
+    assert source.model_dump(mode="json")["content_fields"] == [
+        "Date",
+        "Fuel (L)",
+        "Odometer",
+    ]
+
+
+@pytest.mark.parametrize(
+    "content_fields",
+    [
+        None,
+        [""],
+        ["   "],
+        [" Fuel (L)"],
+        ["Fuel (L) "],
+        ["Fuel\n(L)"],
+        [1],
+        ["x" * 121],
+        [f"Field {index:02d}" for index in range(25)],
+        ["Date", "Date"],
+        ["Odometer", "Date"],
+    ],
+)
+def test_source_discovery_rejects_invalid_content_fields(content_fields: object):
+    with pytest.raises(ValidationError):
+        SourceDiscoveryEntry.model_validate(
+            _source_entry_payload(content_fields=content_fields)
+        )
+
+
+def test_legacy_aggregate_advisory_is_accepted_and_omits_new_fields():
+    advisory = SemanticEvidenceAdvisory.model_validate(
+        _semantic_advisory("resolved", "aggregate", "source_a")
+    )
+
+    assert advisory.aggregate_function is None
+    assert advisory.aggregate_field_name is None
+    assert advisory.model_dump(mode="json") == {
+        "interpretation_status": "resolved",
+        "operation_hint": "aggregate",
+        "candidate_source_ids": ["source_a"],
+    }
+
+
+@pytest.mark.parametrize(
+    "aggregate_function",
+    ["median", "mean", "count", "sum", "minimum", "maximum"],
+)
+def test_enriched_aggregate_advisory_accepts_closed_functions(
+    aggregate_function: str,
+):
+    advisory = SemanticEvidenceAdvisory.model_validate(
+        _semantic_advisory(
+            "resolved",
+            "aggregate",
+            "source_a",
+            aggregate_function=aggregate_function,
+            aggregate_field_name="Fuel (L)",
+        )
+    )
+
+    assert advisory.aggregate_function == aggregate_function
+    assert advisory.aggregate_field_name == "Fuel (L)"
+
+
+@pytest.mark.parametrize("aggregate_function", ["average", "min", "max", "mode"])
+def test_enriched_aggregate_advisory_rejects_unknown_functions(
+    aggregate_function: str,
+):
+    with pytest.raises(ValidationError):
+        SemanticEvidenceAdvisory.model_validate(
+            _semantic_advisory(
+                "resolved",
+                "aggregate",
+                "source_a",
+                aggregate_function=aggregate_function,
+                aggregate_field_name="Fuel (L)",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "median",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_field_name": "Fuel (L)",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": None,
+            "aggregate_field_name": "Fuel (L)",
+        },
+        {
+            "interpretation_status": "resolved",
+            "operation_hint": "aggregate",
+            "candidate_source_ids": ["source_a"],
+            "aggregate_function": "median",
+            "aggregate_field_name": None,
+        },
+    ],
+)
+def test_aggregate_advisory_rejects_one_sided_or_null_details(
+    payload: dict[str, object],
+):
+    with pytest.raises(ValidationError):
+        SemanticEvidenceAdvisory.model_validate(payload)
+
+
+@pytest.mark.parametrize("operation_hint", ["lookup", "latest", "comparison"])
+def test_non_aggregate_advisory_rejects_aggregate_details(operation_hint: str):
+    with pytest.raises(ValidationError):
+        SemanticEvidenceAdvisory.model_validate(
+            _semantic_advisory(
+                "resolved",
+                operation_hint,
+                "source_a",
+                aggregate_function="median",
+                aggregate_field_name="Fuel (L)",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "aggregate_field_name",
+    ["", "   ", " Fuel (L)", "Fuel (L) ", "Fuel\x7f(L)", "x" * 121],
+)
+def test_aggregate_advisory_rejects_invalid_field_names(
+    aggregate_field_name: str,
+):
+    with pytest.raises(ValidationError):
+        SemanticEvidenceAdvisory.model_validate(
+            _semantic_advisory(
+                "resolved",
+                "aggregate",
+                "source_a",
+                aggregate_function="median",
+                aggregate_field_name=aggregate_field_name,
+            )
+        )
+
+
+def test_enriched_resolved_aggregate_requires_exact_candidate_field():
+    request = _fixed_shape_request(
+        task_text="Calculate the requested statistic.",
+        source_discovery=_discovery(
+            _discovery_source(
+                "source_a",
+                "Alpine Register",
+                content_fields=["Date", "Fuel (L)", "Odometer"],
+            )
+        ),
+        semantic_advisory=_semantic_advisory(
+            "resolved",
+            "aggregate",
+            "source_a",
+            aggregate_function="median",
+            aggregate_field_name="Fuel (L)",
+        ),
+    )
+
+    result = _derive_result(request).model_dump(mode="json")
+    _assert_aggregate_operation_blocked(result)
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+    assert "probe_source_ids" not in result["source_match"]
+
+
+@pytest.mark.parametrize(
+    ("source_a_fields", "source_b_fields", "aggregate_field_name"),
+    [
+        (None, ["Fuel (L)"], "Fuel (L)"),
+        (["Date"], ["Fuel (L)"], "Fuel (L)"),
+        (["Fuel (L)"], ["Fuel (L)"], "fuel (l)"),
+        (["Fuel (L)"], ["Fuel (L)"], "Fuel"),
+    ],
+)
+def test_enriched_aggregate_rejects_missing_or_inexact_candidate_field(
+    source_a_fields: list[str] | None,
+    source_b_fields: list[str],
+    aggregate_field_name: str,
+):
+    with pytest.raises(ValidationError):
+        _fixed_shape_request(
+            task_text="Calculate the requested statistic.",
+            source_discovery=_discovery(
+                _discovery_source(
+                    "source_a",
+                    "Alpine Register",
+                    content_fields=source_a_fields,
+                ),
+                _discovery_source(
+                    "source_b",
+                    "Harbor Register",
+                    content_fields=source_b_fields,
+                ),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved",
+                "aggregate",
+                "source_a",
+                aggregate_function="median",
+                aggregate_field_name=aggregate_field_name,
+            ),
+        )
+
+
+def test_enriched_aggregate_rejects_field_found_only_on_unrelated_source():
+    with pytest.raises(ValidationError):
+        _fixed_shape_request(
+            task_text="Calculate the requested statistic.",
+            source_discovery=_discovery(
+                _discovery_source(
+                    "source_a", "Alpine Register", content_fields=["Date"]
+                ),
+                _discovery_source(
+                    "source_b",
+                    "Harbor Register",
+                    content_fields=["Fuel (L)"],
+                ),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved",
+                "aggregate",
+                "source_a",
+                aggregate_function="median",
+                aggregate_field_name="Fuel (L)",
+            ),
+        )
+
+
+@pytest.mark.parametrize("candidate_count", [2, 3])
+def test_enriched_aggregate_ambiguity_requires_field_on_every_candidate(
+    candidate_count: int,
+):
+    sources = [
+        _discovery_source(
+            f"source_{index}",
+            f"Register {index}",
+            content_fields=["Date", "Fuel (L)"],
+        )
+        for index in range(candidate_count)
+    ]
+    candidate_ids = [f"source_{index}" for index in range(candidate_count)]
+    request = _fixed_shape_request(
+        task_text="Calculate the requested statistic.",
+        source_discovery=_discovery(*sources),
+        semantic_advisory=_semantic_advisory(
+            "ambiguous",
+            "aggregate",
+            *candidate_ids,
+            aggregate_function="median",
+            aggregate_field_name="Fuel (L)",
+        ),
+    )
+
+    result = _derive_result(request).model_dump(mode="json")
+    _assert_aggregate_operation_blocked(result)
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "probe_source_ids" not in result["source_match"]
+
+
+def test_enriched_aggregate_ambiguity_rejects_field_missing_from_one_candidate():
+    with pytest.raises(ValidationError):
+        _fixed_shape_request(
+            task_text="Calculate the requested statistic.",
+            source_discovery=_discovery(
+                _discovery_source(
+                    "source_a", "Alpine Register", content_fields=["Fuel (L)"]
+                ),
+                _discovery_source(
+                    "source_b", "Harbor Register", content_fields=["Date"]
+                ),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous",
+                "aggregate",
+                "source_a",
+                "source_b",
+                aggregate_function="median",
+                aggregate_field_name="Fuel (L)",
+            ),
+        )
+
+
+@pytest.mark.parametrize("enriched", [False, True])
+def test_aggregate_no_match_accepts_legacy_and_enriched_contracts(enriched: bool):
+    aggregate_details = (
+        {"aggregate_function": "median", "aggregate_field_name": "Fuel (L)"}
+        if enriched
+        else {}
+    )
+    request = _fixed_shape_request(
+        task_text="Calculate the requested statistic.",
+        source_discovery=_discovery(),
+        semantic_advisory=_semantic_advisory(
+            "no_match",
+            "aggregate",
+            **aggregate_details,
+        ),
+    )
+
+    result = _derive_result(request).model_dump(mode="json")
+    _assert_aggregate_operation_blocked(result)
+    assert result["source_match"]["status"] == "no_match"
+    assert result["source_match"]["matched_source_ids"] == []
+
+
+def test_unknown_aggregate_candidate_remains_rejected_by_inventory_binding():
+    with pytest.raises(ValidationError):
+        _fixed_shape_request(
+            task_text="Calculate the requested statistic.",
+            source_discovery=_discovery(
+                _discovery_source(
+                    "source_a", "Alpine Register", content_fields=["Fuel (L)"]
+                )
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved",
+                "aggregate",
+                "source_unknown",
+                aggregate_function="median",
+                aggregate_field_name="Fuel (L)",
+            ),
+        )
+
+
+def test_legacy_contract_fields_preserve_serialized_semantics():
+    request = _fixed_shape_request(
+        task_text="Calculate the requested statistic.",
+        source_discovery=_discovery(
+            _discovery_source("source_a", "Alpine Register")
+        ),
+        semantic_advisory=_semantic_advisory(
+            "resolved", "aggregate", "source_a"
+        ),
+    )
+    serialized_context = request.task_context.model_dump(mode="json")
+
+    assert "content_fields" not in serialized_context["source_discovery"]["sources"][0]
+    assert "aggregate_function" not in serialized_context["semantic_advisory"]
+    assert "aggregate_field_name" not in serialized_context["semantic_advisory"]
+    result = _derive_result(request).model_dump(mode="json")
+    _assert_aggregate_operation_blocked(result)
+
+
+def test_enriched_aggregate_derivation_is_order_independent_and_meaning_bound():
+    sources = (
+        _discovery_source(
+            "source_a",
+            "Alpine Register",
+            content_fields=["Date", "Fuel (L)", "Odometer"],
+        ),
+        _discovery_source(
+            "source_b",
+            "Harbor Register",
+            content_fields=["Date", "Fuel (L)", "Odometer"],
+        ),
+    )
+
+    def derive(
+        *,
+        inventory: tuple[dict[str, object], ...],
+        candidates: tuple[str, ...],
+        function: str = "median",
+        field: str = "Fuel (L)",
+    ) -> dict[str, object]:
+        request = _fixed_shape_request(
+            task_text="Calculate the requested statistic.",
+            source_discovery=_discovery(*inventory),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous",
+                "aggregate",
+                *candidates,
+                aggregate_function=function,
+                aggregate_field_name=field,
+            ),
+        )
+        return _derive_result(request).model_dump(mode="json")
+
+    first = derive(inventory=sources, candidates=("source_b", "source_a"))
+    reordered = derive(
+        inventory=tuple(reversed(sources)),
+        candidates=("source_a", "source_b"),
+    )
+    changed_function = derive(
+        inventory=sources,
+        candidates=("source_a", "source_b"),
+        function="mean",
+    )
+    changed_field = derive(
+        inventory=tuple(
+            {
+                **source,
+                "content_fields": ["Date", "Fuel (L)", "Odometer"],
+            }
+            for source in sources
+        ),
+        candidates=("source_a", "source_b"),
+        field="Odometer",
+    )
+
+    assert first["source_match"] == reordered["source_match"]
+    assert first["derivation_id"] == reordered["derivation_id"]
+    assert first["derivation_id"] != changed_function["derivation_id"]
+    assert first["derivation_id"] != changed_field["derivation_id"]
+
+
+def test_enriched_aggregate_event_omits_contract_metadata():
+    runtime = _start_runtime()
+    response = _derive(
+        runtime,
+        task_text="Calculate the requested statistic.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "source_a",
+                    "Alpine Register",
+                    content_fields=["PRIVATE_AGGREGATE_FIELD"],
+                )
+            ),
+            semantic_advisory=_semantic_advisory(
+                "resolved",
+                "aggregate",
+                "source_a",
+                aggregate_function="median",
+                aggregate_field_name="PRIVATE_AGGREGATE_FIELD",
+            ),
+        ),
+    )
+    assert response.status_code == 200
+
+    payload = _shape_events(runtime["runtime_session_id"])[0]["event_payload_json"]
+    serialized = json.dumps(payload, sort_keys=True)
+    assert payload["semantic_operation_hint"] == "aggregate"
+    assert "aggregate_function" not in payload
+    assert "aggregate_field_name" not in payload
+    assert "content_fields" not in payload
+    assert "PRIVATE_AGGREGATE_FIELD" not in serialized
