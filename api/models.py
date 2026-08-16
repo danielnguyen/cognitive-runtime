@@ -980,17 +980,29 @@ AggregateFunction = Literal[
     "minimum",
     "maximum",
 ]
-ConfiguredContentField = Annotated[
+DiscoverableContentField = Annotated[
+    str,
+    Field(strict=True, min_length=1, max_length=120),
+]
+AggregateFieldName = Annotated[
     str,
     Field(strict=True, min_length=1, max_length=120),
 ]
 
 
-def _validate_configured_content_field(value: str) -> str:
-    if value != value.strip():
-        raise ValueError("configured_content_field_has_outer_whitespace")
+def _validate_discoverable_content_field(value: str) -> str:
+    if not value.strip():
+        raise ValueError("discoverable_content_field_blank")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise ValueError("configured_content_field_has_control_character")
+        raise ValueError("discoverable_content_field_has_control_character")
+    return value
+
+
+def _validate_aggregate_field_name(value: str) -> str:
+    if value != value.strip():
+        raise ValueError("aggregate_field_name_has_outer_whitespace")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("aggregate_field_name_has_control_character")
     return value
 
 
@@ -1019,7 +1031,7 @@ class SourceDiscoveryEntry(BaseModel):
     connector: EvidenceSufficiencyIdentifier
     domain_tags: list[EvidenceSufficiencyIdentifier] = Field(max_length=8)
     scope_refs: SourceDiscoveryScopeReferences | None = None
-    content_fields: list[ConfiguredContentField] | None = Field(
+    content_fields: list[DiscoverableContentField] | None = Field(
         default=None,
         max_length=24,
     )
@@ -1038,11 +1050,11 @@ class SourceDiscoveryEntry(BaseModel):
     @classmethod
     def validate_content_fields(
         cls,
-        value: list[ConfiguredContentField] | None,
-    ) -> list[ConfiguredContentField] | None:
+        value: list[DiscoverableContentField] | None,
+    ) -> list[DiscoverableContentField] | None:
         if value is None:
             return value
-        validated = [_validate_configured_content_field(field) for field in value]
+        validated = [_validate_discoverable_content_field(field) for field in value]
         if len(set(validated)) != len(validated):
             raise ValueError("duplicate_source_discovery_content_field")
         if validated != sorted(validated):
@@ -1083,7 +1095,7 @@ class SemanticEvidenceAdvisory(BaseModel):
     operation_hint: SemanticOperationHint
     candidate_source_ids: list[EvidenceSufficiencyIdentifier] = Field(max_length=3)
     aggregate_function: AggregateFunction | None = None
-    aggregate_field_name: ConfiguredContentField | None = None
+    aggregate_field_name: AggregateFieldName | None = None
 
     @model_serializer(mode="wrap")
     def omit_absent_aggregate_fields(self, handler):
@@ -1098,11 +1110,11 @@ class SemanticEvidenceAdvisory(BaseModel):
     @classmethod
     def validate_aggregate_field_name(
         cls,
-        value: ConfiguredContentField | None,
-    ) -> ConfiguredContentField | None:
+        value: AggregateFieldName | None,
+    ) -> AggregateFieldName | None:
         if value is None:
             return value
-        return _validate_configured_content_field(value)
+        return _validate_aggregate_field_name(value)
 
     @model_validator(mode="after")
     def validate_candidate_set(self) -> SemanticEvidenceAdvisory:

@@ -2973,14 +2973,47 @@ def test_source_discovery_accepts_sorted_exact_content_fields():
     ]
 
 
+def test_source_discovery_accepts_dsa_valid_outer_whitespace_unchanged():
+    source = SourceDiscoveryEntry.model_validate(
+        _source_entry_payload(content_fields=[" Fuel (L)", "Date", "Fuel (L) "])
+    )
+
+    assert source.content_fields == [" Fuel (L)", "Date", "Fuel (L) "]
+    assert source.model_dump(mode="json")["content_fields"] == [
+        " Fuel (L)",
+        "Date",
+        "Fuel (L) ",
+    ]
+
+
+def test_non_aggregate_shape_accepts_dsa_valid_outer_whitespace_metadata():
+    request = _fixed_shape_request(
+        task_text="Please handle this bounded question.",
+        source_discovery=_discovery(
+            _discovery_source(
+                "source_a",
+                "Alpine Register",
+                content_fields=[" Fuel (L)"],
+            )
+        ),
+        semantic_advisory=_semantic_advisory("resolved", "lookup", "source_a"),
+    )
+
+    result = _derive_result(request).model_dump(mode="json")
+    assert request.task_context.source_discovery.sources[0].content_fields == [
+        " Fuel (L)"
+    ]
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "targeted_lookup"
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+
+
 @pytest.mark.parametrize(
     "content_fields",
     [
         None,
         [""],
         ["   "],
-        [" Fuel (L)"],
-        ["Fuel (L) "],
         ["Fuel\n(L)"],
         [1],
         ["x" * 121],
@@ -3148,6 +3181,7 @@ def test_enriched_resolved_aggregate_requires_exact_candidate_field():
     [
         (None, ["Fuel (L)"], "Fuel (L)"),
         (["Date"], ["Fuel (L)"], "Fuel (L)"),
+        ([" Fuel (L)"], ["Fuel (L)"], "Fuel (L)"),
         (["Fuel (L)"], ["Fuel (L)"], "fuel (l)"),
         (["Fuel (L)"], ["Fuel (L)"], "Fuel"),
     ],
