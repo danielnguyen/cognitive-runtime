@@ -7,7 +7,9 @@ import pytest
 from fastapi.testclient import TestClient
 from main import app
 from models import (
+    AggregateSpec,
     EvidenceShapeDeriveRequest,
+    EvidenceShapeResult,
     SemanticEvidenceAdvisory,
     SourceDiscoveryEntry,
     SourceMatchResult,
@@ -2720,6 +2722,21 @@ def test_aggregate_blocks_inherited_continuation_shape():
     assert result["source_match"]["matched_source_ids"] == ["source_a"]
 
 
+def test_aggregate_prior_shape_cannot_derive_without_current_authority():
+    result = _derive(
+        _start_runtime(),
+        task_text="Continue the prior calculation.",
+        task_context=_context(
+            continuation_of_prior_evidence_task=True,
+            prior_task_shape="aggregate",
+        ),
+    ).json()["result"]
+
+    assert result["derivation_status"] == "ambiguous"
+    assert result["task_shape"] is None
+    assert "aggregate_spec" not in result
+
+
 def test_aggregate_block_preserves_semantic_source_ambiguity():
     result = _derive(
         _start_runtime(),
@@ -3171,9 +3188,219 @@ def test_enriched_resolved_aggregate_requires_exact_candidate_field():
     )
 
     result = _derive_result(request).model_dump(mode="json")
-    _assert_aggregate_operation_blocked(result)
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "aggregate"
+    assert result["candidate_task_shapes"] == ["aggregate"]
+    assert result["clarification_required"] is False
+    assert result["aggregate_spec"] == {
+        "function": "median",
+        "field_name": "Fuel (L)",
+    }
     assert result["source_match"]["matched_source_ids"] == ["source_a"]
     assert "probe_source_ids" not in result["source_match"]
+    assert "semantic_operation_hint" in result["reason_codes"]
+    assert "semantic_operation_unsupported" not in result["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    "aggregate_function",
+    ["median", "mean", "count", "sum", "minimum", "maximum"],
+)
+def test_every_enriched_aggregate_function_derives_authority(
+    aggregate_function: str,
+):
+    request = _fixed_shape_request(
+        task_text="Calculate the requested statistic.",
+        source_discovery=_discovery(
+            _discovery_source(
+                "source_a",
+                "Alpine Register",
+                content_fields=["Fuel (L)"],
+            )
+        ),
+        semantic_advisory=_semantic_advisory(
+            "resolved",
+            "aggregate",
+            "source_a",
+            aggregate_function=aggregate_function,
+            aggregate_field_name="Fuel (L)",
+        ),
+    )
+
+    result = _derive_result(request)
+    assert result.derivation_status == "derived"
+    assert result.task_shape == "aggregate"
+    assert result.aggregate_spec == AggregateSpec(
+        function=aggregate_function,
+        field_name="Fuel (L)",
+    )
+
+
+@pytest.mark.parametrize("inventory_status", ["partial", "unknown", "unavailable"])
+def test_enriched_aggregate_requires_complete_inventory(inventory_status: str):
+    request = _fixed_shape_request(
+        task_text="Calculate the requested statistic.",
+        source_discovery=_discovery(
+            _discovery_source(
+                "source_a",
+                "Alpine Register",
+                content_fields=["Fuel (L)"],
+            ),
+            inventory_status=inventory_status,
+        ),
+        semantic_advisory=_semantic_advisory(
+            "resolved",
+            "aggregate",
+            "source_a",
+            aggregate_function="median",
+            aggregate_field_name="Fuel (L)",
+        ),
+    )
+
+    result = _derive_result(request).model_dump(mode="json")
+    _assert_aggregate_operation_blocked(result)
+    assert "aggregate_spec" not in result
+
+
+def test_enriched_aggregate_deterministic_source_conflict_fails_closed():
+    request = _fixed_shape_request(
+        task_text="What is in Alpine Register?",
+        source_discovery=_discovery(
+            _discovery_source(
+                "source_a",
+                "Alpine Register",
+                content_fields=["Fuel (L)"],
+            ),
+            _discovery_source(
+                "source_b",
+                "Harbor Register",
+                content_fields=["Fuel (L)"],
+            ),
+        ),
+        semantic_advisory=_semantic_advisory(
+            "resolved",
+            "aggregate",
+            "source_b",
+            aggregate_function="median",
+            aggregate_field_name="Fuel (L)",
+        ),
+    )
+
+    result = _derive_result(request).model_dump(mode="json")
+    _assert_aggregate_operation_blocked(result)
+    assert result["source_match"]["matched_source_ids"] == ["source_a"]
+    assert "aggregate_spec" not in result
+
+
+def test_derived_aggregate_identity_is_canonical_and_meaning_bound():
+    source_a = _discovery_source(
+        "source_a",
+        "Alpine Register",
+        content_fields=["Fuel (L)", "Odometer"],
+    )
+    source_b = _discovery_source(
+        "source_b",
+        "Harbor Register",
+        content_fields=["Fuel (L)", "Odometer"],
+    )
+
+    def derive(
+        *,
+        sources: tuple[dict[str, object], ...],
+        function: str = "median",
+        field_name: str = "Fuel (L)",
+    ) -> EvidenceShapeResult:
+        return _derive_result(
+            _fixed_shape_request(
+                task_text="Calculate the requested statistic.",
+                source_discovery=_discovery(*sources),
+                semantic_advisory=_semantic_advisory(
+                    "resolved",
+                    "aggregate",
+                    "source_a",
+                    aggregate_function=function,
+                    aggregate_field_name=field_name,
+                ),
+            )
+        )
+
+    first = derive(sources=(source_a, source_b))
+    reordered = derive(sources=(source_b, source_a))
+    changed_function = derive(sources=(source_a, source_b), function="mean")
+    changed_field = derive(sources=(source_a, source_b), field_name="Odometer")
+
+    assert first.derivation_id == reordered.derivation_id
+    assert first.derivation_id != changed_function.derivation_id
+    assert first.derivation_id != changed_field.derivation_id
+
+
+def _shape_result_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "derivation_id": "evidence-shape-model",
+        "question_anchor": "Which value is configured?",
+        "question_anchor_digest": f"sha256:{'a' * 64}",
+        "derivation_status": "derived",
+        "task_shape": "targeted_lookup",
+        "candidate_task_shapes": ["targeted_lookup"],
+        "evidence_scope_material": True,
+        "clarification_required": False,
+        "reason_codes": ["targeted_lookup_derived"],
+        "user_safe_summary": "A bounded shape was derived.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_aggregate_spec_and_shape_result_contract_is_strict_and_legacy_omits():
+    aggregate = EvidenceShapeResult.model_validate(
+        _shape_result_payload(
+            task_shape="aggregate",
+            candidate_task_shapes=["aggregate"],
+            aggregate_spec={"function": "median", "field_name": "Fuel (L)"},
+        )
+    )
+    legacy = EvidenceShapeResult.model_validate(_shape_result_payload())
+
+    assert aggregate.aggregate_spec == AggregateSpec(
+        function="median", field_name="Fuel (L)"
+    )
+    assert "aggregate_spec" not in legacy.model_dump(mode="json")
+
+    invalid_payloads = [
+        _shape_result_payload(
+            task_shape="aggregate", candidate_task_shapes=["aggregate"]
+        ),
+        _shape_result_payload(
+            aggregate_spec={"function": "median", "field_name": "Fuel (L)"}
+        ),
+        _shape_result_payload(
+            derivation_status="ambiguous",
+            task_shape=None,
+            candidate_task_shapes=[],
+            clarification_required=True,
+            aggregate_spec={"function": "median", "field_name": "Fuel (L)"},
+        ),
+        _shape_result_payload(
+            derivation_status="not_applicable",
+            task_shape=None,
+            candidate_task_shapes=[],
+            evidence_scope_material=False,
+            aggregate_spec={"function": "median", "field_name": "Fuel (L)"},
+        ),
+        _shape_result_payload(aggregate_spec=None),
+        _shape_result_payload(
+            task_shape="aggregate",
+            candidate_task_shapes=["aggregate"],
+            aggregate_spec={
+                "function": "median",
+                "field_name": "Fuel (L)",
+                "extra": "forbidden",
+            },
+        ),
+    ]
+    for payload in invalid_payloads:
+        with pytest.raises(ValidationError):
+            EvidenceShapeResult.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -3353,6 +3580,7 @@ def test_legacy_contract_fields_preserve_serialized_semantics():
     assert "aggregate_function" not in serialized_context["semantic_advisory"]
     assert "aggregate_field_name" not in serialized_context["semantic_advisory"]
     result = _derive_result(request).model_dump(mode="json")
+    assert result["derivation_id"] == "evidence_shape_eff626269a92a38645ed218650596086"
     _assert_aggregate_operation_blocked(result)
 
 
@@ -3444,6 +3672,8 @@ def test_enriched_aggregate_event_omits_contract_metadata():
 
     payload = _shape_events(runtime["runtime_session_id"])[0]["event_payload_json"]
     serialized = json.dumps(payload, sort_keys=True)
+    assert payload["task_shape"] == "aggregate"
+    assert payload["candidate_task_shapes"] == ["aggregate"]
     assert payload["semantic_operation_hint"] == "aggregate"
     assert "aggregate_function" not in payload
     assert "aggregate_field_name" not in payload

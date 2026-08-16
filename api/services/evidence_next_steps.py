@@ -38,6 +38,7 @@ _SUFFICIENCY_STATUSES = {
 }
 _TASK_SHAPES = {
     "targeted_lookup",
+    "aggregate",
     "bounded_exhaustive_review",
     "cross_source_comparison",
     "contradiction_review",
@@ -140,6 +141,7 @@ def _premise_digest(premise: EvidenceAcquisitionPremise) -> str:
         declared_scope=premise.declared_scope,
         source_inventory=premise.source_inventory,
         selected_strategies=premise.selected_strategies,
+        aggregate_spec=premise.aggregate_spec,
     )
 
 

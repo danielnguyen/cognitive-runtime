@@ -4,6 +4,7 @@ import json
 from hashlib import sha256
 
 from models import (
+    AggregateSpec,
     EvidenceAcquisitionStrategy,
     EvidenceCompletenessExpectation,
     EvidenceDeclaredScope,
@@ -24,6 +25,7 @@ from services.runtime_state import (
 
 _COMPLETENESS_BY_SHAPE: dict[str, EvidenceCompletenessExpectation] = {
     "targeted_lookup": "targeted_scope",
+    "aggregate": "complete_for_declared_scope",
     "bounded_exhaustive_review": "complete_for_declared_scope",
     "cross_source_comparison": "complete_for_selected_sources",
     "contradiction_review": "complete_for_selected_sources",
@@ -46,6 +48,11 @@ _COMPLETE_INVENTORY_SHAPES = {
 }
 _MATERIAL_REQUIREMENT_KINDS: dict[str, tuple[str, ...]] = {
     "targeted_lookup": ("targeted_evidence", "context_delivery"),
+    "aggregate": (
+        "complete_scope_coverage",
+        "context_delivery",
+        "no_material_truncation",
+    ),
     "bounded_exhaustive_review": (
         "authoritative_inventory",
         "complete_scope_coverage",
@@ -123,6 +130,7 @@ def evidence_acquisition_premise_digest(
     declared_scope: EvidenceDeclaredScope,
     source_inventory: list[EvidenceSourceDescriptor],
     selected_strategies: list[EvidenceAcquisitionStrategy],
+    aggregate_spec: AggregateSpec | None = None,
 ) -> str:
     scope = _normalized_scope(declared_scope)
     inventory = _normalized_inventory(source_inventory)
@@ -135,6 +143,8 @@ def evidence_acquisition_premise_digest(
         ],
         "selected_strategies": sorted(selected_strategies),
     }
+    if aggregate_spec is not None:
+        material["aggregate_spec"] = aggregate_spec.model_dump(mode="json")
     encoded = json.dumps(
         material,
         sort_keys=True,
@@ -173,6 +183,20 @@ def _eligible_sources(
         for source in inventory
         if source.availability == "available"
         and _within_declared_universe(source, scope)
+    ]
+
+
+def _aggregate_eligible_sources(
+    inventory: list[EvidenceSourceDescriptor],
+    scope: EvidenceDeclaredScope,
+) -> list[EvidenceSourceDescriptor]:
+    if len(scope.source_ids) != 1 or scope.exact_source_refs:
+        return []
+    return [
+        source
+        for source in inventory
+        if source.source_id == scope.source_ids[0]
+        and source.availability == "available"
     ]
 
 
@@ -215,7 +239,20 @@ def _select_strategy(
     task_shape: str,
     scope: EvidenceDeclaredScope,
     eligible: list[EvidenceSourceDescriptor],
+    aggregate_spec: AggregateSpec | None = None,
 ) -> EvidenceAcquisitionStrategy | None:
+    if task_shape == "aggregate":
+        if (
+            aggregate_spec is not None
+            and scope.inventory_status == "complete_for_declared_scope"
+            and len(eligible) == 1
+            and "context_expansion" in eligible[0].capabilities
+            and eligible[0].content_fields is not None
+            and aggregate_spec.field_name in eligible[0].content_fields
+        ):
+            return "structured_field_values"
+        return None
+
     if task_shape == "targeted_lookup":
         if scope.exact_source_refs:
             referenced_source_ids = {
@@ -318,6 +355,17 @@ def _normal_chat_execution_supported(
     eligible: list[EvidenceSourceDescriptor],
     strategy: EvidenceAcquisitionStrategy | None,
 ) -> bool:
+    if task_shape == "aggregate":
+        return bool(
+            strategy == "structured_field_values"
+            and scope.inventory_status == "complete_for_declared_scope"
+            and len(scope.source_ids) == 1
+            and not scope.exact_source_refs
+            and len(eligible) == 1
+            and eligible[0].source_id == scope.source_ids[0]
+            and "context_expansion" in eligible[0].capabilities
+        )
+
     if task_shape == "targeted_lookup":
         if scope.exact_source_refs:
             referenced_source_ids = {
@@ -462,6 +510,32 @@ def _shape_limitations(
     return limitations
 
 
+def _aggregate_limitations(
+    *,
+    scope: EvidenceDeclaredScope,
+    inventory: list[EvidenceSourceDescriptor],
+    aggregate_spec: AggregateSpec,
+) -> set[EvidencePlanLimitationCode]:
+    if len(scope.source_ids) != 1:
+        return set()
+    declared_source = next(
+        (
+            source
+            for source in inventory
+            if source.source_id == scope.source_ids[0]
+        ),
+        None,
+    )
+    if declared_source is None:
+        return set()
+    if (
+        declared_source.content_fields is None
+        or aggregate_spec.field_name not in declared_source.content_fields
+    ):
+        return {"aggregate_field_unavailable"}
+    return set()
+
+
 def _material_plan_supported(
     *,
     task_shape: str,
@@ -475,6 +549,16 @@ def _material_plan_supported(
         return False
     if "declared_source_missing_from_inventory" in limitations:
         return False
+    if task_shape == "aggregate":
+        return bool(
+            scope.inventory_status == "complete_for_declared_scope"
+            and len(scope.source_ids) == 1
+            and not scope.exact_source_refs
+            and len(eligible) == 1
+            and eligible[0].source_id == scope.source_ids[0]
+            and strategy == "structured_field_values"
+            and not limitations
+        )
     if task_shape in _COMPLETE_INVENTORY_SHAPES:
         if scope.inventory_status != "complete_for_declared_scope":
             return False
@@ -605,7 +689,11 @@ def compile_evidence_plan(
 
     scope = _normalized_scope(body.declared_scope)
     inventory = _normalized_inventory(body.source_inventory)
-    eligible = _eligible_sources(inventory, scope)
+    eligible = (
+        _aggregate_eligible_sources(inventory, scope)
+        if body.task_shape == "aggregate"
+        else _eligible_sources(inventory, scope)
+    )
     authoritative = [
         source for source in eligible if source.authority_role == "authoritative"
     ]
@@ -613,6 +701,7 @@ def compile_evidence_plan(
         task_shape=body.task_shape,
         scope=scope,
         eligible=eligible,
+        aggregate_spec=body.aggregate_spec,
     )
     limitations = _base_limitations(
         scope=scope,
@@ -628,6 +717,14 @@ def compile_evidence_plan(
             strategy=strategy,
         )
     )
+    if body.task_shape == "aggregate":
+        limitations.update(
+            _aggregate_limitations(
+                scope=scope,
+                inventory=inventory,
+                aggregate_spec=body.aggregate_spec,
+            )
+        )
     if (
         body.task_shape == "absence_or_coverage_check"
         and "authoritative_source_unavailable" in limitations
@@ -691,33 +788,39 @@ def compile_evidence_plan(
         ],
         "limitation_codes": limitation_codes,
     }
-    result = EvidencePlanResult(
-        plan_id=_plan_identity(
+    if body.aggregate_spec is not None:
+        identity_fields["aggregate_spec"] = body.aggregate_spec.model_dump(mode="json")
+    plan_result_fields = {
+        "plan_id": _plan_identity(
             body=body,
             question_digest=question_digest,
             scope=scope,
             inventory=inventory,
             result_fields=identity_fields,
         ),
-        question_anchor=body.question_anchor,
-        question_anchor_digest=question_digest,
-        task_shape=body.task_shape,
-        plan_status=status,
-        completeness_expectation=completeness,
-        contradiction_search_required=contradiction_required,
-        eligible_source_ids=identity_fields["eligible_source_ids"],
-        authoritative_source_ids=identity_fields["authoritative_source_ids"],
-        selected_strategies=selected_strategies,
-        declared_requirements=requirements,
-        limitation_codes=limitation_codes,
-        user_safe_summary=_safe_summary(status),
-    )
+        "question_anchor": body.question_anchor,
+        "question_anchor_digest": question_digest,
+        "task_shape": body.task_shape,
+        "plan_status": status,
+        "completeness_expectation": completeness,
+        "contradiction_search_required": contradiction_required,
+        "eligible_source_ids": identity_fields["eligible_source_ids"],
+        "authoritative_source_ids": identity_fields["authoritative_source_ids"],
+        "selected_strategies": selected_strategies,
+        "declared_requirements": requirements,
+        "limitation_codes": limitation_codes,
+        "user_safe_summary": _safe_summary(status),
+    }
+    if body.aggregate_spec is not None:
+        plan_result_fields["aggregate_spec"] = body.aggregate_spec
+    result = EvidencePlanResult.model_validate(plan_result_fields)
     acquisition_premise_digest = evidence_acquisition_premise_digest(
         question_anchor_digest=result.question_anchor_digest,
         task_shape=result.task_shape,
         declared_scope=scope,
         source_inventory=inventory,
         selected_strategies=result.selected_strategies,
+        aggregate_spec=result.aggregate_spec,
     )
 
     record_runtime_event(
