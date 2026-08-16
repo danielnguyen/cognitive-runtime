@@ -100,9 +100,7 @@ def _start_runtime(
         assert shape_result["question_anchor"] == question_anchor
         assert shape_result["task_shape"] == planned_premise["task_shape"]
         scope["_shape_result"] = shape_result
-    plan_response = client.post(
-        "/v1/runtime/evidence-plans/compile",
-        json={
+    plan_payload = {
             "request_id": f"compile-{ordinal}",
             "owner_id": scope["owner_id"],
             "conversation_id": scope["conversation_id"],
@@ -113,7 +111,12 @@ def _start_runtime(
             "task_shape": planned_premise["task_shape"],
             "declared_scope": planned_premise["declared_scope"],
             "source_inventory": planned_premise["source_inventory"],
-        },
+    }
+    if "aggregate_spec" in planned_premise:
+        plan_payload["aggregate_spec"] = planned_premise["aggregate_spec"]
+    plan_response = client.post(
+        "/v1/runtime/evidence-plans/compile",
+        json=plan_payload,
     )
     assert plan_response.status_code == 200
     plan_result = plan_response.json()["result"]
@@ -183,8 +186,9 @@ def _source(
     capabilities: list[str] | None = None,
     availability: str = "available",
     authority_role: str = "authoritative",
+    content_fields: list[str] | None = None,
 ) -> dict[str, object]:
-    return {
+    source: dict[str, object] = {
         "source_id": source_id,
         "source_categories": categories or ["records"],
         "capabilities": capabilities or [
@@ -194,6 +198,9 @@ def _source(
         "availability": availability,
         "authority_role": authority_role,
     }
+    if content_fields is not None:
+        source["content_fields"] = content_fields
+    return source
 
 
 def _shape_context(*, high_stakes_accuracy_required: bool = False) -> dict[str, object]:
@@ -217,8 +224,9 @@ def _premise(
     inventory_status: str = "complete_for_declared_scope",
     source_inventory: list[dict[str, object]] | None = None,
     selected_strategies: list[str] | None = None,
+    aggregate_spec: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    return {
+    premise: dict[str, object] = {
         "question_anchor_digest": _question_digest(question),
         "task_shape": task_shape,
         "declared_scope": {
@@ -234,6 +242,9 @@ def _premise(
         "source_inventory": source_inventory or [_source()],
         "selected_strategies": selected_strategies or ["targeted_retrieval"],
     }
+    if aggregate_spec is not None:
+        premise["aggregate_spec"] = aggregate_spec
+    return premise
 
 
 def _premise_digest(premise: dict[str, object]) -> str:
@@ -244,6 +255,7 @@ def _premise_digest(premise: dict[str, object]) -> str:
         declared_scope=model.declared_scope,
         source_inventory=model.source_inventory,
         selected_strategies=model.selected_strategies,
+        aggregate_spec=model.aggregate_spec,
     )
 
 
@@ -1642,3 +1654,114 @@ def test_event_is_structural_private_and_deterministic_for_reordered_inputs():
         "credential",
     ):
         assert excluded not in serialized
+
+
+def _aggregate_premise(
+    *,
+    function: str = "median",
+    field_name: str = "Fuel (L)",
+) -> dict[str, object]:
+    return _premise(
+        question="Calculate the requested statistic.",
+        task_shape="aggregate",
+        source_ids=["source-a"],
+        source_inventory=[
+            _source(
+                capabilities=["context_expansion"],
+                content_fields=["Fuel (L)", "Odometer"],
+            )
+        ],
+        selected_strategies=["structured_field_values"],
+        aggregate_spec={"function": function, "field_name": field_name},
+    )
+
+
+def _aggregate_requirements() -> list[dict[str, str]]:
+    return [
+        _requirement("aggregate-complete-scope", "complete_scope_coverage"),
+        _requirement("aggregate-context-delivery", "context_delivery"),
+        _requirement("aggregate-no-truncation", "no_material_truncation"),
+    ]
+
+
+def test_sufficient_aggregate_selects_bounded_conclusion_permission():
+    scope = _start_runtime(
+        question_anchor="Calculate the requested statistic.",
+        premise=_aggregate_premise(),
+    )
+    requirements = _aggregate_requirements()
+    evaluation = _evaluate(
+        scope,
+        requirements,
+        [
+            _fact(requirement["requirement_id"], "satisfied")
+            for requirement in requirements
+        ],
+        task_shape="aggregate",
+    )
+    response = _select(_next_step_payload(scope, evaluation))
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["task_shape"] == "aggregate"
+    assert result["sufficiency_status"] == "sufficient_for_declared_scope"
+    assert result["selected_next_step"] == "answer_within_declared_scope"
+    assert result["conclusion_disposition"] == "bounded_conclusion_allowed"
+    assert result["provider_disposition"] == "allowed"
+    plan_event = _plan_events(scope["runtime_session_id"])[0]["event_payload_json"]
+    assert result["current_premise_digest"] == plan_event[
+        "acquisition_premise_digest"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [("failed", "insufficient"), ("unknown", "unknown")],
+)
+def test_incomplete_aggregate_withholds_and_never_gets_targeted_advisory(
+    outcome: str,
+    expected_status: str,
+):
+    scope = _start_runtime(
+        question_anchor="Calculate the requested statistic.",
+        premise=_aggregate_premise(),
+    )
+    requirements = _aggregate_requirements()
+    facts = [
+        _fact(
+            requirement["requirement_id"],
+            outcome
+            if requirement["requirement_id"] == "aggregate-complete-scope"
+            else "satisfied",
+        )
+        for requirement in requirements
+    ]
+    evaluation = _evaluate(
+        scope,
+        requirements,
+        facts,
+        task_shape="aggregate",
+    )
+    response = _select(_next_step_payload(scope, evaluation))
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["sufficiency_status"] == expected_status
+    assert result["selected_next_step"] in {
+        "disclose_unexamined_scope",
+        "withhold_unsupported_conclusion",
+    }
+    assert result["conclusion_disposition"] == "requested_conclusion_withheld"
+    assert result["provider_disposition"] == "blocked"
+
+
+def test_aggregate_premise_digest_binds_function_and_exact_field():
+    median_fuel = _premise_digest(_aggregate_premise())
+    mean_fuel = _premise_digest(_aggregate_premise(function="mean"))
+    median_odometer = _premise_digest(
+        _aggregate_premise(field_name="Odometer")
+    )
+
+    assert median_fuel != mean_fuel
+    assert median_fuel != median_odometer
+    assert median_fuel == _premise_digest(_aggregate_premise())

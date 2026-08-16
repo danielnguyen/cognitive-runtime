@@ -552,3 +552,88 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
         "exception",
     ):
         assert excluded not in serialized
+
+
+def _aggregate_requirements() -> list[dict[str, str]]:
+    return [
+        _requirement(
+            "aggregate-complete-scope",
+            requirement_kind="complete_scope_coverage",
+        ),
+        _requirement(
+            "aggregate-context-delivery",
+            requirement_kind="context_delivery",
+        ),
+        _requirement(
+            "aggregate-no-truncation",
+            requirement_kind="no_material_truncation",
+        ),
+    ]
+
+
+def test_aggregate_complete_material_requirements_are_sufficient():
+    scope = _start_runtime()
+    scope["task_shape"] = "aggregate"
+    requirements = _aggregate_requirements()
+    response = _evaluate(
+        scope,
+        requirements,
+        [_fact(requirement["requirement_id"]) for requirement in requirements],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["sufficiency_status"] == (
+        "sufficient_for_declared_scope"
+    )
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "outcome"),
+    [
+        ("aggregate-complete-scope", "truncated"),
+        ("aggregate-no-truncation", "truncated"),
+        ("aggregate-context-delivery", "filtered"),
+    ],
+)
+def test_aggregate_material_failure_is_insufficient(
+    requirement_id: str,
+    outcome: str,
+):
+    scope = _start_runtime()
+    scope["task_shape"] = "aggregate"
+    requirements = _aggregate_requirements()
+    response = _evaluate(
+        scope,
+        requirements,
+        [
+            _fact(
+                requirement["requirement_id"],
+                outcome
+                if requirement["requirement_id"] == requirement_id
+                else "satisfied",
+            )
+            for requirement in requirements
+        ],
+    )
+
+    assert response.json()["result"]["sufficiency_status"] == "insufficient"
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "missing"])
+def test_aggregate_material_unknown_or_missing_is_unknown(outcome: str):
+    scope = _start_runtime()
+    scope["task_shape"] = "aggregate"
+    requirements = _aggregate_requirements()
+    facts = [
+        _fact(requirement["requirement_id"])
+        for requirement in requirements
+        if not (
+            outcome == "missing"
+            and requirement["requirement_id"] == "aggregate-complete-scope"
+        )
+    ]
+    if outcome == "unknown":
+        facts[0] = _fact("aggregate-complete-scope", "unknown")
+    response = _evaluate(scope, requirements, facts)
+
+    assert response.json()["result"]["sufficiency_status"] == "unknown"

@@ -896,6 +896,7 @@ EvidenceSufficiencySurface = Annotated[
 ]
 EvidenceTaskShape = Literal[
     "targeted_lookup",
+    "aggregate",
     "bounded_exhaustive_review",
     "cross_source_comparison",
     "contradiction_review",
@@ -1004,6 +1005,18 @@ def _validate_aggregate_field_name(value: str) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError("aggregate_field_name_has_control_character")
     return value
+
+
+class AggregateSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    function: AggregateFunction
+    field_name: AggregateFieldName
+
+    @field_validator("field_name")
+    @classmethod
+    def validate_field_name(cls, value: AggregateFieldName) -> AggregateFieldName:
+        return _validate_aggregate_field_name(value)
 
 
 class SourceDiscoveryScopeReferences(BaseModel):
@@ -1271,16 +1284,20 @@ class EvidenceShapeResult(BaseModel):
     reason_codes: list[EvidenceShapeReasonCode] = Field(max_length=17)
     user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
     source_match: SourceMatchResult | None = None
+    aggregate_spec: AggregateSpec | None = None
 
     @model_serializer(mode="wrap")
-    def omit_absent_source_match(self, handler):
+    def omit_absent_optional_fields(self, handler):
         serialized = handler(self)
         if self.source_match is None:
             serialized.pop("source_match", None)
+        if self.aggregate_spec is None:
+            serialized.pop("aggregate_spec", None)
         return serialized
 
     @model_validator(mode="after")
     def validate_derivation_outcome(self) -> EvidenceShapeResult:
+        aggregate_spec_supplied = "aggregate_spec" in self.model_fields_set
         if self.derivation_status == "derived":
             if self.task_shape is None or self.candidate_task_shapes != [self.task_shape]:
                 raise ValueError("invalid_derived_shape_outcome")
@@ -1296,6 +1313,11 @@ class EvidenceShapeResult(BaseModel):
                 raise ValueError("invalid_ambiguous_shape_outcome")
             if not self.evidence_scope_material or not self.clarification_required:
                 raise ValueError("invalid_ambiguous_shape_flags")
+        if self.derivation_status == "derived" and self.task_shape == "aggregate":
+            if self.aggregate_spec is None:
+                raise ValueError("aggregate_shape_requires_spec")
+        elif aggregate_spec_supplied:
+            raise ValueError("aggregate_spec_requires_derived_aggregate_shape")
         return self
 
 
@@ -1482,6 +1504,7 @@ EvidenceAcquisitionStrategy = Literal[
     "bounded_full_context",
     "structured_query",
     "hybrid",
+    "structured_field_values",
 ]
 EvidencePlanStatus = Literal["ready", "ready_with_limitations", "unsupported"]
 EvidenceCompletenessExpectation = Literal[
@@ -1508,6 +1531,7 @@ EvidencePlanLimitationCode = Literal[
     "historical_sequence_not_supported",
     "decision_support_scope_insufficient",
     "optional_source_unavailable",
+    "aggregate_field_unavailable",
 ]
 
 
@@ -1573,6 +1597,32 @@ class EvidenceSourceDescriptor(BaseModel):
     capabilities: list[EvidenceSourceCapability] = Field(max_length=5)
     availability: EvidenceSourceAvailability
     authority_role: EvidenceSourceAuthorityRole
+    content_fields: list[DiscoverableContentField] | None = Field(
+        default=None,
+        max_length=24,
+    )
+
+    @model_serializer(mode="wrap")
+    def omit_absent_content_fields(self, handler):
+        serialized = handler(self)
+        if self.content_fields is None:
+            serialized.pop("content_fields", None)
+        return serialized
+
+    @field_validator("content_fields")
+    @classmethod
+    def validate_content_fields(
+        cls,
+        value: list[DiscoverableContentField] | None,
+    ) -> list[DiscoverableContentField] | None:
+        if value is None:
+            return value
+        validated = [_validate_discoverable_content_field(field) for field in value]
+        if len(set(validated)) != len(validated):
+            raise ValueError("duplicate_source_content_field")
+        if validated != sorted(validated):
+            raise ValueError("source_content_fields_not_sorted")
+        return validated
 
     @model_validator(mode="after")
     def validate_unique_source_values(self) -> EvidenceSourceDescriptor:
@@ -1580,6 +1630,8 @@ class EvidenceSourceDescriptor(BaseModel):
             raise ValueError("duplicate_source_category")
         if len(set(self.capabilities)) != len(self.capabilities):
             raise ValueError("duplicate_source_capability")
+        if "content_fields" in self.model_fields_set and self.content_fields is None:
+            raise ValueError("source_content_fields_null")
         return self
 
 
@@ -1596,6 +1648,14 @@ class EvidencePlanCompileRequest(BaseModel):
     task_shape: EvidenceTaskShape
     declared_scope: EvidenceDeclaredScope
     source_inventory: list[EvidenceSourceDescriptor] = Field(max_length=32)
+    aggregate_spec: AggregateSpec | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_aggregate_spec(self, handler):
+        serialized = handler(self)
+        if self.aggregate_spec is None:
+            serialized.pop("aggregate_spec", None)
+        return serialized
 
     @field_validator("question_anchor", mode="before")
     @classmethod
@@ -1606,9 +1666,15 @@ class EvidencePlanCompileRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_unique_source_ids(self) -> EvidencePlanCompileRequest:
+        aggregate_spec_supplied = "aggregate_spec" in self.model_fields_set
         source_ids = [source.source_id for source in self.source_inventory]
         if len(set(source_ids)) != len(source_ids):
             raise ValueError("duplicate_source_descriptor")
+        if self.task_shape == "aggregate":
+            if self.aggregate_spec is None:
+                raise ValueError("aggregate_plan_request_requires_spec")
+        elif aggregate_spec_supplied:
+            raise ValueError("aggregate_spec_requires_aggregate_plan_request")
         return self
 
 
@@ -1631,6 +1697,24 @@ class EvidencePlanResult(BaseModel):
     declared_requirements: list[EvidenceRequirement] = Field(min_length=1, max_length=32)
     limitation_codes: list[EvidencePlanLimitationCode] = Field(max_length=16)
     user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+    aggregate_spec: AggregateSpec | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_aggregate_spec(self, handler):
+        serialized = handler(self)
+        if self.aggregate_spec is None:
+            serialized.pop("aggregate_spec", None)
+        return serialized
+
+    @model_validator(mode="after")
+    def validate_aggregate_spec(self) -> EvidencePlanResult:
+        aggregate_spec_supplied = "aggregate_spec" in self.model_fields_set
+        if self.task_shape == "aggregate":
+            if self.aggregate_spec is None:
+                raise ValueError("aggregate_plan_requires_spec")
+        elif aggregate_spec_supplied:
+            raise ValueError("aggregate_spec_requires_aggregate_plan")
+        return self
 
 
 class EvidencePlanCompileResponse(BaseModel):
@@ -1698,14 +1782,28 @@ class EvidenceAcquisitionPremise(BaseModel):
     declared_scope: EvidenceDeclaredScope
     source_inventory: list[EvidenceSourceDescriptor] = Field(max_length=32)
     selected_strategies: list[EvidenceAcquisitionStrategy] = Field(max_length=5)
+    aggregate_spec: AggregateSpec | None = None
+
+    @model_serializer(mode="wrap")
+    def omit_absent_aggregate_spec(self, handler):
+        serialized = handler(self)
+        if self.aggregate_spec is None:
+            serialized.pop("aggregate_spec", None)
+        return serialized
 
     @model_validator(mode="after")
     def validate_unique_premise_values(self) -> EvidenceAcquisitionPremise:
+        aggregate_spec_supplied = "aggregate_spec" in self.model_fields_set
         source_ids = [source.source_id for source in self.source_inventory]
         if len(set(source_ids)) != len(source_ids):
             raise ValueError("duplicate_source_descriptor")
         if len(set(self.selected_strategies)) != len(self.selected_strategies):
             raise ValueError("duplicate_acquisition_strategy")
+        if self.task_shape == "aggregate":
+            if self.aggregate_spec is None:
+                raise ValueError("aggregate_premise_requires_spec")
+        elif aggregate_spec_supplied:
+            raise ValueError("aggregate_spec_requires_aggregate_premise")
         return self
 
 

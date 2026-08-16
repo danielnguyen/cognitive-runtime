@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 
 from models import (
+    AggregateSpec,
     EvidenceShapeDerivationStatus,
     EvidenceShapeDeriveRequest,
     EvidenceShapeDeriveResponse,
@@ -628,6 +629,7 @@ def _derivation_identity(
     evidence_scope_material: bool,
     clarification_required: bool,
     reasons: list[EvidenceShapeReasonCode],
+    aggregate_spec: AggregateSpec | None,
 ) -> str:
     context = body.task_context.model_dump(mode="json")
     context["evidence_input_kinds"] = sorted(context["evidence_input_kinds"])
@@ -665,6 +667,8 @@ def _derivation_identity(
         "clarification_required": clarification_required,
         "reason_codes": reasons,
     }
+    if aggregate_spec is not None:
+        material["aggregate_spec"] = aggregate_spec.model_dump(mode="json")
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return f"evidence_shape_{sha256(encoded.encode('utf-8')).hexdigest()[:32]}"
 
@@ -677,14 +681,15 @@ def _build_result(
     candidates: list[EvidenceTaskShape],
     reasons: set[EvidenceShapeReasonCode],
     source_match: SourceMatchResult | None,
+    aggregate_spec: AggregateSpec | None = None,
 ) -> EvidenceShapeResult:
     sorted_candidates = sorted(set(candidates))
     sorted_reasons = sorted(reasons)
     material = status != "not_applicable"
     clarification = status == "ambiguous"
     question_digest = f"sha256:{sha256(body.task_text.encode('utf-8')).hexdigest()}"
-    return EvidenceShapeResult(
-        derivation_id=_derivation_identity(
+    result_fields = {
+        "derivation_id": _derivation_identity(
             body,
             question_digest=question_digest,
             status=status,
@@ -693,18 +698,22 @@ def _build_result(
             evidence_scope_material=material,
             clarification_required=clarification,
             reasons=sorted_reasons,
+            aggregate_spec=aggregate_spec,
         ),
-        question_anchor=body.task_text,
-        question_anchor_digest=question_digest,
-        derivation_status=status,
-        task_shape=task_shape,
-        candidate_task_shapes=sorted_candidates,
-        evidence_scope_material=material,
-        clarification_required=clarification,
-        reason_codes=sorted_reasons,
-        user_safe_summary=_safe_summary(status),
-        source_match=source_match,
-    )
+        "question_anchor": body.task_text,
+        "question_anchor_digest": question_digest,
+        "derivation_status": status,
+        "task_shape": task_shape,
+        "candidate_task_shapes": sorted_candidates,
+        "evidence_scope_material": material,
+        "clarification_required": clarification,
+        "reason_codes": sorted_reasons,
+        "user_safe_summary": _safe_summary(status),
+        "source_match": source_match,
+    }
+    if aggregate_spec is not None:
+        result_fields["aggregate_spec"] = aggregate_spec
+    return EvidenceShapeResult.model_validate(result_fields)
 
 
 def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
@@ -774,9 +783,35 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         )
 
     if semantic_operation == "aggregate":
-        reasons.update(
-            {"semantic_operation_hint", "semantic_operation_unsupported"}
+        advisory = context.semantic_advisory
+        aggregate_authorized = bool(
+            advisory is not None
+            and advisory.interpretation_status == "resolved"
+            and advisory.aggregate_function is not None
+            and advisory.aggregate_field_name is not None
+            and context.source_discovery is not None
+            and context.source_discovery.inventory_status == "complete"
+            and source_match is not None
+            and source_match.status == "matched"
+            and source_match.matched_source_ids
+            == sorted(advisory.candidate_source_ids)
         )
+        reasons.add("semantic_operation_hint")
+        if aggregate_authorized:
+            aggregate_spec = AggregateSpec(
+                function=advisory.aggregate_function,
+                field_name=advisory.aggregate_field_name,
+            )
+            return _build_result(
+                body,
+                status="derived",
+                task_shape="aggregate",
+                candidates=["aggregate"],
+                reasons=reasons,
+                source_match=source_match,
+                aggregate_spec=aggregate_spec,
+            )
+        reasons.add("semantic_operation_unsupported")
         return _build_result(
             body,
             status="ambiguous",
@@ -806,6 +841,16 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
     elif len(specialized) == 1:
         selected = next(iter(specialized))
     elif context.continuation_of_prior_evidence_task:
+        if context.prior_task_shape == "aggregate":
+            reasons.add("prior_shape_inherited")
+            return _build_result(
+                body,
+                status="ambiguous",
+                task_shape=None,
+                candidates=[],
+                reasons=reasons,
+                source_match=source_match,
+            )
         selected = context.prior_task_shape
         reasons.add("prior_shape_inherited")
     elif semantic_operation in _SEMANTIC_OPERATION_SHAPES:
