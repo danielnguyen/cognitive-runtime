@@ -1063,16 +1063,10 @@ class ClaimSupportProposal(BaseModel):
         exclusion_ids = [item.evidence_ref_id for item in self.material_exclusions]
         if len(exclusion_ids) != len(set(exclusion_ids)):
             raise ValueError("duplicate_material_exclusion")
-        evidence_roles = (
-            set(self.supporting_evidence_ref_ids),
-            set(self.counterevidence_ref_ids),
-            set(exclusion_ids),
-        )
-        if any(
-            left & right
-            for index, left in enumerate(evidence_roles)
-            for right in evidence_roles[index + 1 :]
-        ):
+        support_ids = set(self.supporting_evidence_ref_ids)
+        counter_ids = set(self.counterevidence_ref_ids)
+        exclusion_id_set = set(exclusion_ids)
+        if support_ids & counter_ids or counter_ids & exclusion_id_set:
             raise ValueError("conflicting_proposal_evidence_role")
         return self
 

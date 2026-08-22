@@ -804,6 +804,75 @@ def test_generic_proposal_references_are_closed_and_unique(
     assert expected_error in response.text
 
 
+def test_generic_supporting_evidence_may_disclose_partial_material_exclusion():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("collection-evidence")],
+        proposal={
+            "proposed_claim": "The usable entries support a bounded estimate.",
+            "supporting_evidence_ref_ids": ["collection-evidence"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [
+                {
+                    "evidence_ref_id": "collection-evidence",
+                    "reason": "One entry was ambiguous and excluded.",
+                }
+            ],
+            "executed_derivation_ref_ids": [],
+        },
+    )
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["calibration_status"] == "limited"
+    assert result["conclusion_disposition"] == "qualified"
+    assert result["qualification_required"] is True
+    assert result["validated_supporting_evidence_ref_ids"] == [
+        "collection-evidence"
+    ]
+    assert result["validated_material_exclusions"] == [
+        {
+            "evidence_ref_id": "collection-evidence",
+            "reason": "One entry was ambiguous and excluded.",
+        }
+    ]
+    assert "material_exclusion" in result["limitation_codes"]
+
+
+def test_generic_counterevidence_cannot_be_relabelled_as_exclusion():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[
+            _support_evidence(
+                "material-counter",
+                material_disclosure_required=True,
+                material_role="counterevidence",
+            )
+        ],
+        proposal={
+            "proposed_claim": "A bounded claim.",
+            "supporting_evidence_ref_ids": [],
+            "counterevidence_ref_ids": ["material-counter"],
+            "material_exclusions": [
+                {
+                    "evidence_ref_id": "material-counter",
+                    "reason": "The material conflicts with the claim.",
+                }
+            ],
+            "executed_derivation_ref_ids": [],
+        },
+    )
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 422
+    assert "conflicting_proposal_evidence_role" in response.text
+
+
 @pytest.mark.parametrize(
     ("authority_update", "expected_error"),
     [
@@ -840,10 +909,18 @@ def test_generic_complete_scope_requirement_is_claim_sensitive():
         },
         complete_declared_scope_established=False,
     )
-    exhaustive_scope = _start_runtime(request_id="exhaustive-start")
+    exhaustive_scope = _start_runtime(
+        request_id="exhaustive-start",
+        conversation_id="conversation-exhaustive",
+    )
     exhaustive = _support_payload(
         exhaustive_scope,
-        evidence_references=[_support_evidence("exhaustive-evidence")],
+        evidence_references=[
+            _support_evidence(
+                "exhaustive-evidence",
+                conversation_id="conversation-exhaustive",
+            )
+        ],
         proposal={
             "proposed_claim": "The declared scope contains no other records.",
             "supporting_evidence_ref_ids": ["exhaustive-evidence"],

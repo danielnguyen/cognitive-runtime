@@ -237,6 +237,10 @@ surface, runtime session and turn, authorized evidence identities, claim-relevan
 scope and acquisition facts, and actual deterministic derivation records. The
 proposal supplies only a bounded claim, supporting or counterevidence identities,
 material exclusions, and references to those executed derivations.
+One bounded evidence unit may both support a claim and carry a disclosed material
+exclusion when only part of that unit was usable. That overlap necessarily
+qualifies the result. Supporting and counterevidence roles remain mutually
+exclusive, and counterevidence cannot be relabelled as an exclusion.
 
 The evaluator rejects references outside that authority context and returns a
 CR-owned `supported`, `limited`, or `unsupported` calibration together with an
