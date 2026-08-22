@@ -14,6 +14,12 @@ from models import (
     ClaimEvidenceStrength,
     ClaimFreshnessSummary,
     ClaimLimitationCode,
+    ClaimSupportCalibrationStatus,
+    ClaimSupportConclusionDisposition,
+    ClaimSupportEvaluateRequest,
+    ClaimSupportEvaluateResponse,
+    ClaimSupportEvaluationResult,
+    ClaimSupportLimitationCode,
 )
 from services.runtime_state import (
     record_runtime_event,
@@ -339,5 +345,231 @@ def evaluate_claim_calibration(
         surface=body.surface,
         runtime_session_id=body.runtime_session_id,
         runtime_turn_id=body.runtime_turn_id,
+        result=result,
+    )
+
+
+def _claim_support_identity(
+    body: ClaimSupportEvaluateRequest,
+    claim_digest: str,
+    limitation_codes: list[ClaimSupportLimitationCode],
+) -> str:
+    proposal = body.proposal
+    material = {
+        "request_id": body.request_id,
+        "owner_id": body.authority_context.owner_id,
+        "conversation_id": body.authority_context.conversation_id,
+        "surface": body.authority_context.surface,
+        "runtime_session_id": body.authority_context.runtime_session_id,
+        "runtime_turn_id": body.authority_context.runtime_turn_id,
+        "claim_digest": claim_digest,
+        "supporting_evidence_ref_ids": sorted(proposal.supporting_evidence_ref_ids),
+        "counterevidence_ref_ids": sorted(proposal.counterevidence_ref_ids),
+        "material_exclusions": sorted(
+            (
+                {
+                    "evidence_ref_id": item.evidence_ref_id,
+                    "reason": item.reason,
+                }
+                for item in proposal.material_exclusions
+            ),
+            key=lambda item: (item["evidence_ref_id"], item["reason"]),
+        ),
+        "executed_derivation_ref_ids": sorted(
+            proposal.executed_derivation_ref_ids
+        ),
+        "limitation_codes": limitation_codes,
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return f"claim_{_digest(encoded)[:32]}"
+
+
+def _claim_support_summary(
+    calibration_status: ClaimSupportCalibrationStatus,
+) -> str:
+    if calibration_status == "supported":
+        return "The proposed claim has authorized support for the declared bounded scope."
+    if calibration_status == "limited":
+        return (
+            "The proposed claim has bounded support but requires explicit qualification "
+            "for the recorded limitations."
+        )
+    return (
+        "The proposed claim does not have enough authorized support for an "
+        "unqualified conclusion."
+    )
+
+
+def evaluate_claim_support(
+    body: ClaimSupportEvaluateRequest,
+) -> ClaimSupportEvaluateResponse:
+    context = body.authority_context
+    proposal = body.proposal
+    session = runtime_session_by_id(context.runtime_session_id)
+    if session is None:
+        raise RuntimeError("runtime_session_not_found")
+    if (
+        session.owner_id != context.owner_id
+        or session.conversation_id != context.conversation_id
+        or session.surface != context.surface
+    ):
+        raise RuntimeError("runtime_session_mismatch")
+    validate_runtime_turn_session(
+        runtime_session_id=context.runtime_session_id,
+        runtime_turn_id=context.runtime_turn_id,
+    )
+
+    evidence_by_id = {item.ref_id: item for item in context.evidence_references}
+    derivations_by_id = {
+        item.derivation_id: item for item in context.executed_derivations
+    }
+    support_ids = set(proposal.supporting_evidence_ref_ids)
+    counter_ids = set(proposal.counterevidence_ref_ids)
+    exclusion_ids = {
+        item.evidence_ref_id for item in proposal.material_exclusions
+    }
+    referenced_derivations = [
+        derivations_by_id[item]
+        for item in sorted(proposal.executed_derivation_ref_ids)
+    ]
+    derivation_evidence_ids = {
+        evidence_ref_id
+        for derivation in referenced_derivations
+        for evidence_ref_id in derivation.supporting_evidence_ref_ids
+    }
+    authority_support_ids = support_ids | derivation_evidence_ids
+    mentioned_ids = support_ids | counter_ids | exclusion_ids
+
+    limitations: list[ClaimSupportLimitationCode] = []
+    calibration_status: ClaimSupportCalibrationStatus = "supported"
+    disposition: ClaimSupportConclusionDisposition = "allowed"
+
+    def add_limitation(
+        code: ClaimSupportLimitationCode,
+        *,
+        severity: ClaimSupportCalibrationStatus,
+    ) -> None:
+        nonlocal calibration_status, disposition
+        if code not in limitations:
+            limitations.append(code)
+        if severity == "unsupported":
+            calibration_status = "unsupported"
+            disposition = "withheld"
+        elif calibration_status == "supported":
+            calibration_status = "limited"
+            disposition = "qualified"
+
+    if not support_ids and not referenced_derivations:
+        add_limitation("no_supporting_evidence", severity="unsupported")
+
+    for evidence_ref_id in sorted(authority_support_ids):
+        reference = evidence_by_id[evidence_ref_id]
+        if reference.source_authority == "limited":
+            add_limitation("limited_source_authority", severity="limited")
+        elif reference.source_authority == "unknown":
+            add_limitation("unknown_source_authority", severity="limited")
+        if reference.freshness == "stale":
+            add_limitation("stale_evidence", severity="limited")
+        elif reference.freshness == "unknown":
+            add_limitation("unknown_freshness", severity="limited")
+
+    if context.complete_declared_scope_required and (
+        context.complete_declared_scope_established is not True
+        or context.material_acquisition_limited
+    ):
+        add_limitation("complete_scope_not_established", severity="unsupported")
+    if context.material_acquisition_limited:
+        add_limitation("material_acquisition_limited", severity="limited")
+
+    for reference in sorted(context.evidence_references, key=lambda item: item.ref_id):
+        if reference.material_disclosure_required and reference.ref_id not in mentioned_ids:
+            add_limitation("material_evidence_omitted", severity="unsupported")
+        if reference.material_role == "counterevidence":
+            if reference.ref_id in support_ids:
+                add_limitation(
+                    "material_counterevidence_misclassified",
+                    severity="unsupported",
+                )
+            elif reference.ref_id in counter_ids:
+                add_limitation(
+                    "material_counterevidence_present",
+                    severity="limited",
+                )
+            elif reference.ref_id in exclusion_ids:
+                add_limitation(
+                    "material_counterevidence_excluded",
+                    severity="limited",
+                )
+        if reference.material_role == "support" and reference.ref_id in exclusion_ids:
+            add_limitation("material_support_excluded", severity="limited")
+
+    if counter_ids:
+        add_limitation("declared_counterevidence", severity="limited")
+    if exclusion_ids:
+        add_limitation("material_exclusion", severity="limited")
+    if any(
+        derivation.input_basis == "model_interpreted"
+        for derivation in referenced_derivations
+    ):
+        add_limitation("interpretation_dependent_derivation", severity="limited")
+    if not context.privacy_policy_allows_claim:
+        add_limitation("privacy_constraint", severity="unsupported")
+    if not context.consequence_policy_allows_claim:
+        add_limitation("consequence_constraint", severity="unsupported")
+
+    claim_digest = f"sha256:{_digest(proposal.proposed_claim)}"
+    result = ClaimSupportEvaluationResult(
+        claim_id=_claim_support_identity(body, claim_digest, limitations),
+        claim_digest=claim_digest,
+        calibration_status=calibration_status,
+        conclusion_disposition=disposition,
+        qualification_required=disposition != "allowed",
+        limitation_codes=limitations,
+        validated_supporting_evidence_ref_ids=sorted(support_ids),
+        validated_counterevidence_ref_ids=sorted(counter_ids),
+        validated_material_exclusions=sorted(
+            proposal.material_exclusions,
+            key=lambda item: (item.evidence_ref_id, item.reason),
+        ),
+        validated_executed_derivation_ref_ids=sorted(
+            proposal.executed_derivation_ref_ids
+        ),
+        user_safe_summary=_claim_support_summary(calibration_status),
+    )
+
+    record_runtime_event(
+        runtime_session_id=context.runtime_session_id,
+        runtime_turn_id=context.runtime_turn_id,
+        event_type="claim_support_evaluated",
+        event_payload_json={
+            "request_id": body.request_id,
+            "runtime_session_id": context.runtime_session_id,
+            "runtime_turn_id": context.runtime_turn_id,
+            "claim_id": result.claim_id,
+            "claim_digest": result.claim_digest,
+            "calibration_status": result.calibration_status,
+            "conclusion_disposition": result.conclusion_disposition,
+            "qualification_required": result.qualification_required,
+            "limitation_codes": result.limitation_codes,
+            "supporting_evidence_count": len(
+                result.validated_supporting_evidence_ref_ids
+            ),
+            "counterevidence_count": len(result.validated_counterevidence_ref_ids),
+            "material_exclusion_count": len(result.validated_material_exclusions),
+            "executed_derivation_count": len(
+                result.validated_executed_derivation_ref_ids
+            ),
+            "interpretation_dependent_derivation": (
+                "interpretation_dependent_derivation" in result.limitation_codes
+            ),
+        },
+    )
+    return ClaimSupportEvaluateResponse(
+        request_id=body.request_id,
+        owner_id=context.owner_id,
+        conversation_id=context.conversation_id,
+        surface=context.surface,
+        runtime_session_id=context.runtime_session_id,
+        runtime_turn_id=context.runtime_turn_id,
         result=result,
     )

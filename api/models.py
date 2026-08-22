@@ -143,6 +143,7 @@ RuntimeEventType = Literal[
     "confirmation_challenge_evaluated",
     "action_summary_recorded",
     "claim_calibration_evaluated",
+    "claim_support_evaluated",
     "evidence_shape_derived",
     "evidence_plan_compiled",
     "evidence_sufficiency_evaluated",
@@ -876,6 +877,268 @@ class ClaimCalibrationEvaluateResponse(BaseModel):
     runtime_session_id: ClaimCalibrationIdentifier
     runtime_turn_id: ClaimCalibrationIdentifier
     result: ClaimCalibrationResult
+
+
+ClaimSupportSourceAuthority = Literal["established", "limited", "unknown"]
+ClaimSupportFreshness = Literal["current", "stale", "unknown", "not_applicable"]
+ClaimSupportMaterialRole = Literal["support", "counterevidence", "neutral"]
+ClaimSupportInputBasis = Literal["system_established", "model_interpreted"]
+ClaimSupportCalibrationStatus = Literal["supported", "limited", "unsupported"]
+ClaimSupportConclusionDisposition = Literal["allowed", "qualified", "withheld"]
+ClaimSupportLimitationCode = Literal[
+    "no_supporting_evidence",
+    "limited_source_authority",
+    "unknown_source_authority",
+    "stale_evidence",
+    "unknown_freshness",
+    "complete_scope_not_established",
+    "material_acquisition_limited",
+    "material_evidence_omitted",
+    "material_counterevidence_present",
+    "material_counterevidence_excluded",
+    "material_counterevidence_misclassified",
+    "material_support_excluded",
+    "interpretation_dependent_derivation",
+    "privacy_constraint",
+    "consequence_constraint",
+    "declared_counterevidence",
+    "material_exclusion",
+]
+ClaimSupportCanonicalNumber = Annotated[str, Field(min_length=1, max_length=128)]
+ClaimSupportDigest = Annotated[
+    str,
+    Field(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+]
+
+
+class ClaimSupportEvidenceAuthority(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref_id: ClaimCalibrationIdentifier
+    owner_id: ClaimCalibrationIdentifier
+    conversation_id: ClaimCalibrationIdentifier
+    source_authority: ClaimSupportSourceAuthority
+    freshness: ClaimSupportFreshness
+    material_disclosure_required: bool = False
+    material_role: ClaimSupportMaterialRole = "neutral"
+
+
+class ClaimSupportDerivationRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    derivation_id: ClaimCalibrationIdentifier
+    owner_id: ClaimCalibrationIdentifier
+    conversation_id: ClaimCalibrationIdentifier
+    runtime_session_id: ClaimCalibrationIdentifier
+    runtime_turn_id: ClaimCalibrationIdentifier
+    operation: Literal["divide", "mean"]
+    canonical_inputs: list[ClaimSupportCanonicalNumber] = Field(
+        min_length=1,
+        max_length=32,
+    )
+    canonical_result: ClaimSupportCanonicalNumber
+    execution_status: Literal["executed"]
+    execution_digest: ClaimSupportDigest
+    executor_version: ClaimCalibrationIdentifier
+    supporting_evidence_ref_ids: list[ClaimCalibrationIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    input_basis: ClaimSupportInputBasis
+
+    @model_validator(mode="after")
+    def validate_supporting_references(self) -> ClaimSupportDerivationRecord:
+        if len(self.supporting_evidence_ref_ids) != len(
+            set(self.supporting_evidence_ref_ids)
+        ):
+            raise ValueError("duplicate_derivation_evidence_reference")
+        if self.input_basis == "model_interpreted" and not self.supporting_evidence_ref_ids:
+            raise ValueError("interpreted_derivation_evidence_required")
+        return self
+
+
+class ClaimSupportAuthorityContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    owner_id: ClaimCalibrationIdentifier
+    conversation_id: ClaimCalibrationIdentifier
+    surface: Annotated[str, Field(min_length=1, max_length=64)]
+    runtime_session_id: ClaimCalibrationIdentifier
+    runtime_turn_id: ClaimCalibrationIdentifier
+    evidence_references: list[ClaimSupportEvidenceAuthority] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    complete_declared_scope_required: bool = False
+    complete_declared_scope_established: bool | None = None
+    material_acquisition_limited: bool = False
+    privacy_policy_allows_claim: bool = True
+    consequence_policy_allows_claim: bool = True
+    executed_derivations: list[ClaimSupportDerivationRecord] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+    @model_validator(mode="after")
+    def validate_authority_associations(self) -> ClaimSupportAuthorityContext:
+        evidence_ids: set[str] = set()
+        for reference in self.evidence_references:
+            if reference.owner_id != self.owner_id:
+                raise ValueError("evidence_owner_mismatch")
+            if reference.conversation_id != self.conversation_id:
+                raise ValueError("evidence_conversation_mismatch")
+            if reference.ref_id in evidence_ids:
+                raise ValueError("duplicate_evidence_reference")
+            evidence_ids.add(reference.ref_id)
+
+        derivation_ids: set[str] = set()
+        for derivation in self.executed_derivations:
+            if derivation.owner_id != self.owner_id:
+                raise ValueError("derivation_owner_mismatch")
+            if derivation.conversation_id != self.conversation_id:
+                raise ValueError("derivation_conversation_mismatch")
+            if derivation.runtime_session_id != self.runtime_session_id:
+                raise ValueError("derivation_session_mismatch")
+            if derivation.runtime_turn_id != self.runtime_turn_id:
+                raise ValueError("derivation_turn_mismatch")
+            if derivation.derivation_id in derivation_ids:
+                raise ValueError("duplicate_derivation_reference")
+            derivation_ids.add(derivation.derivation_id)
+            if not set(derivation.supporting_evidence_ref_ids) <= evidence_ids:
+                raise ValueError("derivation_evidence_reference_not_authorized")
+        return self
+
+
+class ClaimSupportMaterialExclusion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_ref_id: ClaimCalibrationIdentifier
+    reason: Annotated[str, Field(min_length=1, max_length=240)]
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return " ".join(value.split())
+
+
+class ClaimSupportProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposed_claim: Annotated[str, Field(min_length=1, max_length=1000)]
+    supporting_evidence_ref_ids: list[ClaimCalibrationIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    counterevidence_ref_ids: list[ClaimCalibrationIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    material_exclusions: list[ClaimSupportMaterialExclusion] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    executed_derivation_ref_ids: list[ClaimCalibrationIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+    @field_validator("proposed_claim", mode="before")
+    @classmethod
+    def normalize_proposed_claim(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return " ".join(value.split())
+
+    @model_validator(mode="after")
+    def validate_reference_uniqueness(self) -> ClaimSupportProposal:
+        collections = (
+            self.supporting_evidence_ref_ids,
+            self.counterevidence_ref_ids,
+            self.executed_derivation_ref_ids,
+        )
+        if any(len(items) != len(set(items)) for items in collections):
+            raise ValueError("duplicate_proposal_reference")
+        exclusion_ids = [item.evidence_ref_id for item in self.material_exclusions]
+        if len(exclusion_ids) != len(set(exclusion_ids)):
+            raise ValueError("duplicate_material_exclusion")
+        support_ids = set(self.supporting_evidence_ref_ids)
+        counter_ids = set(self.counterevidence_ref_ids)
+        exclusion_id_set = set(exclusion_ids)
+        if support_ids & counter_ids or counter_ids & exclusion_id_set:
+            raise ValueError("conflicting_proposal_evidence_role")
+        return self
+
+
+class ClaimSupportEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: ClaimCalibrationIdentifier
+    authority_context: ClaimSupportAuthorityContext
+    proposal: ClaimSupportProposal
+
+    @model_validator(mode="after")
+    def validate_proposal_references(self) -> ClaimSupportEvaluateRequest:
+        evidence_ids = {
+            item.ref_id for item in self.authority_context.evidence_references
+        }
+        proposal_evidence_ids = (
+            set(self.proposal.supporting_evidence_ref_ids)
+            | set(self.proposal.counterevidence_ref_ids)
+            | {item.evidence_ref_id for item in self.proposal.material_exclusions}
+        )
+        if not proposal_evidence_ids <= evidence_ids:
+            raise ValueError("proposal_evidence_reference_not_authorized")
+        derivation_ids = {
+            item.derivation_id for item in self.authority_context.executed_derivations
+        }
+        if not set(self.proposal.executed_derivation_ref_ids) <= derivation_ids:
+            raise ValueError("proposal_derivation_reference_not_executed")
+        return self
+
+
+class ClaimSupportEvaluationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: ClaimCalibrationIdentifier
+    claim_digest: ClaimSupportDigest
+    calibration_status: ClaimSupportCalibrationStatus
+    conclusion_disposition: ClaimSupportConclusionDisposition
+    qualification_required: bool
+    limitation_codes: list[ClaimSupportLimitationCode] = Field(
+        default_factory=list,
+        max_length=17,
+    )
+    validated_supporting_evidence_ref_ids: list[ClaimCalibrationIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    validated_counterevidence_ref_ids: list[ClaimCalibrationIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    validated_material_exclusions: list[ClaimSupportMaterialExclusion] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    validated_executed_derivation_ref_ids: list[ClaimCalibrationIdentifier] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    user_safe_summary: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class ClaimSupportEvaluateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: ClaimCalibrationIdentifier
+    owner_id: ClaimCalibrationIdentifier
+    conversation_id: ClaimCalibrationIdentifier
+    surface: Annotated[str, Field(min_length=1, max_length=64)]
+    runtime_session_id: ClaimCalibrationIdentifier
+    runtime_turn_id: ClaimCalibrationIdentifier
+    result: ClaimSupportEvaluationResult
 
 
 EvidenceSufficiencyIdentifier = Annotated[

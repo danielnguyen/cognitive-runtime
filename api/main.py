@@ -18,6 +18,8 @@ from models import (
     CapabilityMatchResponse,
     ClaimCalibrationEvaluateRequest,
     ClaimCalibrationEvaluateResponse,
+    ClaimSupportEvaluateRequest,
+    ClaimSupportEvaluateResponse,
     CompanionPolicyCompileRequest,
     CompanionPolicyCompileResponse,
     CompanionProfileActiveResponse,
@@ -112,7 +114,7 @@ from services.capability_authorization import (
     match_registered_capability,
     record_capability_confirmation,
 )
-from services.claim_calibration import evaluate_claim_calibration
+from services.claim_calibration import evaluate_claim_calibration, evaluate_claim_support
 from services.companion_contracts import companion_contracts_repository
 from services.companion_policy import (
     active_profile,
@@ -570,6 +572,22 @@ async def runtime_claim_calibration_evaluate(
 ) -> ClaimCalibrationEvaluateResponse:
     try:
         return evaluate_claim_calibration(body)
+    except RuntimeError as exc:
+        error = _bounded_http_error(exc, _CLAIM_CALIBRATION_ERROR_STATUS)
+        if error is not None:
+            raise error from exc
+        raise
+
+
+@app.post(
+    "/v1/runtime/claim-support/evaluate",
+    response_model=ClaimSupportEvaluateResponse,
+)
+async def runtime_claim_support_evaluate(
+    body: ClaimSupportEvaluateRequest,
+) -> ClaimSupportEvaluateResponse:
+    try:
+        return evaluate_claim_support(body)
     except RuntimeError as exc:
         error = _bounded_http_error(exc, _CLAIM_CALIBRATION_ERROR_STATUS)
         if error is not None:
