@@ -170,6 +170,7 @@ adapter-visible conversation identity.
 | Privacy context | `POST /v1/runtime/privacy-context/evaluate` |
 | Memory hygiene | `POST /v1/runtime/memory-hygiene/evaluate` |
 | Claim calibration | `POST /v1/runtime/claim-calibration/evaluate` |
+| Generic claim support evaluation | `POST /v1/runtime/claim-support/evaluate` |
 | Evidence shape derivation | `POST /v1/runtime/evidence-shapes/derive` |
 | Evidence planning | `POST /v1/runtime/evidence-plans/compile` |
 | Evidence sufficiency | `POST /v1/runtime/evidence-sufficiency/evaluate` |
@@ -228,6 +229,24 @@ uncertainty requirement, and safe explanation summary. The evaluator does not
 select evidence from a retrieval bundle, verify that referenced records physically
 exist, persist a durable claim record, call a model provider, or execute an
 external action.
+
+Generic claim support evaluation is an additive provider-free authority path.
+The request keeps system-established authority context separate from a shallow
+claim proposal. The authority context supplies the exact owner, conversation,
+surface, runtime session and turn, authorized evidence identities, claim-relevant
+scope and acquisition facts, and actual deterministic derivation records. The
+proposal supplies only a bounded claim, supporting or counterevidence identities,
+material exclusions, and references to those executed derivations.
+
+The evaluator rejects references outside that authority context and returns a
+CR-owned `supported`, `limited`, or `unsupported` calibration together with an
+`allowed`, `qualified`, or `withheld` conclusion disposition. Complete-scope and
+material-disclosure constraints apply only when the system context marks them as
+claim-relevant. Arithmetic execution does not upgrade a model-interpreted input
+premise into an independently established fact. The endpoint records only a
+bounded structural event; it does not log claim prose, source content, prompts,
+or hidden reasoning. It does not change the existing claim-calibration,
+evidence-planning, sufficiency, or next-step paths.
 
 Evidence shape derivation consumes the existing interaction classification, a
 bounded current task statement, and structural evidence-materiality context. It

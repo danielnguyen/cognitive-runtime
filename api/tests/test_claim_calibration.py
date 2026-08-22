@@ -72,6 +72,92 @@ def _evaluate(
     return client.post("/v1/runtime/claim-calibration/evaluate", json=payload)
 
 
+def _support_evidence(
+    ref_id: str,
+    *,
+    owner_id: str = "owner-1",
+    conversation_id: str = "conversation-1",
+    source_authority: str = "established",
+    freshness: str = "current",
+    material_disclosure_required: bool = False,
+    material_role: str = "neutral",
+) -> dict[str, object]:
+    return {
+        "ref_id": ref_id,
+        "owner_id": owner_id,
+        "conversation_id": conversation_id,
+        "source_authority": source_authority,
+        "freshness": freshness,
+        "material_disclosure_required": material_disclosure_required,
+        "material_role": material_role,
+    }
+
+
+def _executed_derivation(
+    scope: dict[str, str],
+    *,
+    derivation_id: str = "derivation-1",
+    evidence_ref_ids: list[str] | None = None,
+    input_basis: str = "system_established",
+) -> dict[str, object]:
+    return {
+        "derivation_id": derivation_id,
+        "owner_id": scope["owner_id"],
+        "conversation_id": scope["conversation_id"],
+        "runtime_session_id": scope["runtime_session_id"],
+        "runtime_turn_id": scope["runtime_turn_id"],
+        "operation": "divide",
+        "canonical_inputs": ["5", "8"],
+        "canonical_result": "0.625",
+        "execution_status": "executed",
+        "execution_digest": f"sha256:{'a' * 64}",
+        "executor_version": "decimal-v1",
+        "supporting_evidence_ref_ids": evidence_ref_ids or [],
+        "input_basis": input_basis,
+    }
+
+
+def _support_payload(
+    scope: dict[str, str],
+    *,
+    evidence_references: list[dict[str, object]] | None = None,
+    proposal: dict[str, object] | None = None,
+    executed_derivations: list[dict[str, object]] | None = None,
+    **authority_overrides: object,
+) -> dict[str, object]:
+    authority_context: dict[str, object] = {
+        "owner_id": scope["owner_id"],
+        "conversation_id": scope["conversation_id"],
+        "surface": scope["surface"],
+        "runtime_session_id": scope["runtime_session_id"],
+        "runtime_turn_id": scope["runtime_turn_id"],
+        "evidence_references": evidence_references or [],
+        "complete_declared_scope_required": False,
+        "complete_declared_scope_established": None,
+        "material_acquisition_limited": False,
+        "privacy_policy_allows_claim": True,
+        "consequence_policy_allows_claim": True,
+        "executed_derivations": executed_derivations or [],
+    }
+    authority_context.update(authority_overrides)
+    return {
+        "request_id": "request-claim-support",
+        "authority_context": authority_context,
+        "proposal": proposal
+        or {
+            "proposed_claim": "The bounded records support the proposed result.",
+            "supporting_evidence_ref_ids": [],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+    }
+
+
+def _evaluate_support(payload: dict[str, object]):
+    return client.post("/v1/runtime/claim-support/evaluate", json=payload)
+
+
 def test_single_current_manufacturer_source_remains_moderately_supported():
     scope = _start_runtime()
     response = _evaluate(
@@ -605,3 +691,461 @@ def test_api_response_and_runtime_event_agree_on_structural_outcome():
     ):
         assert payload[field] == result[field]
     assert payload["evidence_count"] == 1
+
+
+def test_generic_claim_support_allows_ordinary_claim_without_task_shape():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("evidence-1")],
+        proposal={
+            "proposed_claim": "  A bounded contextual claim is supported.  ",
+            "supporting_evidence_ref_ids": ["evidence-1"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        complete_declared_scope_established=False,
+    )
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["calibration_status"] == "supported"
+    assert result["conclusion_disposition"] == "allowed"
+    assert result["qualification_required"] is False
+    assert result["limitation_codes"] == []
+    assert result["validated_supporting_evidence_ref_ids"] == ["evidence-1"]
+    assert "task_shape" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "proposal_field",
+    [
+        "provenance",
+        "source_authority",
+        "freshness",
+        "completeness",
+        "execution_status",
+        "confidence",
+        "conclusion_disposition",
+        "action_permission",
+        "tool_permission",
+        "observation_status",
+    ],
+)
+def test_generic_proposal_rejects_authority_escalation_fields(
+    proposal_field: str,
+):
+    scope = _start_runtime()
+    proposal = {
+        "proposed_claim": "A bounded claim.",
+        "supporting_evidence_ref_ids": ["evidence-1"],
+        "counterevidence_ref_ids": [],
+        "material_exclusions": [],
+        "executed_derivation_ref_ids": [],
+        proposal_field: "provider-selected",
+    }
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("evidence-1")],
+        proposal=proposal,
+    )
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 422
+    assert "extra_forbidden" in response.text
+
+
+@pytest.mark.parametrize(
+    ("proposal_update", "expected_error"),
+    [
+        (
+            {"supporting_evidence_ref_ids": ["missing-evidence"]},
+            "proposal_evidence_reference_not_authorized",
+        ),
+        (
+            {"supporting_evidence_ref_ids": ["evidence-1", "evidence-1"]},
+            "duplicate_proposal_reference",
+        ),
+        (
+            {
+                "supporting_evidence_ref_ids": ["evidence-1"],
+                "counterevidence_ref_ids": ["evidence-1"],
+            },
+            "conflicting_proposal_evidence_role",
+        ),
+    ],
+)
+def test_generic_proposal_references_are_closed_and_unique(
+    proposal_update: dict[str, object],
+    expected_error: str,
+):
+    scope = _start_runtime()
+    proposal: dict[str, object] = {
+        "proposed_claim": "A bounded claim.",
+        "supporting_evidence_ref_ids": [],
+        "counterevidence_ref_ids": [],
+        "material_exclusions": [],
+        "executed_derivation_ref_ids": [],
+    }
+    proposal.update(proposal_update)
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("evidence-1")],
+        proposal=proposal,
+    )
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 422
+    assert expected_error in response.text
+
+
+@pytest.mark.parametrize(
+    ("authority_update", "expected_error"),
+    [
+        ({"owner_id": "owner-2"}, "evidence_owner_mismatch"),
+        ({"conversation_id": "conversation-2"}, "evidence_conversation_mismatch"),
+    ],
+)
+def test_generic_authority_rejects_evidence_association_mismatch(
+    authority_update: dict[str, object],
+    expected_error: str,
+):
+    scope = _start_runtime()
+    reference = _support_evidence("evidence-1")
+    reference.update(authority_update)
+    payload = _support_payload(scope, evidence_references=[reference])
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 422
+    assert expected_error in response.text
+
+
+def test_generic_complete_scope_requirement_is_claim_sensitive():
+    ordinary_scope = _start_runtime(request_id="ordinary-start")
+    ordinary = _support_payload(
+        ordinary_scope,
+        evidence_references=[_support_evidence("ordinary-evidence")],
+        proposal={
+            "proposed_claim": "A bounded ordinary claim.",
+            "supporting_evidence_ref_ids": ["ordinary-evidence"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        complete_declared_scope_established=False,
+    )
+    exhaustive_scope = _start_runtime(request_id="exhaustive-start")
+    exhaustive = _support_payload(
+        exhaustive_scope,
+        evidence_references=[_support_evidence("exhaustive-evidence")],
+        proposal={
+            "proposed_claim": "The declared scope contains no other records.",
+            "supporting_evidence_ref_ids": ["exhaustive-evidence"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        complete_declared_scope_required=True,
+        complete_declared_scope_established=False,
+    )
+
+    ordinary_result = _evaluate_support(ordinary).json()["result"]
+    exhaustive_result = _evaluate_support(exhaustive).json()["result"]
+
+    assert ordinary_result["conclusion_disposition"] == "allowed"
+    assert exhaustive_result["calibration_status"] == "unsupported"
+    assert exhaustive_result["conclusion_disposition"] == "withheld"
+    assert "complete_scope_not_established" in exhaustive_result["limitation_codes"]
+
+
+def test_generic_omitted_required_material_evidence_withholds_claim():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[
+            _support_evidence("support-1"),
+            _support_evidence(
+                "material-counter-1",
+                material_disclosure_required=True,
+                material_role="counterevidence",
+            ),
+        ],
+        proposal={
+            "proposed_claim": "A claim that omits known material evidence.",
+            "supporting_evidence_ref_ids": ["support-1"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert result["calibration_status"] == "unsupported"
+    assert result["conclusion_disposition"] == "withheld"
+    assert "material_evidence_omitted" in result["limitation_codes"]
+
+
+def test_generic_declared_material_counterevidence_requires_qualification():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[
+            _support_evidence("support-1"),
+            _support_evidence(
+                "material-counter-1",
+                material_disclosure_required=True,
+                material_role="counterevidence",
+            ),
+        ],
+        proposal={
+            "proposed_claim": "A claim with disclosed counterevidence.",
+            "supporting_evidence_ref_ids": ["support-1"],
+            "counterevidence_ref_ids": ["material-counter-1"],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert result["calibration_status"] == "limited"
+    assert result["conclusion_disposition"] == "qualified"
+    assert result["qualification_required"] is True
+    assert "material_counterevidence_present" in result["limitation_codes"]
+
+
+def test_generic_actual_system_derivation_is_validated_and_order_independent():
+    scope = _start_runtime()
+    evidence = [_support_evidence("evidence-1")]
+    derivation = _executed_derivation(scope, evidence_ref_ids=["evidence-1"])
+    proposal = {
+        "proposed_claim": "The deterministic result is 0.625.",
+        "supporting_evidence_ref_ids": ["evidence-1"],
+        "counterevidence_ref_ids": [],
+        "material_exclusions": [],
+        "executed_derivation_ref_ids": ["derivation-1"],
+    }
+    payload = _support_payload(
+        scope,
+        evidence_references=evidence,
+        proposal=proposal,
+        executed_derivations=[derivation],
+    )
+
+    first = _evaluate_support(payload)
+    second = _evaluate_support(payload)
+
+    assert first.status_code == 200
+    assert first.json()["result"] == second.json()["result"]
+    assert first.json()["result"]["validated_executed_derivation_ref_ids"] == [
+        "derivation-1"
+    ]
+    assert first.json()["result"]["conclusion_disposition"] == "allowed"
+
+
+@pytest.mark.parametrize(
+    ("derivation_update", "proposal_refs", "expected_error"),
+    [
+        ({}, ["missing-derivation"], "proposal_derivation_reference_not_executed"),
+        (
+            {"execution_status": "proposed"},
+            ["derivation-1"],
+            "literal_error",
+        ),
+        (
+            {"runtime_turn_id": "rtturn-other"},
+            ["derivation-1"],
+            "derivation_turn_mismatch",
+        ),
+    ],
+)
+def test_generic_fabricated_or_mismatched_derivations_are_rejected(
+    derivation_update: dict[str, object],
+    proposal_refs: list[str],
+    expected_error: str,
+):
+    scope = _start_runtime()
+    derivation = _executed_derivation(scope)
+    derivation.update(derivation_update)
+    payload = _support_payload(
+        scope,
+        proposal={
+            "proposed_claim": "A bounded derived claim.",
+            "supporting_evidence_ref_ids": [],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": proposal_refs,
+        },
+        executed_derivations=[derivation],
+    )
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 422
+    assert expected_error in response.text
+
+
+def test_generic_interpretation_dependent_arithmetic_remains_qualified():
+    scope = _start_runtime()
+    evidence = [_support_evidence("semantic-source-1")]
+    derivation = _executed_derivation(
+        scope,
+        evidence_ref_ids=["semantic-source-1"],
+        input_basis="model_interpreted",
+    )
+    payload = _support_payload(
+        scope,
+        evidence_references=evidence,
+        proposal={
+            "proposed_claim": "The mechanically derived result is 0.625.",
+            "supporting_evidence_ref_ids": ["semantic-source-1"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": ["derivation-1"],
+        },
+        executed_derivations=[derivation],
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert result["calibration_status"] == "limited"
+    assert result["conclusion_disposition"] == "qualified"
+    assert "interpretation_dependent_derivation" in result["limitation_codes"]
+    assert "verified" not in result["user_safe_summary"].lower()
+
+
+@pytest.mark.parametrize(
+    ("policy_field", "limitation"),
+    [
+        ("privacy_policy_allows_claim", "privacy_constraint"),
+        ("consequence_policy_allows_claim", "consequence_constraint"),
+    ],
+)
+def test_generic_system_policy_constraints_withhold_claim(
+    policy_field: str,
+    limitation: str,
+):
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("evidence-1")],
+        proposal={
+            "proposed_claim": "A bounded claim.",
+            "supporting_evidence_ref_ids": ["evidence-1"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        **{policy_field: False},
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert result["conclusion_disposition"] == "withheld"
+    assert limitation in result["limitation_codes"]
+
+
+def test_generic_runtime_event_is_bounded_and_excludes_claim_content_and_refs():
+    scope = _start_runtime()
+    private_claim = "PRIVATE CLAIM SENTINEL"
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("private-ref-1")],
+        proposal={
+            "proposed_claim": private_claim,
+            "supporting_evidence_ref_ids": ["private-ref-1"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+    )
+    response = _evaluate_support(payload)
+    assert response.status_code == 200
+
+    diagnostics = client.get(f"/v1/runtime/sessions/{scope['runtime_session_id']}")
+    event = next(
+        item
+        for item in diagnostics.json()["events"]
+        if item["event_type"] == "claim_support_evaluated"
+    )
+    event_payload = event["event_payload_json"]
+    serialized = json.dumps(event_payload, sort_keys=True)
+    assert set(event_payload) == {
+        "request_id",
+        "runtime_session_id",
+        "runtime_turn_id",
+        "claim_id",
+        "claim_digest",
+        "calibration_status",
+        "conclusion_disposition",
+        "qualification_required",
+        "limitation_codes",
+        "supporting_evidence_count",
+        "counterevidence_count",
+        "material_exclusion_count",
+        "executed_derivation_count",
+        "interpretation_dependent_derivation",
+    }
+    assert private_claim not in serialized
+    assert "private-ref-1" not in serialized
+    assert "prompt" not in serialized.lower()
+    assert "reasoning" not in serialized.lower()
+
+
+def test_generic_unknown_session_and_turn_return_bounded_errors():
+    scope = _start_runtime()
+    missing_session_payload = _support_payload(scope)
+    missing_session_payload["authority_context"]["runtime_session_id"] = (
+        "rtsession-missing"
+    )
+    missing_session_payload["authority_context"]["runtime_turn_id"] = "rtturn-missing"
+    missing_turn_payload = _support_payload(scope)
+    missing_turn_payload["authority_context"]["runtime_turn_id"] = "rtturn-missing"
+
+    missing_session = _evaluate_support(missing_session_payload)
+    missing_turn = _evaluate_support(missing_turn_payload)
+
+    assert missing_session.status_code == 404
+    assert missing_session.json() == {"detail": "runtime_session_not_found"}
+    assert missing_turn.status_code == 404
+    assert missing_turn.json() == {"detail": "runtime_turn_not_found"}
+
+
+def test_generic_runtime_scope_mismatch_returns_bounded_error():
+    scope = _start_runtime()
+    payload = _support_payload(scope)
+    payload["authority_context"]["owner_id"] = "owner-2"
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "runtime_session_mismatch"}
+
+
+@pytest.mark.parametrize("invalid_ref", [True, 503, "contains whitespace"])
+def test_generic_proposal_rejects_coercive_or_malformed_reference_ids(
+    invalid_ref: object,
+):
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("evidence-1")],
+        proposal={
+            "proposed_claim": "A bounded claim.",
+            "supporting_evidence_ref_ids": [invalid_ref],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+    )
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 422
