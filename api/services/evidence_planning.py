@@ -347,73 +347,63 @@ def _select_strategy(
     return None
 
 
-def _normal_chat_execution_supported(
+def _acquisition_strategy_supported(
     *,
-    task_shape: str,
     scope: EvidenceDeclaredScope,
-    inventory: list[EvidenceSourceDescriptor],
     eligible: list[EvidenceSourceDescriptor],
     strategy: EvidenceAcquisitionStrategy | None,
+    aggregate_spec: AggregateSpec | None = None,
 ) -> bool:
-    if task_shape == "aggregate":
+    if strategy is None or not eligible:
+        return False
+
+    if strategy == "targeted_retrieval":
         return bool(
-            strategy == "structured_field_values"
+            not scope.exact_source_refs
+            and _all_have_capability(eligible, "targeted_retrieval")
+        )
+
+    if strategy == "exact_fetch":
+        referenced_source_ids = {
+            reference.source_id for reference in scope.exact_source_refs
+        }
+        eligible_source_ids = {source.source_id for source in eligible}
+        return bool(
+            scope.exact_source_refs
+            and referenced_source_ids == eligible_source_ids
+            and _all_have_capability(eligible, "exact_fetch")
+        )
+
+    if strategy == "bounded_full_context":
+        return bool(
+            not scope.exact_source_refs
+            and _all_have_capability(eligible, "bounded_full_context")
+        )
+
+    if strategy == "structured_query":
+        return bool(
+            not scope.exact_source_refs
+            and _all_have_capability(eligible, "structured_query")
+        )
+
+    if strategy == "hybrid":
+        return bool(
+            not scope.exact_source_refs
+            and len(eligible) <= 8
+            and _all_support_hybrid(eligible)
+        )
+
+    if strategy == "structured_field_values":
+        return bool(
+            aggregate_spec is not None
             and scope.inventory_status == "complete_for_declared_scope"
             and len(scope.source_ids) == 1
             and not scope.exact_source_refs
             and len(eligible) == 1
             and eligible[0].source_id == scope.source_ids[0]
             and "context_expansion" in eligible[0].capabilities
-        )
-
-    if task_shape == "targeted_lookup":
-        if scope.exact_source_refs:
-            referenced_source_ids = {
-                reference.source_id for reference in scope.exact_source_refs
-            }
-            eligible_source_ids = {source.source_id for source in eligible}
-            return (
-                strategy == "exact_fetch"
-                and bool(eligible)
-                and referenced_source_ids == eligible_source_ids
-                and _all_have_capability(eligible, "exact_fetch")
-            )
-        return (
-            strategy == "targeted_retrieval"
-            and _all_have_capability(eligible, "targeted_retrieval")
-        )
-
-    if task_shape == "cross_source_comparison":
-        return (
-            strategy == "hybrid"
-            and not scope.exact_source_refs
-            and 2 <= len(eligible) <= 8
-            and _all_have_capability(eligible, "targeted_retrieval")
-            and _all_have_capability(eligible, "context_expansion")
-        )
-
-    if task_shape == "bounded_exhaustive_review":
-        scoped_inventory = [
-            source
-            for source in inventory
-            if _within_declared_universe(source, scope)
-        ]
-        if (
-            strategy != "hybrid"
-            or bool(scope.exact_source_refs)
-            or scope.inventory_status != "complete_for_declared_scope"
-            or len(scoped_inventory) != 1
-            or len(eligible) != 1
-        ):
-            return False
-        scoped_source = scoped_inventory[0]
-        eligible_source = eligible[0]
-        return bool(
-            scoped_source.source_id == eligible_source.source_id
-            and scoped_source.availability == "available"
-            and scoped_source.authority_role == "authoritative"
-            and "targeted_retrieval" in scoped_source.capabilities
-            and "context_expansion" in scoped_source.capabilities
+            and eligible[0].content_fields is not None
+            and aggregate_spec.field_name in eligible[0].content_fields
         )
 
     return False
@@ -730,6 +720,14 @@ def compile_evidence_plan(
         and "authoritative_source_unavailable" in limitations
     ):
         limitations.add("absence_scope_not_enumerable")
+    strategy_supported = _acquisition_strategy_supported(
+        scope=scope,
+        eligible=eligible,
+        strategy=strategy,
+        aggregate_spec=body.aggregate_spec,
+    )
+    if strategy is not None and not strategy_supported:
+        limitations.add("required_capability_unavailable")
     source_material_supported = _material_plan_supported(
         task_shape=body.task_shape,
         scope=scope,
@@ -738,16 +736,7 @@ def compile_evidence_plan(
         strategy=strategy,
         limitations=limitations,
     )
-    execution_supported = _normal_chat_execution_supported(
-        task_shape=body.task_shape,
-        scope=scope,
-        inventory=inventory,
-        eligible=eligible,
-        strategy=strategy,
-    )
-    if strategy is not None and not execution_supported:
-        limitations.add("required_capability_unavailable")
-    material_supported = source_material_supported and execution_supported
+    material_supported = source_material_supported and strategy_supported
     status = _plan_status(material_supported, limitations)
     optional_scope_limitations = {
         "optional_source_unavailable",

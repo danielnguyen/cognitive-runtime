@@ -177,7 +177,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             True,
             "structured_query",
             {"authoritative_inventory", "complete_scope_coverage"},
-            "unsupported",
+            "ready",
         ),
         (
             "cross_source_comparison",
@@ -212,7 +212,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             True,
             "hybrid",
             {"contradiction_search", "counterevidence_coverage"},
-            "unsupported",
+            "ready",
         ),
         (
             "absence_or_coverage_check",
@@ -222,7 +222,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             False,
             "structured_query",
             {"authoritative_inventory", "structured_absence_check"},
-            "unsupported",
+            "ready",
         ),
         (
             "historical_reconstruction",
@@ -232,7 +232,7 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             False,
             "structured_query",
             {"historical_scope", "historical_sequence_coverage"},
-            "unsupported",
+            "ready",
         ),
         (
             "recommendation_or_decision_support",
@@ -251,11 +251,11 @@ def _requirement_kinds(result: dict[str, object]) -> set[str]:
             True,
             "hybrid",
             {"candidate_evidence_coverage", "counterevidence_coverage"},
-            "unsupported",
+            "ready",
         ),
     ],
 )
-def test_each_task_shape_preserves_candidate_strategy_and_requirements(
+def test_each_task_shape_preserves_strategy_and_requirements(
     task_shape: str,
     declared_scope: dict[str, object],
     inventory: list[dict[str, object]],
@@ -265,8 +265,9 @@ def test_each_task_shape_preserves_candidate_strategy_and_requirements(
     required_kinds: set[str],
     expected_status: str,
 ):
+    runtime = _start_runtime()
     response = _compile(
-        _start_runtime(),
+        runtime,
         task_shape=task_shape,
         declared_scope=declared_scope,
         source_inventory=inventory,
@@ -283,6 +284,18 @@ def test_each_task_shape_preserves_candidate_strategy_and_requirements(
     assert (
         "required_capability_unavailable" in result["limitation_codes"]
     ) is (expected_status == "unsupported")
+    event = _plan_events(runtime["runtime_session_id"])[0][
+        "event_payload_json"
+    ]
+    assert event["task_shape"] == task_shape
+    assert event["plan_status"] == expected_status
+    assert event["selected_strategies"] == [strategy]
+    assert event["limitation_codes"] == result["limitation_codes"]
+    assert event["completeness_expectation"] == completeness
+    assert event["contradiction_search_required"] is contradiction_required
+    assert event["material_requirement_count"] == len(
+        result["declared_requirements"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -302,6 +315,12 @@ def test_each_task_shape_preserves_candidate_strategy_and_requirements(
                 _source("source-b", capabilities=["targeted_retrieval"]),
             ],
             "targeted_retrieval",
+        ),
+        (
+            "targeted_lookup",
+            _scope(source_ids=["source-a"]),
+            [_source("source-a", capabilities=["bounded_full_context"])],
+            "bounded_full_context",
         ),
         (
             "targeted_lookup",
@@ -359,13 +378,14 @@ def test_each_task_shape_preserves_candidate_strategy_and_requirements(
     ids=[
         "targeted-single-source",
         "targeted-multiple-sources",
+        "targeted-bounded-full-context",
         "exact-fetch",
         "hybrid-two-sources",
         "hybrid-eight-sources",
         "bounded-exhaustive-one-source",
     ],
 )
-def test_current_normal_chat_executable_readiness_matrix(
+def test_existing_strategy_ready_paths_remain_ready(
     task_shape: str,
     declared_scope: dict[str, object],
     inventory: list[dict[str, object]],
@@ -549,7 +569,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
 
 
 @pytest.mark.parametrize(
-    ("declared_scope", "inventory"),
+    ("declared_scope", "inventory", "expected_status"),
     [
         (
             _scope(source_categories=["records"]),
@@ -560,6 +580,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
                 )
                 for source_id in ("source-a", "source-b")
             ],
+            "ready",
         ),
         (
             _scope(),
@@ -570,6 +591,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
                 )
                 for source_id in ("source-a", "source-b")
             ],
+            "ready",
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -580,6 +602,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
                 )
                 for source_id in ("source-a", "source-b")
             ],
+            "ready",
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -594,6 +617,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
                     availability="unavailable",
                 ),
             ],
+            "unsupported",
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -608,6 +632,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
                     authority_role="supplemental",
                 ),
             ],
+            "ready",
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -622,6 +647,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
                     availability="disabled",
                 ),
             ],
+            "unsupported",
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -636,6 +662,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
                     availability="unknown",
                 ),
             ],
+            "unsupported",
         ),
     ],
     ids=[
@@ -651,6 +678,7 @@ def test_bounded_exhaustive_declared_universe_can_narrow_to_one_source(
 def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
     declared_scope: dict[str, object],
     inventory: list[dict[str, object]],
+    expected_status: str,
 ):
     result = _compile(
         _start_runtime(),
@@ -659,10 +687,9 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
         source_inventory=inventory,
     ).json()["result"]
 
-    assert result["plan_status"] == "unsupported"
-    assert result["plan_status"] != "ready_with_limitations"
+    assert result["plan_status"] == expected_status
     assert result["selected_strategies"] == ["hybrid"]
-    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert "required_capability_unavailable" not in result["limitation_codes"]
     assert result["completeness_expectation"] == "complete_for_declared_scope"
     assert result["contradiction_search_required"] is True
     assert _requirement_kinds(result) == {
@@ -682,6 +709,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
         "capabilities",
         "exact_source_refs",
         "expected_strategy",
+        "expected_status",
+        "capability_limitation_expected",
     ),
     [
         (
@@ -691,6 +720,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "context_expansion"],
             [],
             "hybrid",
+            "unsupported",
+            False,
         ),
         (
             "unknown",
@@ -699,6 +730,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "context_expansion"],
             [],
             "hybrid",
+            "unsupported",
+            False,
         ),
         (
             "unavailable",
@@ -707,6 +740,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "context_expansion"],
             [],
             "hybrid",
+            "unsupported",
+            False,
         ),
         (
             "complete_for_declared_scope",
@@ -715,6 +750,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "context_expansion"],
             [],
             "hybrid",
+            "unsupported",
+            False,
         ),
         (
             "complete_for_declared_scope",
@@ -723,6 +760,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "context_expansion"],
             [],
             "hybrid",
+            "unsupported",
+            False,
         ),
         (
             "complete_for_declared_scope",
@@ -731,6 +770,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "context_expansion"],
             [],
             None,
+            "unsupported",
+            True,
         ),
         (
             "complete_for_declared_scope",
@@ -739,6 +780,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["context_expansion"],
             [],
             None,
+            "unsupported",
+            True,
         ),
         (
             "complete_for_declared_scope",
@@ -747,6 +790,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval"],
             [],
             None,
+            "unsupported",
+            True,
         ),
         (
             "complete_for_declared_scope",
@@ -755,6 +800,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "exact_fetch"],
             [],
             "hybrid",
+            "ready",
+            False,
         ),
         (
             "complete_for_declared_scope",
@@ -763,6 +810,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "bounded_full_context"],
             [],
             "bounded_full_context",
+            "ready",
+            False,
         ),
         (
             "complete_for_declared_scope",
@@ -771,6 +820,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["structured_query"],
             [],
             "structured_query",
+            "ready",
+            False,
         ),
         (
             "complete_for_declared_scope",
@@ -779,6 +830,8 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
             ["targeted_retrieval", "context_expansion"],
             [_exact_ref("source-a", "item-a")],
             "hybrid",
+            "unsupported",
+            True,
         ),
     ],
     ids=[
@@ -796,13 +849,15 @@ def test_bounded_exhaustive_readiness_counts_every_scoped_inventory_source(
         "exact-references",
     ],
 )
-def test_bounded_exhaustive_trust_and_capability_mismatches_are_unsupported(
+def test_bounded_exhaustive_scope_and_strategy_prerequisites(
     inventory_status: str,
     authority_role: str,
     availability: str,
     capabilities: list[str],
     exact_source_refs: list[dict[str, str]],
     expected_strategy: str | None,
+    expected_status: str,
+    capability_limitation_expected: bool,
 ):
     result = _compile(
         _start_runtime(),
@@ -822,12 +877,13 @@ def test_bounded_exhaustive_trust_and_capability_mismatches_are_unsupported(
         ],
     ).json()["result"]
 
-    assert result["plan_status"] == "unsupported"
-    assert result["plan_status"] != "ready_with_limitations"
+    assert result["plan_status"] == expected_status
     assert result["selected_strategies"] == (
         [expected_strategy] if expected_strategy is not None else []
     )
-    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert (
+        "required_capability_unavailable" in result["limitation_codes"]
+    ) is capability_limitation_expected
     assert result["completeness_expectation"] == "complete_for_declared_scope"
     assert result["contradiction_search_required"] is True
     assert _requirement_kinds(result) == {
@@ -864,7 +920,7 @@ def test_suggestive_scope_text_cannot_confer_exhaustive_readiness():
     assert result["selected_strategies"] == ["hybrid"]
     assert result["plan_status"] == "unsupported"
     assert "authoritative_source_missing" in result["limitation_codes"]
-    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert "required_capability_unavailable" not in result["limitation_codes"]
 
 
 def test_question_anchor_is_normalized_and_explicit_exact_fetch_is_preferred():
@@ -1277,7 +1333,7 @@ def test_absence_plan_requires_authority_and_enumeration_capability():
     assert "required_capability_unavailable" in targeted_only["limitation_codes"]
 
 
-def test_comparison_requires_two_sources_and_contradiction_rejects_targeted_only():
+def test_comparison_and_contradiction_preserve_scope_and_strategy_boundaries():
     comparison_negative = _compile(
         _start_runtime(),
         task_shape="cross_source_comparison",
@@ -1316,9 +1372,9 @@ def test_comparison_requires_two_sources_and_contradiction_rejects_targeted_only
 
     assert comparison_negative["plan_status"] == "unsupported"
     assert "insufficient_comparison_scope" in comparison_negative["limitation_codes"]
-    assert comparison_positive["plan_status"] == "unsupported"
+    assert comparison_positive["plan_status"] == "ready"
     assert comparison_positive["selected_strategies"] == ["targeted_retrieval"]
-    assert "required_capability_unavailable" in comparison_positive[
+    assert "required_capability_unavailable" not in comparison_positive[
         "limitation_codes"
     ]
     assert comparison_exact["plan_status"] == "unsupported"
@@ -1328,11 +1384,11 @@ def test_comparison_requires_two_sources_and_contradiction_rejects_targeted_only
     assert "contradiction_search_not_supported" in contradiction_negative[
         "limitation_codes"
     ]
-    assert contradiction_positive["plan_status"] == "unsupported"
+    assert contradiction_positive["plan_status"] == "ready"
     assert contradiction_positive["selected_strategies"] == [
         "bounded_full_context"
     ]
-    assert "required_capability_unavailable" in contradiction_positive[
+    assert "required_capability_unavailable" not in contradiction_positive[
         "limitation_codes"
     ]
 
@@ -1347,11 +1403,6 @@ def test_comparison_requires_two_sources_and_contradiction_rejects_targeted_only
                 _source("source-b", capabilities=["bounded_full_context"]),
             ],
             "targeted_retrieval",
-        ),
-        (
-            _scope(source_ids=["source-a"]),
-            [_source("source-a", capabilities=["bounded_full_context"])],
-            "bounded_full_context",
         ),
         (
             _scope(
@@ -1386,7 +1437,6 @@ def test_comparison_requires_two_sources_and_contradiction_rejects_targeted_only
     ],
     ids=[
         "partial-targeted-capability",
-        "bounded-full-context-candidate",
         "referenced-source-lacks-fetch",
         "reference-universe-exceeds-eligible-sources",
     ],
@@ -1410,7 +1460,13 @@ def test_targeted_execution_mismatches_are_unsupported(
 
 
 @pytest.mark.parametrize(
-    ("declared_scope", "inventory", "expected_strategy"),
+    (
+        "declared_scope",
+        "inventory",
+        "expected_strategy",
+        "expected_status",
+        "capability_limitation_expected",
+    ),
     [
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1422,6 +1478,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 _source("source-b", capabilities=["targeted_retrieval"]),
             ],
             "hybrid",
+            "unsupported",
+            True,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1430,6 +1488,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 _source("source-b", capabilities=["targeted_retrieval"]),
             ],
             "targeted_retrieval",
+            "ready",
+            False,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1444,6 +1504,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 ),
             ],
             "hybrid",
+            "ready",
+            False,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1458,6 +1520,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 ),
             ],
             "hybrid",
+            "ready",
+            False,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1472,6 +1536,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 ),
             ],
             "hybrid",
+            "ready",
+            False,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1483,6 +1549,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 _source("source-b", capabilities=["context_expansion"]),
             ],
             None,
+            "unsupported",
+            True,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1498,6 +1566,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 ),
             ],
             None,
+            "unsupported",
+            True,
         ),
         (
             _scope(source_ids=["source-a"]),
@@ -1508,6 +1578,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 )
             ],
             None,
+            "unsupported",
+            True,
         ),
         (
             _scope(source_ids=[f"source-{index}" for index in range(9)]),
@@ -1519,6 +1591,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 for index in range(9)
             ],
             "hybrid",
+            "unsupported",
+            True,
         ),
         (
             _scope(
@@ -1538,6 +1612,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 ),
             ],
             "hybrid",
+            "unsupported",
+            True,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1546,6 +1622,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 _source("source-b", capabilities=["exact_fetch"]),
             ],
             "exact_fetch",
+            "unsupported",
+            True,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1554,6 +1632,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 _source("source-b", capabilities=["structured_query"]),
             ],
             "structured_query",
+            "ready",
+            False,
         ),
         (
             _scope(source_ids=["source-a", "source-b"]),
@@ -1562,6 +1642,8 @@ def test_targeted_execution_mismatches_are_unsupported(
                 _source("source-b", capabilities=["bounded_full_context"]),
             ],
             "bounded_full_context",
+            "ready",
+            False,
         ),
     ],
     ids=[
@@ -1580,10 +1662,12 @@ def test_targeted_execution_mismatches_are_unsupported(
         "bounded-full-context-fallback",
     ],
 )
-def test_cross_source_execution_compositions_are_unsupported(
+def test_cross_source_strategy_prerequisites(
     declared_scope: dict[str, object],
     inventory: list[dict[str, object]],
     expected_strategy: str | None,
+    expected_status: str,
+    capability_limitation_expected: bool,
 ):
     result = _compile(
         _start_runtime(),
@@ -1592,11 +1676,13 @@ def test_cross_source_execution_compositions_are_unsupported(
         source_inventory=inventory,
     ).json()["result"]
 
-    assert result["plan_status"] == "unsupported"
+    assert result["plan_status"] == expected_status
     assert result["selected_strategies"] == (
         [expected_strategy] if expected_strategy is not None else []
     )
-    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert (
+        "required_capability_unavailable" in result["limitation_codes"]
+    ) is capability_limitation_expected
     assert result["completeness_expectation"] == "complete_for_selected_sources"
     assert {
         "selected_source_coverage",
@@ -1605,7 +1691,7 @@ def test_cross_source_execution_compositions_are_unsupported(
     } <= _requirement_kinds(result)
 
 
-def test_execution_incompatibility_cannot_become_ready_with_limitations():
+def test_valid_strategy_can_be_ready_with_optional_scope_limitations():
     result = _compile(
         _start_runtime(),
         declared_scope=_scope(inventory_status="partial"),
@@ -1621,8 +1707,8 @@ def test_execution_incompatibility_cannot_become_ready_with_limitations():
     ).json()["result"]
 
     assert result["selected_strategies"] == ["bounded_full_context"]
-    assert result["plan_status"] == "unsupported"
-    assert "required_capability_unavailable" in result["limitation_codes"]
+    assert result["plan_status"] == "ready_with_limitations"
+    assert "required_capability_unavailable" not in result["limitation_codes"]
     assert "optional_source_unavailable" in result["limitation_codes"]
     assert "source_inventory_partial" in result["limitation_codes"]
 
@@ -2031,19 +2117,15 @@ def test_bounded_exhaustive_reordered_inputs_preserve_plan_identity():
             [
                 _source(
                     "source-a",
-                    capabilities=["targeted_retrieval", "exact_fetch"],
+                    capabilities=["targeted_retrieval"],
                 )
             ],
         ),
         (
-            _scope(source_ids=["source-a", "source-b"]),
+            _scope(source_ids=["source-a", "source-missing"]),
             [
                 _source(
                     "source-a",
-                    capabilities=["targeted_retrieval", "context_expansion"],
-                ),
-                _source(
-                    "source-b",
                     capabilities=["targeted_retrieval", "context_expansion"],
                 ),
             ],
@@ -2084,7 +2166,7 @@ def test_bounded_exhaustive_material_changes_affect_plan_identity(
     assert ready["plan_id"] != changed["plan_id"]
 
 
-def test_execution_readiness_changes_plan_identity_truthfully():
+def test_strategy_readiness_changes_plan_identity_truthfully():
     runtime = _start_runtime()
     scope = _scope(source_ids=["source-a", "source-b"])
     ready = _compile(
@@ -2113,7 +2195,7 @@ def test_execution_readiness_changes_plan_identity_truthfully():
             ),
             _source(
                 "source-b",
-                capabilities=["targeted_retrieval", "exact_fetch"],
+                capabilities=["targeted_retrieval"],
             ),
         ],
     ).json()["result"]
