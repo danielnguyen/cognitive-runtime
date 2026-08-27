@@ -2988,7 +2988,7 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
             ),
             semantic_advisory=_semantic_advisory(
                 "ambiguous",
-                "lookup",
+                "comparison",
                 "private_candidate_beta",
                 "private_candidate_alpha",
             ),
@@ -2998,7 +2998,7 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
     serialized = json.dumps(payload, sort_keys=True).lower()
 
     assert payload["semantic_interpretation_status"] == "ambiguous"
-    assert payload["semantic_operation_hint"] == "lookup"
+    assert payload["semantic_operation_hint"] == "comparison"
     assert payload["semantic_candidate_count"] == 2
     assert payload["probe_source_count"] == 2
     assert "matched_source_ids" not in payload
@@ -3019,7 +3019,9 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
     [
         _semantic_advisory("resolved", "lookup", "source_a"),
         _semantic_advisory("no_match", "unknown"),
-        _semantic_advisory("ambiguous", "comparison", "source_a", "source_b"),
+        _semantic_advisory(
+            "ambiguous", "exhaustive_review", "source_a", "source_b"
+        ),
     ],
 )
 def test_runtime_event_omits_probe_count_without_authorization(
