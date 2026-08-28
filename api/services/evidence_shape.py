@@ -228,6 +228,14 @@ _SEMANTIC_OPERATION_SHAPES: dict[str, EvidenceTaskShape] = {
     "historical_reconstruction": "historical_reconstruction",
     "decision_support": "recommendation_or_decision_support",
 }
+_AMBIGUOUS_PROBE_TASK_SHAPES: frozenset[EvidenceTaskShape] = frozenset(
+    {
+        "targeted_lookup",
+        "cross_source_comparison",
+        "contradiction_review",
+        "recommendation_or_decision_support",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -350,13 +358,14 @@ def _derive_deterministic_source_match(
             len(token_sources[token]) == 1 for token in matched_tokens
         )
         exact_match = exact_source_id or exact_display_name
-        strong = exact_match or unique_match or len(matched_tokens) >= 2
+        multi_token_match = len(matched_tokens) >= 2
+        strong = exact_match or multi_token_match
         if matched_tokens:
             candidates.append(
                 {
                     "source_id": source.source_id,
                     "strong": strong,
-                    "distinct": exact_match or unique_match,
+                    "distinct": exact_match or (multi_token_match and unique_match),
                     "reasons": set(matched_by_field),
                     "source_kinds": _source_identity_kinds(source),
                 }
@@ -426,7 +435,11 @@ def _derive_deterministic_source_match(
     )
 
 
-def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult | None:
+def _derive_source_match(
+    body: EvidenceShapeDeriveRequest,
+    *,
+    effective_task_shape: EvidenceTaskShape | None,
+) -> SourceMatchResult | None:
     deterministic = _derive_deterministic_source_match(body)
     if deterministic is None:
         return None
@@ -459,12 +472,7 @@ def _derive_source_match(body: EvidenceShapeDeriveRequest) -> SourceMatchResult 
         probe_source_ids: list[str] = []
         if (
             discovery.inventory_status == "complete"
-            and advisory.operation_hint in {"lookup", "latest"}
-            and not _specialized_shapes(body.task_text)
-            and (
-                not body.task_context.continuation_of_prior_evidence_task
-                or body.task_context.prior_task_shape == "targeted_lookup"
-            )
+            and effective_task_shape in _AMBIGUOUS_PROBE_TASK_SHAPES
         ):
             sources_by_id = {source.source_id: source for source in discovery.sources}
             candidates = [
@@ -542,6 +550,28 @@ def _specialized_shapes(text: str) -> set[EvidenceTaskShape]:
     if _DECISION.search(text):
         shapes.add("recommendation_or_decision_support")
     return shapes
+
+
+def _effective_task_shape(
+    body: EvidenceShapeDeriveRequest,
+    *,
+    specialized: set[EvidenceTaskShape],
+) -> EvidenceTaskShape | None:
+    context = body.task_context
+    semantic_operation = (
+        context.semantic_advisory.operation_hint
+        if context.semantic_advisory is not None
+        else None
+    )
+    if semantic_operation == "aggregate":
+        return "aggregate"
+    if len(specialized) > 1:
+        return _COMPATIBLE_COMBINATIONS.get(frozenset(specialized))
+    if len(specialized) == 1:
+        return next(iter(specialized))
+    if context.continuation_of_prior_evidence_task:
+        return context.prior_task_shape
+    return _SEMANTIC_OPERATION_SHAPES.get(semantic_operation)
 
 
 def _verification_dependent_request(text: str) -> bool:
@@ -717,12 +747,16 @@ def _build_result(
 
 
 def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
-    source_match = _derive_source_match(body)
+    specialized = _specialized_shapes(body.task_text)
+    effective_task_shape = _effective_task_shape(body, specialized=specialized)
+    source_match = _derive_source_match(
+        body,
+        effective_task_shape=effective_task_shape,
+    )
     source_context_material = source_match is not None and source_match.status in {
         "matched",
         "ambiguous",
     }
-    specialized = _specialized_shapes(body.task_text)
     explicit_evidence = _explicit_evidence_language(
         body.task_text,
         specialized=specialized,
@@ -837,9 +871,9 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
                 reasons=reasons,
                 source_match=source_match,
             )
-        selected = compatible
+        selected = effective_task_shape
     elif len(specialized) == 1:
-        selected = next(iter(specialized))
+        selected = effective_task_shape
     elif context.continuation_of_prior_evidence_task:
         if context.prior_task_shape == "aggregate":
             reasons.add("prior_shape_inherited")
@@ -851,10 +885,10 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
                 reasons=reasons,
                 source_match=source_match,
             )
-        selected = context.prior_task_shape
+        selected = effective_task_shape
         reasons.add("prior_shape_inherited")
     elif semantic_operation in _SEMANTIC_OPERATION_SHAPES:
-        selected = _SEMANTIC_OPERATION_SHAPES[semantic_operation]
+        selected = effective_task_shape
         reasons.add("semantic_operation_hint")
         if selected == "targeted_lookup":
             reasons.add("targeted_lookup_derived")

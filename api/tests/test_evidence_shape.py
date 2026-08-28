@@ -1173,9 +1173,11 @@ def test_natural_display_name_match_makes_ordinary_question_targeted():
             "display_name_match",
         ),
         (
-            "What is the current nutrition total?",
+            "What is the current nutrition summary total?",
             _discovery_source(
-                "meal_summary", "Meal Summary", domain_tags=["nutrition"]
+                "meal_archive",
+                "Meal Archive",
+                domain_tags=["nutrition", "summary"],
             ),
             "domain_tag_match",
         ),
@@ -1227,6 +1229,64 @@ def test_multiple_distinct_sources_match_in_sorted_order_and_preserve_shape():
     assert "multiple_explicit_source_matches" in result["source_match"][
         "reason_codes"
     ]
+
+
+def test_globally_unique_single_metadata_token_does_not_establish_identity():
+    result = _derive(
+        _start_runtime(),
+        task_text="Can it answer this bounded question?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "unrelated_archive",
+                    "Unrelated Archive",
+                    domain_tags=["it"],
+                ),
+                _discovery_source(
+                    "harbor_register",
+                    "Harbor Register",
+                    domain_tags=["harbor"],
+                ),
+            )
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "no_match"
+    assert result["source_match"]["matched_source_ids"] == []
+
+
+def test_weak_singleton_natural_association_uses_semantic_advisory():
+    discovery = _discovery(
+        _discovery_source(
+            "meal_archive",
+            "Meal Archive",
+            domain_tags=["nutrition"],
+        ),
+        _discovery_source("harbor_register", "Harbor Register"),
+    )
+    deterministic = _derive(
+        _start_runtime(),
+        task_text="What is the current nutrition total?",
+        task_context=_context(source_discovery=discovery),
+    ).json()["result"]
+    semantic = _derive(
+        _start_runtime(),
+        task_text="What is the current nutrition total?",
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory(
+                "resolved", "lookup", "meal_archive"
+            ),
+        ),
+    ).json()["result"]
+
+    assert deterministic["source_match"]["status"] == "no_match"
+    assert deterministic["source_match"]["matched_source_ids"] == []
+    assert semantic["source_match"] == {
+        "status": "matched",
+        "matched_source_ids": ["meal_archive"],
+        "reason_codes": ["semantic_candidate_validated"],
+    }
 
 
 def test_source_kind_disambiguates_only_already_strong_candidates():
@@ -2392,7 +2452,7 @@ def test_semantic_ambiguity_requires_every_probe_candidate_available(
                 _discovery_source("source_b", "Harbor Register"),
             ),
             semantic_advisory=_semantic_advisory(
-                "ambiguous", "lookup", "source_a", "source_b"
+                "ambiguous", "comparison", "source_a", "source_b"
             ),
         ),
     ).json()["result"]
@@ -2416,7 +2476,7 @@ def test_semantic_ambiguity_requires_every_probe_candidate_search_capable():
                 _discovery_source("source_b", "Harbor Register"),
             ),
             semantic_advisory=_semantic_advisory(
-                "ambiguous", "lookup", "source_a", "source_b"
+                "ambiguous", "contradiction_review", "source_a", "source_b"
             ),
         ),
     ).json()["result"]
@@ -2429,17 +2489,14 @@ def test_semantic_ambiguity_requires_every_probe_candidate_search_capable():
 @pytest.mark.parametrize(
     "operation_hint",
     [
-        "comparison",
         "exhaustive_review",
-        "contradiction_review",
         "absence_check",
         "historical_reconstruction",
-        "decision_support",
         "aggregate",
         "unknown",
     ],
 )
-def test_non_lookup_semantic_ambiguity_does_not_authorize_probe(
+def test_unsafe_semantic_ambiguity_does_not_authorize_probe(
     operation_hint: str,
 ):
     result = _derive(
@@ -2461,7 +2518,50 @@ def test_non_lookup_semantic_ambiguity_does_not_authorize_probe(
     assert "probe_source_ids" not in result["source_match"]
 
 
-def test_deterministic_non_lookup_shape_prevents_lookup_probe_authorization():
+@pytest.mark.parametrize(
+    ("operation_hint", "expected_shape"),
+    [
+        ("comparison", "cross_source_comparison"),
+        ("contradiction_review", "contradiction_review"),
+        ("decision_support", "recommendation_or_decision_support"),
+    ],
+)
+def test_semantic_ambiguity_authorizes_bounded_probe_for_safe_reasoning_shapes(
+    operation_hint: str,
+    expected_shape: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="Please handle this bounded question.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_c", "Forest Register"),
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous",
+                operation_hint,
+                "source_c",
+                "source_a",
+                "source_b",
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": ["source_a", "source_b", "source_c"],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == expected_shape
+    assert result["candidate_task_shapes"] == [expected_shape]
+    assert result["clarification_required"] is False
+
+
+def test_effective_comparison_shape_authorizes_lookup_advisory_probe():
     result = _derive(
         _start_runtime(),
         task_text="Compare the available records.",
@@ -2477,9 +2577,35 @@ def test_deterministic_non_lookup_shape_prevents_lookup_probe_authorization():
     ).json()["result"]
 
     assert result["source_match"]["status"] == "ambiguous"
-    assert "probe_source_ids" not in result["source_match"]
+    assert result["source_match"]["matched_source_ids"] == []
+    assert result["source_match"]["probe_source_ids"] == [
+        "source_a",
+        "source_b",
+    ]
     assert result["derivation_status"] == "derived"
     assert result["task_shape"] == "cross_source_comparison"
+    assert result["clarification_required"] is False
+
+
+def test_incompatible_effective_shapes_cannot_be_downgraded_to_lookup_probe():
+    result = _derive(
+        _start_runtime(),
+        task_text="Compare the timeline and decide between the options.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "lookup", "source_a", "source_b"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["derivation_status"] == "ambiguous"
+    assert result["task_shape"] is None
+    assert result["source_match"]["status"] == "ambiguous"
+    assert "probe_source_ids" not in result["source_match"]
 
 
 @pytest.mark.parametrize(
@@ -2862,7 +2988,7 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
             ),
             semantic_advisory=_semantic_advisory(
                 "ambiguous",
-                "lookup",
+                "comparison",
                 "private_candidate_beta",
                 "private_candidate_alpha",
             ),
@@ -2872,7 +2998,7 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
     serialized = json.dumps(payload, sort_keys=True).lower()
 
     assert payload["semantic_interpretation_status"] == "ambiguous"
-    assert payload["semantic_operation_hint"] == "lookup"
+    assert payload["semantic_operation_hint"] == "comparison"
     assert payload["semantic_candidate_count"] == 2
     assert payload["probe_source_count"] == 2
     assert "matched_source_ids" not in payload
@@ -2893,7 +3019,9 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
     [
         _semantic_advisory("resolved", "lookup", "source_a"),
         _semantic_advisory("no_match", "unknown"),
-        _semantic_advisory("ambiguous", "comparison", "source_a", "source_b"),
+        _semantic_advisory(
+            "ambiguous", "exhaustive_review", "source_a", "source_b"
+        ),
     ],
 )
 def test_runtime_event_omits_probe_count_without_authorization(
