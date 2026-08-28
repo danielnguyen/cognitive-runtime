@@ -2136,6 +2136,286 @@ def test_deterministic_match_outranks_semantic_probe_candidates():
     assert "probe_source_ids" not in result["source_match"]
 
 
+def test_semantic_no_match_can_reduce_natural_topical_source_match():
+    discovery = _discovery(
+        _discovery_source(
+            "alpha_archive",
+            "Alpha Archive",
+            domain_tags=["market", "analysis"],
+        ),
+        _discovery_source("beta_register", "Beta Register"),
+    )
+    deterministic = _derive(
+        _start_runtime(),
+        task_text="What does the market analysis indicate?",
+        task_context=_context(source_discovery=discovery),
+    ).json()["result"]
+    refined = _derive(
+        _start_runtime(),
+        task_text="What does the market analysis indicate?",
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory("no_match", "unknown"),
+        ),
+    ).json()["result"]
+
+    assert deterministic["source_match"]["status"] == "matched"
+    assert deterministic["source_match"]["matched_source_ids"] == [
+        "alpha_archive"
+    ]
+    assert refined["source_match"] == {
+        "status": "no_match",
+        "matched_source_ids": [],
+        "reason_codes": ["semantic_no_match"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("task_text", "expected_reason"),
+    [
+        ("What is in alpha_review_archive?", "source_id_match"),
+        ("What is in Alpha Review Archive?", "display_name_match"),
+    ],
+)
+def test_semantic_no_match_cannot_erase_exact_source_identity(
+    task_text: str,
+    expected_reason: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "alpha_review_archive", "Alpha Review Archive"
+                ),
+                _discovery_source("beta_register", "Beta Register"),
+            ),
+            semantic_advisory=_semantic_advisory("no_match", "unknown"),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == [
+        "alpha_review_archive"
+    ]
+    assert expected_reason in result["source_match"]["reason_codes"]
+
+
+def test_exact_source_match_can_be_augmented_into_bounded_comparison_probe():
+    result = _derive(
+        _start_runtime(),
+        task_text="Compare Alpha Review Archive with the related records.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "alpha_review_archive", "Alpha Review Archive"
+                ),
+                _discovery_source("beta_register", "Beta Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous",
+                "comparison",
+                "beta_register",
+                "alpha_review_archive",
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": [
+            "alpha_review_archive",
+            "beta_register",
+        ],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    assert result["task_shape"] == "cross_source_comparison"
+    assert result["clarification_required"] is False
+
+
+def test_natural_source_match_can_be_augmented_into_bounded_comparison_probe():
+    discovery = _discovery(
+        _discovery_source(
+            "alpha_register",
+            "Alpha Register",
+            domain_tags=["north", "review"],
+        ),
+        _discovery_source("beta_register", "Beta Register"),
+    )
+    deterministic = _derive(
+        _start_runtime(),
+        task_text="Compare the north review records.",
+        task_context=_context(source_discovery=discovery),
+    ).json()["result"]
+    augmented = _derive(
+        _start_runtime(),
+        task_text="Compare the north review records.",
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "comparison", "beta_register", "alpha_register"
+            ),
+        ),
+    ).json()["result"]
+
+    assert deterministic["source_match"]["status"] == "matched"
+    assert deterministic["source_match"]["matched_source_ids"] == [
+        "alpha_register"
+    ]
+    assert augmented["source_match"] == {
+        "status": "ambiguous",
+        "matched_source_ids": [],
+        "probe_source_ids": ["alpha_register", "beta_register"],
+        "reason_codes": ["semantic_candidates_ambiguous"],
+    }
+    assert augmented["task_shape"] == "cross_source_comparison"
+    assert augmented["clarification_required"] is False
+
+
+def test_semantic_probe_cannot_replace_omitted_exact_source_identity():
+    result = _derive(
+        _start_runtime(),
+        task_text="Compare Alpha Review Archive with related records.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "alpha_review_archive", "Alpha Review Archive"
+                ),
+                _discovery_source("beta_register", "Beta Register"),
+                _discovery_source("gamma_register", "Gamma Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous",
+                "comparison",
+                "beta_register",
+                "gamma_register",
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == [
+        "alpha_review_archive"
+    ]
+    assert "probe_source_ids" not in result["source_match"]
+
+
+@pytest.mark.parametrize(
+    "source_update",
+    [
+        {"availability": "unavailable"},
+        {"availability": "disabled"},
+        {"availability": "unknown"},
+        {"capabilities": ["fetch", "context"]},
+    ],
+)
+def test_natural_match_augmentation_requires_usable_probe_candidates(
+    source_update: dict[str, object],
+):
+    beta_source = _discovery_source(
+        "beta_register",
+        "Beta Register",
+        domain_tags=["secondary", "review"],
+    )
+    beta_source.update(source_update)
+    result = _derive(
+        _start_runtime(),
+        task_text="Compare the north review records.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "alpha_register",
+                    "Alpha Register",
+                    domain_tags=["north", "review"],
+                ),
+                beta_source,
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "comparison", "alpha_register", "beta_register"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["alpha_register"]
+    assert "probe_source_ids" not in result["source_match"]
+
+
+@pytest.mark.parametrize(
+    "operation_hint",
+    [
+        "exhaustive_review",
+        "absence_check",
+        "historical_reconstruction",
+        "aggregate",
+    ],
+)
+def test_natural_match_augmentation_preserves_unsafe_shape_boundary(
+    operation_hint: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text="What do the north review records say?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "alpha_register",
+                    "Alpha Register",
+                    domain_tags=["north", "review"],
+                ),
+                _discovery_source("beta_register", "Beta Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", operation_hint, "alpha_register", "beta_register"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["source_match"]["status"] == "matched"
+    assert result["source_match"]["matched_source_ids"] == ["alpha_register"]
+    assert "probe_source_ids" not in result["source_match"]
+
+
+@pytest.mark.parametrize(
+    "candidate_source_ids",
+    [
+        ("alpha_register", "missing_register"),
+        (
+            "alpha_register",
+            "beta_register",
+            "gamma_register",
+            "delta_register",
+        ),
+    ],
+)
+def test_natural_match_augmentation_rejects_invalid_candidate_bounds(
+    candidate_source_ids: tuple[str, ...],
+):
+    response = _derive(
+        _start_runtime(),
+        task_text="Compare the north review records.",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source(
+                    "alpha_register",
+                    "Alpha Register",
+                    domain_tags=["north", "review"],
+                ),
+                _discovery_source("beta_register", "Beta Register"),
+                _discovery_source("gamma_register", "Gamma Register"),
+                _discovery_source("delta_register", "Delta Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "comparison", *candidate_source_ids
+            ),
+        ),
+    )
+
+    assert response.status_code == 422
+
+
 def test_primary_distinct_ambiguity_outranks_semantic_candidate():
     discovery = _discovery(
         _discovery_source(

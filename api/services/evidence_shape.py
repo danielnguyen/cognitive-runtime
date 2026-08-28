@@ -13,6 +13,7 @@ from models import (
     EvidenceShapeReasonCode,
     EvidenceShapeResult,
     EvidenceTaskShape,
+    SourceDiscoveryContext,
     SourceDiscoveryEntry,
     SourceMatchResult,
 )
@@ -242,6 +243,7 @@ _AMBIGUOUS_PROBE_TASK_SHAPES: frozenset[EvidenceTaskShape] = frozenset(
 class _DeterministicSourceMatch:
     result: SourceMatchResult
     ambiguous_has_distinct_candidate: bool = False
+    exact_matched_source_ids: tuple[str, ...] = ()
 
 
 def _normalized_tokens(value: str) -> tuple[str, ...]:
@@ -366,6 +368,7 @@ def _derive_deterministic_source_match(
                     "source_id": source.source_id,
                     "strong": strong,
                     "distinct": exact_match or (multi_token_match and unique_match),
+                    "exact_match": exact_match,
                     "reasons": set(matched_by_field),
                     "source_kinds": _source_identity_kinds(source),
                 }
@@ -432,7 +435,36 @@ def _derive_deterministic_source_match(
             status == "ambiguous"
             and any(candidate["distinct"] for candidate in strong_candidates)
         ),
+        exact_matched_source_ids=tuple(
+            sorted(
+                str(candidate["source_id"])
+                for candidate in strong_candidates
+                if candidate["exact_match"]
+                and candidate["source_id"] in matched_source_ids
+            )
+        ),
     )
+
+
+def _authorized_probe_source_ids(
+    discovery: SourceDiscoveryContext,
+    *,
+    candidate_source_ids: list[str],
+    effective_task_shape: EvidenceTaskShape | None,
+) -> list[str]:
+    if (
+        discovery.inventory_status != "complete"
+        or effective_task_shape not in _AMBIGUOUS_PROBE_TASK_SHAPES
+    ):
+        return []
+    sources_by_id = {source.source_id: source for source in discovery.sources}
+    candidates = [sources_by_id[source_id] for source_id in candidate_source_ids]
+    if not all(
+        source.availability == "available" and "search" in source.capabilities
+        for source in candidates
+    ):
+        return []
+    return sorted(candidate_source_ids)
 
 
 def _derive_source_match(
@@ -450,6 +482,43 @@ def _derive_source_match(
     if discovery.inventory_status in {"unknown", "unavailable"}:
         return deterministic.result
     if deterministic.result.status == "matched":
+        if advisory.interpretation_status == "no_match":
+            if deterministic.exact_matched_source_ids:
+                return deterministic.result
+            return SourceMatchResult(
+                status=(
+                    "inventory_unavailable"
+                    if discovery.inventory_status == "partial"
+                    else "no_match"
+                ),
+                matched_source_ids=[],
+                reason_codes=sorted(
+                    {"semantic_no_match"}
+                    | (
+                        {"inventory_partial"}
+                        if discovery.inventory_status == "partial"
+                        else set()
+                    )
+                ),
+            )
+        if advisory.interpretation_status == "ambiguous":
+            deterministic_source_ids = set(
+                deterministic.result.matched_source_ids
+            )
+            semantic_source_ids = set(advisory.candidate_source_ids)
+            if deterministic_source_ids <= semantic_source_ids:
+                probe_source_ids = _authorized_probe_source_ids(
+                    discovery,
+                    candidate_source_ids=advisory.candidate_source_ids,
+                    effective_task_shape=effective_task_shape,
+                )
+                if probe_source_ids:
+                    return SourceMatchResult(
+                        status="ambiguous",
+                        matched_source_ids=[],
+                        probe_source_ids=probe_source_ids,
+                        reason_codes=["semantic_candidates_ambiguous"],
+                    )
         return deterministic.result
     if (
         deterministic.result.status == "ambiguous"
@@ -469,22 +538,11 @@ def _derive_source_match(
             reason_codes=sorted({"semantic_candidate_validated"} | partial_reasons),
         )
     if advisory.interpretation_status == "ambiguous":
-        probe_source_ids: list[str] = []
-        if (
-            discovery.inventory_status == "complete"
-            and effective_task_shape in _AMBIGUOUS_PROBE_TASK_SHAPES
-        ):
-            sources_by_id = {source.source_id: source for source in discovery.sources}
-            candidates = [
-                sources_by_id[source_id]
-                for source_id in advisory.candidate_source_ids
-            ]
-            if all(
-                source.availability == "available"
-                and "search" in source.capabilities
-                for source in candidates
-            ):
-                probe_source_ids = sorted(advisory.candidate_source_ids)
+        probe_source_ids = _authorized_probe_source_ids(
+            discovery,
+            candidate_source_ids=advisory.candidate_source_ids,
+            effective_task_shape=effective_task_shape,
+        )
         return SourceMatchResult(
             status="ambiguous",
             matched_source_ids=[],
