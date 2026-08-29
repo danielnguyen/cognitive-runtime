@@ -362,6 +362,7 @@ def _claim_support_identity(
         "surface": body.authority_context.surface,
         "runtime_session_id": body.authority_context.runtime_session_id,
         "runtime_turn_id": body.authority_context.runtime_turn_id,
+        "claim_scope_basis": body.authority_context.claim_scope_basis,
         "claim_digest": claim_digest,
         "supporting_evidence_ref_ids": sorted(proposal.supporting_evidence_ref_ids),
         "counterevidence_ref_ids": sorted(proposal.counterevidence_ref_ids),
@@ -477,7 +478,14 @@ def evaluate_claim_support(
         context.complete_declared_scope_established is not True
         or context.material_acquisition_limited
     ):
-        add_limitation("complete_scope_not_established", severity="unsupported")
+        add_limitation(
+            "complete_scope_not_established",
+            severity=(
+                "limited"
+                if context.claim_scope_basis == "supplied_evidence"
+                else "unsupported"
+            ),
+        )
     if context.material_acquisition_limited:
         add_limitation("material_acquisition_limited", severity="limited")
 
@@ -545,6 +553,7 @@ def evaluate_claim_support(
             "request_id": body.request_id,
             "runtime_session_id": context.runtime_session_id,
             "runtime_turn_id": context.runtime_turn_id,
+            "claim_scope_basis": context.claim_scope_basis,
             "claim_id": result.claim_id,
             "claim_digest": result.claim_digest,
             "calibration_status": result.calibration_status,

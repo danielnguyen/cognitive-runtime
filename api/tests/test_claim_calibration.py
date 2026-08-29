@@ -733,6 +733,7 @@ def test_generic_claim_support_allows_ordinary_claim_without_task_shape():
         "action_permission",
         "tool_permission",
         "observation_status",
+        "claim_scope_basis",
     ],
 )
 def test_generic_proposal_rejects_authority_escalation_fields(
@@ -935,10 +936,208 @@ def test_generic_complete_scope_requirement_is_claim_sensitive():
     ordinary_result = _evaluate_support(ordinary).json()["result"]
     exhaustive_result = _evaluate_support(exhaustive).json()["result"]
 
+    assert "claim_scope_basis" not in exhaustive["authority_context"]
     assert ordinary_result["conclusion_disposition"] == "allowed"
     assert exhaustive_result["calibration_status"] == "unsupported"
     assert exhaustive_result["conclusion_disposition"] == "withheld"
     assert "complete_scope_not_established" in exhaustive_result["limitation_codes"]
+
+
+def test_generic_supplied_evidence_scope_qualifies_incomplete_broader_scope():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("bounded-evidence")],
+        proposal={
+            "proposed_claim": (
+                "Among the supplied records, the available entries support "
+                "the bounded comparison."
+            ),
+            "supporting_evidence_ref_ids": ["bounded-evidence"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        claim_scope_basis="supplied_evidence",
+        complete_declared_scope_required=True,
+        complete_declared_scope_established=False,
+    )
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["calibration_status"] == "limited"
+    assert result["conclusion_disposition"] == "qualified"
+    assert result["qualification_required"] is True
+    assert "complete_scope_not_established" in result["limitation_codes"]
+    assert result["validated_supporting_evidence_ref_ids"] == ["bounded-evidence"]
+
+
+def test_generic_supplied_evidence_scope_discloses_material_acquisition_limit():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("bounded-evidence")],
+        proposal={
+            "proposed_claim": "The supplied records support a bounded claim.",
+            "supporting_evidence_ref_ids": ["bounded-evidence"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        claim_scope_basis="supplied_evidence",
+        complete_declared_scope_required=True,
+        complete_declared_scope_established=False,
+        material_acquisition_limited=True,
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert result["calibration_status"] == "limited"
+    assert result["conclusion_disposition"] == "qualified"
+    assert result["qualification_required"] is True
+    assert "complete_scope_not_established" in result["limitation_codes"]
+    assert "material_acquisition_limited" in result["limitation_codes"]
+
+
+def test_generic_supplied_evidence_scope_does_not_force_qualification():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("complete-evidence")],
+        proposal={
+            "proposed_claim": "The supplied records support the complete result.",
+            "supporting_evidence_ref_ids": ["complete-evidence"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        claim_scope_basis="supplied_evidence",
+        complete_declared_scope_required=True,
+        complete_declared_scope_established=True,
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert result["calibration_status"] == "supported"
+    assert result["conclusion_disposition"] == "allowed"
+    assert result["qualification_required"] is False
+    assert result["limitation_codes"] == []
+
+
+def test_generic_claim_scope_basis_changes_claim_identity_not_digest():
+    scope = _start_runtime()
+    common = {
+        "evidence_references": [_support_evidence("complete-evidence")],
+        "proposal": {
+            "proposed_claim": "The complete evidence supports this claim.",
+            "supporting_evidence_ref_ids": ["complete-evidence"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        "complete_declared_scope_required": True,
+        "complete_declared_scope_established": True,
+    }
+    declared = _support_payload(
+        scope,
+        claim_scope_basis="declared_scope",
+        **common,
+    )
+    supplied = _support_payload(
+        scope,
+        claim_scope_basis="supplied_evidence",
+        **common,
+    )
+
+    declared_result = _evaluate_support(declared).json()["result"]
+    supplied_result = _evaluate_support(supplied).json()["result"]
+
+    assert declared_result["claim_digest"] == supplied_result["claim_digest"]
+    assert declared_result["limitation_codes"] == supplied_result["limitation_codes"]
+    assert declared_result["claim_id"] != supplied_result["claim_id"]
+
+
+def test_generic_claim_support_response_fields_remain_compatible():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[_support_evidence("evidence-1")],
+        proposal={
+            "proposed_claim": "A bounded claim.",
+            "supporting_evidence_ref_ids": ["evidence-1"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        claim_scope_basis="supplied_evidence",
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert set(result) == {
+        "claim_id",
+        "claim_digest",
+        "calibration_status",
+        "conclusion_disposition",
+        "qualification_required",
+        "limitation_codes",
+        "validated_supporting_evidence_ref_ids",
+        "validated_counterevidence_ref_ids",
+        "validated_material_exclusions",
+        "validated_executed_derivation_ref_ids",
+        "user_safe_summary",
+    }
+    assert "claim_scope_basis" not in result
+
+
+def test_generic_claim_scope_basis_rejects_unknown_value():
+    scope = _start_runtime()
+    payload = _support_payload(scope, claim_scope_basis="provider_selected")
+
+    response = _evaluate_support(payload)
+
+    assert response.status_code == 422
+    assert "literal_error" in response.text
+
+
+@pytest.mark.parametrize(
+    ("authority_update", "expected_limitation"),
+    [
+        ({}, "no_supporting_evidence"),
+        ({"privacy_policy_allows_claim": False}, "privacy_constraint"),
+        ({"consequence_policy_allows_claim": False}, "consequence_constraint"),
+    ],
+)
+def test_generic_supplied_evidence_scope_preserves_hard_authority_blockers(
+    authority_update: dict[str, object],
+    expected_limitation: str,
+):
+    scope = _start_runtime()
+    evidence = [] if not authority_update else [_support_evidence("evidence-1")]
+    support_ids = [] if not authority_update else ["evidence-1"]
+    payload = _support_payload(
+        scope,
+        evidence_references=evidence,
+        proposal={
+            "proposed_claim": "A bounded claim.",
+            "supporting_evidence_ref_ids": support_ids,
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        claim_scope_basis="supplied_evidence",
+        complete_declared_scope_required=True,
+        complete_declared_scope_established=False,
+        **authority_update,
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert result["calibration_status"] == "unsupported"
+    assert result["conclusion_disposition"] == "withheld"
+    assert expected_limitation in result["limitation_codes"]
 
 
 def test_generic_omitted_required_material_evidence_withholds_claim():
@@ -960,6 +1159,7 @@ def test_generic_omitted_required_material_evidence_withholds_claim():
             "material_exclusions": [],
             "executed_derivation_ref_ids": [],
         },
+        claim_scope_basis="supplied_evidence",
     )
 
     result = _evaluate_support(payload).json()["result"]
@@ -967,6 +1167,34 @@ def test_generic_omitted_required_material_evidence_withholds_claim():
     assert result["calibration_status"] == "unsupported"
     assert result["conclusion_disposition"] == "withheld"
     assert "material_evidence_omitted" in result["limitation_codes"]
+
+
+def test_generic_supplied_evidence_scope_cannot_misclassify_counterevidence():
+    scope = _start_runtime()
+    payload = _support_payload(
+        scope,
+        evidence_references=[
+            _support_evidence(
+                "material-counter",
+                material_disclosure_required=True,
+                material_role="counterevidence",
+            )
+        ],
+        proposal={
+            "proposed_claim": "A bounded claim.",
+            "supporting_evidence_ref_ids": ["material-counter"],
+            "counterevidence_ref_ids": [],
+            "material_exclusions": [],
+            "executed_derivation_ref_ids": [],
+        },
+        claim_scope_basis="supplied_evidence",
+    )
+
+    result = _evaluate_support(payload).json()["result"]
+
+    assert result["calibration_status"] == "unsupported"
+    assert result["conclusion_disposition"] == "withheld"
+    assert "material_counterevidence_misclassified" in result["limitation_codes"]
 
 
 def test_generic_declared_material_counterevidence_requires_qualification():
@@ -1129,7 +1357,10 @@ def test_generic_system_policy_constraints_withhold_claim(
     assert limitation in result["limitation_codes"]
 
 
-def test_generic_runtime_event_is_bounded_and_excludes_claim_content_and_refs():
+@pytest.mark.parametrize("claim_scope_basis", ["declared_scope", "supplied_evidence"])
+def test_generic_runtime_event_is_bounded_and_excludes_claim_content_and_refs(
+    claim_scope_basis: str,
+):
     scope = _start_runtime()
     private_claim = "PRIVATE CLAIM SENTINEL"
     payload = _support_payload(
@@ -1142,6 +1373,7 @@ def test_generic_runtime_event_is_bounded_and_excludes_claim_content_and_refs():
             "material_exclusions": [],
             "executed_derivation_ref_ids": [],
         },
+        claim_scope_basis=claim_scope_basis,
     )
     response = _evaluate_support(payload)
     assert response.status_code == 200
@@ -1158,6 +1390,7 @@ def test_generic_runtime_event_is_bounded_and_excludes_claim_content_and_refs():
         "request_id",
         "runtime_session_id",
         "runtime_turn_id",
+        "claim_scope_basis",
         "claim_id",
         "claim_digest",
         "calibration_status",
@@ -1170,6 +1403,7 @@ def test_generic_runtime_event_is_bounded_and_excludes_claim_content_and_refs():
         "executed_derivation_count",
         "interpretation_dependent_derivation",
     }
+    assert event_payload["claim_scope_basis"] == claim_scope_basis
     assert private_claim not in serialized
     assert "private-ref-1" not in serialized
     assert "prompt" not in serialized.lower()
