@@ -39,7 +39,6 @@ _CONTRADICTION_SHAPES = {
     "recommendation_or_decision_support",
 }
 _AUTHORITATIVE_INVENTORY_SHAPES = {
-    "bounded_exhaustive_review",
     "absence_or_coverage_check",
 }
 _COMPLETE_INVENTORY_SHAPES = {
@@ -54,7 +53,6 @@ _MATERIAL_REQUIREMENT_KINDS: dict[str, tuple[str, ...]] = {
         "no_material_truncation",
     ),
     "bounded_exhaustive_review": (
-        "authoritative_inventory",
         "complete_scope_coverage",
         "contradiction_search",
         "context_delivery",
@@ -552,11 +550,17 @@ def _material_plan_supported(
     if task_shape in _COMPLETE_INVENTORY_SHAPES:
         if scope.inventory_status != "complete_for_declared_scope":
             return False
+        if "declared_source_missing_from_inventory" in limitations:
+            return False
+        if task_shape == "bounded_exhaustive_review" and limitations & {
+            "authoritative_source_unavailable",
+            "optional_source_unavailable",
+        }:
+            return False
+    if task_shape in _AUTHORITATIVE_INVENTORY_SHAPES:
         if not authoritative:
             return False
         if "authoritative_source_unavailable" in limitations:
-            return False
-        if "declared_source_missing_from_inventory" in limitations:
             return False
     if task_shape in {"cross_source_comparison", "recommendation_or_decision_support"}:
         if len(eligible) < 2:
