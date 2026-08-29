@@ -237,6 +237,15 @@ surface, runtime session and turn, authorized evidence identities, claim-relevan
 scope and acquisition facts, and actual deterministic derivation records. The
 proposal supplies only a bounded claim, supporting or counterevidence identities,
 material exclusions, and references to those executed derivations.
+The system-owned `claim_scope_basis` authority fact distinguishes a claim about
+the full `declared_scope` from a claim already bounded by the trusted caller to
+`supplied_evidence`. `declared_scope` is the compatibility default and retains
+strict complete-scope enforcement. `supplied_evidence` does not assert that the
+broader declared scope was complete; incomplete broader acquisition therefore
+requires qualification rather than automatic withholding when no independent
+hard blocker exists. Universal and absence conclusions still require the
+appropriate complete-scope authority. The claim proposal cannot select this
+field, and the evaluation response adds no corresponding field.
 One bounded evidence unit may both support a claim and carry a disclosed material
 exclusion when only part of that unit was usable. That overlap necessarily
 qualifies the result. Supporting and counterevidence roles remain mutually

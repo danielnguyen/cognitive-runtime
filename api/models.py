@@ -883,6 +883,7 @@ ClaimSupportSourceAuthority = Literal["established", "limited", "unknown"]
 ClaimSupportFreshness = Literal["current", "stale", "unknown", "not_applicable"]
 ClaimSupportMaterialRole = Literal["support", "counterevidence", "neutral"]
 ClaimSupportInputBasis = Literal["system_established", "model_interpreted"]
+ClaimSupportScopeBasis = Literal["declared_scope", "supplied_evidence"]
 ClaimSupportCalibrationStatus = Literal["supported", "limited", "unsupported"]
 ClaimSupportConclusionDisposition = Literal["allowed", "qualified", "withheld"]
 ClaimSupportLimitationCode = Literal[
@@ -969,6 +970,7 @@ class ClaimSupportAuthorityContext(BaseModel):
         default_factory=list,
         max_length=16,
     )
+    claim_scope_basis: ClaimSupportScopeBasis = "declared_scope"
     complete_declared_scope_required: bool = False
     complete_declared_scope_established: bool | None = None
     material_acquisition_limited: bool = False
