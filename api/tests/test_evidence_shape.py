@@ -833,7 +833,6 @@ def _source(
             "complete_for_declared_scope",
             True,
             {
-                "authoritative_inventory",
                 "complete_scope_coverage",
                 "contradiction_search",
                 "context_delivery",
