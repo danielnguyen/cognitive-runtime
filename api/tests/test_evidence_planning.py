@@ -1774,19 +1774,67 @@ def test_valid_strategy_can_be_ready_with_optional_scope_limitations():
     assert "source_inventory_partial" in result["limitation_codes"]
 
 
-def test_historical_and_decision_support_prerequisites_are_enforced():
+def test_historical_without_time_scope_admits_safe_hybrid_with_limitations():
     historical_missing_time = _compile(
         _start_runtime(),
         task_shape="historical_reconstruction",
         declared_scope=_scope(source_ids=["source-a"]),
+        source_inventory=[
+            _source(
+                "source-a",
+                capabilities=["targeted_retrieval", "context_expansion"],
+            )
+        ],
+    ).json()["result"]
+
+    assert historical_missing_time["plan_status"] == "ready_with_limitations"
+    assert historical_missing_time["selected_strategies"] == ["hybrid"]
+    assert "historical_time_scope_missing" in historical_missing_time[
+        "limitation_codes"
+    ]
+    assert "historical_sequence_not_supported" not in historical_missing_time[
+        "limitation_codes"
+    ]
+    assert {
+        "historical_scope",
+        "historical_sequence_coverage",
+    } <= _requirement_kinds(historical_missing_time)
+
+
+def test_historical_with_time_scope_retains_supported_behavior():
+    result = _compile(
+        _start_runtime(),
+        task_shape="historical_reconstruction",
+        declared_scope=_scope(source_ids=["source-a"], time_scope_ref="window-1"),
         source_inventory=[_source("source-a", capabilities=["structured_query"])],
     ).json()["result"]
+
+    assert result["plan_status"] == "ready"
+    assert result["selected_strategies"] == ["structured_query"]
+    assert "historical_time_scope_missing" not in result["limitation_codes"]
+    assert "historical_sequence_not_supported" not in result["limitation_codes"]
+    assert {
+        "historical_scope",
+        "historical_sequence_coverage",
+    } <= _requirement_kinds(result)
+
+
+def test_historical_without_safe_capability_remains_unsupported():
     historical_targeted = _compile(
         _start_runtime(),
         task_shape="historical_reconstruction",
         declared_scope=_scope(source_ids=["source-a"], time_scope_ref="window-1"),
         source_inventory=[_source("source-a", capabilities=["targeted_retrieval"])],
     ).json()["result"]
+
+    assert historical_targeted["plan_status"] == "unsupported"
+    assert historical_targeted["selected_strategies"] == []
+    assert "historical_sequence_not_supported" in historical_targeted[
+        "limitation_codes"
+    ]
+
+
+def test_decision_support_prerequisites_are_enforced():
     decision_negative = _compile(
         _start_runtime(),
         task_shape="recommendation_or_decision_support",
@@ -1799,14 +1847,6 @@ def test_historical_and_decision_support_prerequisites_are_enforced():
         ],
     ).json()["result"]
 
-    assert historical_missing_time["plan_status"] == "unsupported"
-    assert "historical_time_scope_missing" in historical_missing_time[
-        "limitation_codes"
-    ]
-    assert historical_targeted["plan_status"] == "unsupported"
-    assert "historical_sequence_not_supported" in historical_targeted[
-        "limitation_codes"
-    ]
     assert decision_negative["plan_status"] == "unsupported"
     assert "decision_support_scope_insufficient" in decision_negative[
         "limitation_codes"
@@ -1816,6 +1856,113 @@ def test_historical_and_decision_support_prerequisites_are_enforced():
         "cross_source_comparison",
         "counterevidence_coverage",
     } <= _requirement_kinds(decision_negative)
+
+
+@pytest.mark.parametrize(
+    ("scope", "inventory", "expected_limitation", "expected_status"),
+    [
+        (
+            _scope(source_ids=["source-missing"]),
+            [_source("source-a", capabilities=["structured_query"])],
+            "declared_source_missing_from_inventory",
+            "unsupported",
+        ),
+        (
+            _scope(source_ids=["source-a"]),
+            [
+                _source(
+                    "source-a",
+                    capabilities=["structured_query"],
+                    availability="unavailable",
+                )
+            ],
+            "authoritative_source_unavailable",
+            "unsupported",
+        ),
+        (
+            _scope(source_ids=["source-a"], inventory_status="partial"),
+            [_source("source-a", capabilities=["structured_query"])],
+            "source_inventory_partial",
+            "ready_with_limitations",
+        ),
+    ],
+    ids=["missing-source", "unavailable-source", "partial-inventory"],
+)
+def test_historical_inventory_failures_remain_conservative(
+    scope: dict[str, object],
+    inventory: list[dict[str, object]],
+    expected_limitation: str,
+    expected_status: str,
+):
+    result = _compile(
+        _start_runtime(),
+        task_shape="historical_reconstruction",
+        declared_scope=scope,
+        source_inventory=inventory,
+    ).json()["result"]
+
+    assert result["plan_status"] == expected_status
+    assert expected_limitation in result["limitation_codes"]
+    assert "historical_time_scope_missing" in result["limitation_codes"]
+    assert result["plan_status"] != "ready"
+
+
+def test_historical_malformed_inventory_is_rejected():
+    response = _compile(
+        _start_runtime(),
+        task_shape="historical_reconstruction",
+        declared_scope=_scope(source_ids=["source-a"]),
+        source_inventory=[
+            {
+                **_source("source-a", capabilities=["structured_query"]),
+                "capabilities": ["unsupported-capability"],
+            }
+        ],
+    )
+
+    assert response.status_code == 422
+
+
+def test_historical_without_time_scope_replays_deterministically():
+    runtime = _start_runtime()
+    scope = _scope(
+        source_ids=["source-a"],
+        source_categories=["maintenance", "records"],
+    )
+    inventory = [
+        _source(
+            "source-a",
+            categories=["maintenance", "records"],
+            capabilities=["targeted_retrieval", "context_expansion"],
+        )
+    ]
+    first = _compile(
+        runtime,
+        task_shape="historical_reconstruction",
+        declared_scope=scope,
+        source_inventory=inventory,
+    )
+    reordered = _compile(
+        runtime,
+        task_shape="historical_reconstruction",
+        declared_scope={
+            **scope,
+            "source_categories": list(reversed(scope["source_categories"])),
+        },
+        source_inventory=[
+            {
+                **inventory[0],
+                "source_categories": list(
+                    reversed(inventory[0]["source_categories"])
+                ),
+                "capabilities": list(reversed(inventory[0]["capabilities"])),
+            }
+        ],
+    )
+
+    assert first.status_code == 200
+    assert reordered.status_code == 200
+    assert first.json()["result"] == reordered.json()["result"]
 
 
 def test_declared_universe_and_available_eligible_sources_remain_distinct():

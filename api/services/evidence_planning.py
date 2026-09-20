@@ -321,8 +321,6 @@ def _select_strategy(
         return None
 
     if task_shape == "historical_reconstruction":
-        if not scope.time_scope_ref:
-            return None
         if _all_have_capability(eligible, "structured_query"):
             return "structured_query"
         if _all_support_hybrid(eligible):
@@ -575,8 +573,6 @@ def _material_plan_supported(
         )
         if len(eligible) < 2 and not one_full_authoritative:
             return False
-    if task_shape == "historical_reconstruction" and not scope.time_scope_ref:
-        return False
     return True
 
 
