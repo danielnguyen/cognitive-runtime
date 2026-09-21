@@ -557,6 +557,18 @@ class RuntimeTurnCompleteRequest(BaseModel):
     continuation_state: str | None = Field(default=None, max_length=64)
 
 
+class RuntimeTurnsReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=120, pattern=r"\S")
+
+
+class RuntimeTurnsReconcileResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    interrupted_count: int = Field(ge=0)
+
+
 class RuntimeTurnResponse(BaseModel):
     runtime_session: RuntimeSession
     runtime_turn: RuntimeTurn

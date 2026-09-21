@@ -96,6 +96,239 @@ def _runtime_rows(db_path: Path) -> tuple[tuple[tuple[object, ...], ...], ...]:
         )
 
 
+@pytest.mark.parametrize("status", ["received", "retrieving", "responding"])
+def test_reconcile_interrupted_turn_is_durable_and_idempotent(tmp_path, status):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    session, turn, _ = repo.start_turn(
+        request_id="original-request", owner_id="owner-interrupted",
+        conversation_id="conversation-interrupted", surface="web",
+        intent_class="question", restraint_policy="short_answer",
+    )
+    if status != "received":
+        repo.update_turn(
+            request_id="original-request", runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id, turn_status=status,
+        )
+    before = _runtime_rows(db_path)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/runtime/turns/reconcile-interrupted", json={"request_id": "restart-request"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"interrupted_count": 1}
+    reopened = RuntimeStateRepository(db_path)
+    diagnostics = reopened.diagnostics(session.runtime_session_id)
+    assert diagnostics.active_turn is None
+    result = diagnostics.latest_turn
+    assert result.runtime_turn_id == turn.runtime_turn_id
+    assert result.turn_status == "abandoned"
+    assert result.completed_at == result.updated_at
+    assert datetime.fromisoformat(result.completed_at) >= datetime.fromisoformat(turn.created_at)
+    assert result.intent_class == "question"
+    assert result.restraint_policy == "short_answer"
+    thread = reopened.resolve_thread(
+        owner_id=session.owner_id, conversation_id=session.conversation_id,
+    )
+    assert thread.state == "idle"
+    assert thread.revision == 2
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            """SELECT active_runtime_session_id, active_runtime_turn_id,
+                      active_surface, active_request_id FROM conversation_runtime_threads""",
+        ).fetchall() == [(None, None, None, None)]
+    terminal_events = [
+        event for event in diagnostics.events if event.event_type == "turn_completed"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].runtime_turn_id == turn.runtime_turn_id
+    assert terminal_events[0].event_payload_json == {
+        "request_id": "restart-request", "turn_status": "abandoned", "continuation_state": None,
+    }
+    after = _runtime_rows(db_path)
+    assert len(after[0]) == len(before[0]) == 1  # No new session/admission.
+    assert len(after[2]) == len(before[2]) == 1  # No new execution.
+    assert len(after[3]) == len(before[3]) + 1  # Only normal terminal audit.
+    assert reopened.reconcile_interrupted_turns(request_id="another-restart") == 0
+    assert _runtime_rows(db_path) == after
+    # Ordinary admission is available again without resuming the abandoned turn.
+    _, next_turn, _ = reopened.start_turn(
+        request_id="new-request", owner_id=session.owner_id,
+        conversation_id=session.conversation_id, surface="web", expected_thread_revision=2,
+    )
+    assert next_turn.runtime_turn_id != turn.runtime_turn_id
+
+
+def test_reconcile_multiple_conversations_leaves_terminal_turns_unchanged(tmp_path):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    terminals = []
+    for index, status in enumerate(["completed", "abandoned", None, None]):
+        session, turn, _ = repo.start_turn(
+            request_id=f"request-{index}", owner_id=f"owner-{index % 2}",
+            conversation_id=f"conversation-{index}", surface="web",
+        )
+        if status:
+            repo.complete_turn(
+                request_id=f"done-{index}", runtime_session_id=session.runtime_session_id,
+                runtime_turn_id=turn.runtime_turn_id, turn_status=status,
+            )
+            terminals.append(repo.diagnostics(session.runtime_session_id))
+    assert repo.reconcile_interrupted_turns(request_id="restart") == 2
+    for terminal in terminals:
+        assert repo.diagnostics(terminal.runtime_session.runtime_session_id) == terminal
+    for index in range(4):
+        thread = repo.resolve_thread(
+            owner_id=f"owner-{index % 2}", conversation_id=f"conversation-{index}",
+        )
+        assert thread.state == "idle"
+        assert thread.revision == 2
+    before = _runtime_rows(db_path)
+    assert repo.reconcile_interrupted_turns(request_id="restart") == 0
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("corruption", [
+    "missing_thread", "contended", "unavailable", "idle", "wrong_turn", "wrong_session",
+    "wrong_surface", "wrong_request", "missing_request", "missing_start", "duplicate_turn",
+    "completed_timestamp", "missing_session", "duplicate_start", "terminal_event",
+])
+def test_reconcile_inconsistent_state_rolls_back_all_turns(tmp_path, corruption):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    for index in range(2):
+        session, turn, _ = repo.start_turn(
+            request_id=f"request-{index}", owner_id="owner-interrupted",
+            conversation_id=f"conversation-{index}", surface="web",
+        )
+    # Corrupt the second turn: even a valid earlier completion must roll back.
+    with sqlite3.connect(db_path) as conn:
+        if corruption == "missing_thread":
+            conn.execute("DELETE FROM conversation_runtime_threads WHERE conversation_id = ?",
+                         (session.conversation_id,))
+        elif corruption in {"contended", "unavailable", "idle"}:
+            conn.execute(
+                "UPDATE conversation_runtime_threads SET state = ? WHERE conversation_id = ?",
+                (corruption, session.conversation_id),
+            )
+        elif corruption.startswith("wrong_") or corruption == "missing_request":
+            field = {
+                "wrong_turn": "active_runtime_turn_id",
+                "wrong_session": "active_runtime_session_id",
+                "wrong_surface": "active_surface", "wrong_request": "active_request_id",
+                "missing_request": "active_request_id",
+            }[corruption]
+            conn.execute(
+                f"UPDATE conversation_runtime_threads SET {field} = ? WHERE conversation_id = ?",
+                (None if corruption == "missing_request" else "mismatch", session.conversation_id),
+            )
+        elif corruption == "missing_start":
+            conn.execute("DELETE FROM conversation_runtime_events WHERE runtime_turn_id = ?",
+                         (turn.runtime_turn_id,))
+        elif corruption in {"duplicate_start", "terminal_event"}:
+            conn.execute(
+                """INSERT INTO conversation_runtime_events
+                   (event_id, runtime_session_id, runtime_turn_id, event_type,
+                    event_payload_json, created_at)
+                   SELECT 'conflicting-event', runtime_session_id, runtime_turn_id, ?,
+                          event_payload_json, created_at
+                   FROM conversation_runtime_events
+                   WHERE runtime_turn_id = ? AND event_type = 'turn_started'""",
+                ("turn_started" if corruption == "duplicate_start" else "turn_completed",
+                 turn.runtime_turn_id),
+            )
+        elif corruption == "duplicate_turn":
+            conn.execute(
+                """INSERT INTO conversation_runtime_turns
+                   (runtime_turn_id, runtime_session_id, turn_status, created_at, updated_at)
+                   VALUES ('duplicate-turn', ?, 'received', ?, ?)""",
+                (session.runtime_session_id, turn.created_at, turn.updated_at),
+            )
+        elif corruption == "completed_timestamp":
+            conn.execute(
+                "UPDATE conversation_runtime_turns SET completed_at = ? WHERE runtime_turn_id = ?",
+                (turn.created_at, turn.runtime_turn_id),
+            )
+        elif corruption == "missing_session":
+            conn.execute("DELETE FROM conversation_runtime_sessions WHERE runtime_session_id = ?",
+                         (session.runtime_session_id,))
+    before = _runtime_rows(db_path)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/runtime/turns/reconcile-interrupted", json={"request_id": "restart"},
+    )
+    expected = (
+        "runtime_thread_contended" if corruption == "contended" else "runtime_thread_unavailable"
+    )
+    assert response.status_code == (409 if corruption == "contended" else 503)
+    assert response.json() == {"detail": expected}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("body", [{}, {"request_id": ""}, {"request_id": " "},
+                                  {"request_id": "x" * 121}, {"request_id": 1},
+                                  {"request_id": "restart", "owner_id": "private"}])
+def test_reconcile_request_is_strict_and_bounded(tmp_path, body):
+    db_path = _use_database(tmp_path)
+    before = _runtime_rows(db_path)
+    client = TestClient(app)
+    assert client.post("/v1/runtime/turns/reconcile-interrupted", json=body).status_code == 422
+    assert _runtime_rows(db_path) == before
+
+
+def test_concurrent_reconciliation_records_one_terminal_event(tmp_path):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    session, turn, _ = repo.start_turn(
+        request_id="original", owner_id="owner", conversation_id="conversation", surface="web",
+    )
+    barrier = threading.Barrier(2)
+
+    def reconcile(index):
+        independent = RuntimeStateRepository(db_path)
+        barrier.wait()
+        return independent.reconcile_interrupted_turns(request_id=f"restart-{index}")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        counts = list(pool.map(reconcile, range(2)))
+    assert sorted(counts) == [0, 1]
+    diagnostics = repo.diagnostics(session.runtime_session_id)
+    assert diagnostics.latest_turn.runtime_turn_id == turn.runtime_turn_id
+    assert diagnostics.latest_turn.turn_status == "abandoned"
+    assert len([e for e in diagnostics.events if e.event_type == "turn_completed"]) == 1
+    assert repo.resolve_thread(owner_id="owner", conversation_id="conversation").revision == 2
+
+
+def test_reconcile_event_failure_rolls_back_completion(tmp_path, monkeypatch):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    repo.start_turn(
+        request_id="original", owner_id="owner", conversation_id="conversation", surface="web",
+    )
+    before = _runtime_rows(db_path)
+
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError("audit unavailable")
+
+    monkeypatch.setattr(repo, "_record_event", unavailable)
+    with pytest.raises(sqlite3.OperationalError, match="audit unavailable"):
+        repo.reconcile_interrupted_turns(request_id="restart")
+    assert _runtime_rows(db_path) == before
+
+
+def test_reconcile_persistence_failure_is_bounded(monkeypatch):
+    def unavailable(**kwargs):
+        raise sqlite3.OperationalError("private-database-location-sentinel")
+
+    monkeypatch.setattr(main_module, "reconcile_interrupted_turns", unavailable)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/runtime/turns/reconcile-interrupted", json={"request_id": "restart"},
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+
+
 def _continuation_candidate(
     conversation_id: str,
     *,

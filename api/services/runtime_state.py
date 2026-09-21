@@ -1341,86 +1341,166 @@ class RuntimeStateRepository:
         now = _now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE;")
-            session = self._session_by_id(conn, runtime_session_id)
-            if session is None:
-                raise RuntimeError("runtime_session_not_found")
-            turn = self._turn_by_id(conn, runtime_turn_id)
-            if turn is None:
-                raise RuntimeError("runtime_turn_not_found")
-            if turn.runtime_session_id != runtime_session_id:
-                raise RuntimeError("runtime_turn_session_mismatch")
-            if turn.turn_status in _TERMINAL_TURN_STATUSES:
-                event = self._turn_event(
-                    conn,
-                    runtime_turn_id=runtime_turn_id,
-                    event_type="turn_completed",
-                    request_id=request_id,
-                    turn_status=turn_status,
-                )
-                if (
-                    turn.turn_status == turn_status
-                    and event is not None
-                    and event.event_payload_json.get("continuation_state")
-                    == continuation_state
-                ):
-                    return session, turn, event
-                raise RuntimeError("runtime_turn_not_current")
-
-            thread = self._validate_current_turn(conn, session=session, turn=turn)
-            self._update_turn_row(
+            return self._complete_turn_in_transaction(
                 conn,
-                runtime_turn_id,
-                {
-                    "turn_status": turn_status,
-                    "continuation_state": continuation_state,
-                    "updated_at": now,
-                    "completed_at": now,
-                },
-            )
-            self._update_session_row(
-                conn,
-                runtime_session_id,
-                {
-                    "status": "active",
-                    "last_activity_at": now,
-                    "updated_at": now,
-                },
-            )
-            event = self._record_event(
-                conn,
+                request_id=request_id,
                 runtime_session_id=runtime_session_id,
                 runtime_turn_id=runtime_turn_id,
+                turn_status=turn_status,
+                continuation_state=continuation_state,
+                now=now,
+            )
+
+    def _complete_turn_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        request_id: str,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+        turn_status: str,
+        continuation_state: str | None = None,
+        now: str,
+    ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
+        session = self._session_by_id(conn, runtime_session_id)
+        if session is None:
+            raise RuntimeError("runtime_session_not_found")
+        turn = self._turn_by_id(conn, runtime_turn_id)
+        if turn is None:
+            raise RuntimeError("runtime_turn_not_found")
+        if turn.runtime_session_id != runtime_session_id:
+            raise RuntimeError("runtime_turn_session_mismatch")
+        if turn.turn_status in _TERMINAL_TURN_STATUSES:
+            event = self._turn_event(
+                conn,
+                runtime_turn_id=runtime_turn_id,
                 event_type="turn_completed",
-                event_payload_json={
-                    "request_id": request_id,
-                    "turn_status": turn_status,
-                    "continuation_state": continuation_state,
-                },
+                request_id=request_id,
+                turn_status=turn_status,
             )
-            thread_update = conn.execute(
-                """
-                UPDATE conversation_runtime_threads
-                SET state = 'idle', revision = revision + 1,
-                    active_runtime_session_id = NULL,
-                    active_runtime_turn_id = NULL,
-                    active_surface = NULL, active_request_id = NULL,
-                    last_activity_at = ?, updated_at = ?
-                WHERE owner_id = ? AND conversation_id = ? AND revision = ?;
-                """,
-                (
-                    now,
-                    now,
-                    session.owner_id,
-                    session.conversation_id,
-                    thread["revision"],
-                ),
-            )
-            if thread_update.rowcount != 1:
-                raise RuntimeError("runtime_thread_unavailable")
-            updated_turn = self._turn_by_id(conn, runtime_turn_id)
-            updated_session = self._session_by_id(conn, runtime_session_id)
+            if (
+                turn.turn_status == turn_status
+                and event is not None
+                and event.event_payload_json.get("continuation_state")
+                == continuation_state
+            ):
+                return session, turn, event
+            raise RuntimeError("runtime_turn_not_current")
+
+        thread = self._validate_current_turn(conn, session=session, turn=turn)
+        self._update_turn_row(
+            conn,
+            runtime_turn_id,
+            {
+                "turn_status": turn_status,
+                "continuation_state": continuation_state,
+                "updated_at": now,
+                "completed_at": now,
+            },
+        )
+        self._update_session_row(
+            conn,
+            runtime_session_id,
+            {
+                "status": "active",
+                "last_activity_at": now,
+                "updated_at": now,
+            },
+        )
+        event = self._record_event(
+            conn,
+            runtime_session_id=runtime_session_id,
+            runtime_turn_id=runtime_turn_id,
+            event_type="turn_completed",
+            event_payload_json={
+                "request_id": request_id,
+                "turn_status": turn_status,
+                "continuation_state": continuation_state,
+            },
+        )
+        thread_update = conn.execute(
+            """
+            UPDATE conversation_runtime_threads
+            SET state = 'idle', revision = revision + 1,
+                active_runtime_session_id = NULL,
+                active_runtime_turn_id = NULL,
+                active_surface = NULL, active_request_id = NULL,
+                last_activity_at = ?, updated_at = ?
+            WHERE owner_id = ? AND conversation_id = ? AND revision = ?;
+            """,
+            (
+                now,
+                now,
+                session.owner_id,
+                session.conversation_id,
+                thread["revision"],
+            ),
+        )
+        if thread_update.rowcount != 1:
+            raise RuntimeError("runtime_thread_unavailable")
+        updated_turn = self._turn_by_id(conn, runtime_turn_id)
+        updated_session = self._session_by_id(conn, runtime_session_id)
         assert updated_turn is not None and updated_session is not None
         return updated_session, updated_turn, event
+
+    def reconcile_interrupted_turns(self, *, request_id: str) -> int:
+        # The caller must have stopped the sole execution process before calling.
+        # One transaction prevents partial cleanup or racing normal turn writes.
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            rows = conn.execute(
+                """
+                SELECT * FROM conversation_runtime_turns
+                WHERE turn_status NOT IN ('completed', 'abandoned')
+                ORDER BY id ASC;
+                """
+            ).fetchall()
+            for row in rows:
+                session = self._session_by_id(conn, row["runtime_session_id"])
+                if session is None or row["completed_at"] is not None:
+                    raise RuntimeError("runtime_thread_unavailable")
+                # Inspect without _ensure_thread: missing ownership must not be repaired.
+                inspection = self._inspect_continuation_thread(
+                    conn, owner_id=session.owner_id, conversation_id=session.conversation_id,
+                )
+                if inspection["state"] == "contended":
+                    raise RuntimeError("runtime_thread_contended")
+                if inspection["state"] != "active":
+                    raise RuntimeError("runtime_thread_unavailable")
+                thread = self._thread_by_key(
+                    conn, owner_id=session.owner_id, conversation_id=session.conversation_id,
+                )
+                started = conn.execute(
+                    """
+                    SELECT * FROM conversation_runtime_events
+                    WHERE runtime_turn_id = ?
+                      AND event_type IN ('turn_started', 'turn_completed');
+                    """,
+                    (row["runtime_turn_id"],),
+                ).fetchall()
+                if (
+                    thread is None
+                    or thread["active_runtime_turn_id"] != row["runtime_turn_id"]
+                    or not thread["active_request_id"]
+                    or len(started) != 1
+                    or started[0]["event_type"] != "turn_started"
+                    or started[0]["runtime_session_id"] != session.runtime_session_id
+                    or self._event_from_row(started[0]).event_payload_json.get("request_id")
+                    != thread["active_request_id"]
+                ):
+                    raise RuntimeError("runtime_thread_unavailable")
+                self._raise_if_retirement_reserved(
+                    conn, owner_id=session.owner_id, conversation_id=session.conversation_id,
+                )
+                self._complete_turn_in_transaction(
+                    conn,
+                    request_id=request_id,
+                    runtime_session_id=session.runtime_session_id,
+                    runtime_turn_id=row["runtime_turn_id"],
+                    turn_status="abandoned",
+                    now=_now(),
+                )
+            return len(rows)
 
     def _validate_current_turn(
         self,
@@ -2076,6 +2156,10 @@ def complete_turn(
         turn_status=turn_status,
         continuation_state=continuation_state,
     )
+
+
+def reconcile_interrupted_turns(*, request_id: str) -> int:
+    return runtime_state_repository().reconcile_interrupted_turns(request_id=request_id)
 
 
 def record_runtime_event(

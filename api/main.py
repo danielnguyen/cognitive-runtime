@@ -84,6 +84,8 @@ from models import (
     RuntimeThreadResolveRequest,
     RuntimeTurnCompleteRequest,
     RuntimeTurnResponse,
+    RuntimeTurnsReconcileRequest,
+    RuntimeTurnsReconcileResponse,
     RuntimeTurnStartRequest,
     RuntimeTurnUpdateRequest,
     ScenePolicyDetail,
@@ -158,6 +160,7 @@ from services.runtime_state import (
     complete_turn,
     finalize_runtime_retirement,
     get_runtime_session,
+    reconcile_interrupted_turns,
     record_runtime_event,
     reserve_runtime_retirement,
     reset_state,
@@ -489,6 +492,20 @@ async def runtime_turn_complete(body: RuntimeTurnCompleteRequest) -> RuntimeTurn
     except Exception as exc:
         raise _runtime_state_http_error(exc) from None
     return RuntimeTurnResponse(runtime_session=session, runtime_turn=turn, event=event)
+
+
+@app.post(
+    "/v1/runtime/turns/reconcile-interrupted",
+    response_model=RuntimeTurnsReconcileResponse,
+)
+async def runtime_turns_reconcile(
+    body: RuntimeTurnsReconcileRequest,
+) -> RuntimeTurnsReconcileResponse:
+    try:
+        count = reconcile_interrupted_turns(request_id=body.request_id)
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
+    return RuntimeTurnsReconcileResponse(interrupted_count=count)
 
 
 @app.post(
