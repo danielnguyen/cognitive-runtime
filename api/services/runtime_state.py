@@ -261,6 +261,8 @@ class RuntimeStateRepository:
             active_mode = (session.active_mode or "").strip().lower().replace("-", "_")
             if session.status in {"closing", "closed"}:
                 state, reason = "not_present", "session_not_present"
+            elif request.explicit_proactive_opt_out is True:
+                state, reason = "do_not_intrude", "explicit_proactive_opt_out"
             elif request.active_task_mode:
                 state, reason = "driving_or_active_task", "active_task_mode"
             elif active_mode in {"driving", "active_task", "driving_or_active_task"}:
@@ -306,7 +308,8 @@ class RuntimeStateRepository:
                 previous_presence_state=previous_state,
                 state_changed=state != previous_state,
                 proactive_output_suppressed=request.proactive_output_suppressed or state in {
-                    "not_present", "idle", "low_attention", "driving_or_active_task",
+                    "not_present", "do_not_intrude", "idle", "low_attention",
+                    "driving_or_active_task",
                 },
                 required_help_allowed=state != "not_present",
                 reason_codes=reasons,
