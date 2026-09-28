@@ -1,8 +1,10 @@
+import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import get_args
 
 import main as main_module
 import pytest
@@ -18,8 +20,12 @@ from models import (
     RetirementReservationRequest,
     RetirementReservationResponse,
     RetirementReservationResult,
+    RuntimePresenceEvaluateRequest,
+    RuntimePresenceEvaluateResponse,
+    RuntimePresenceResult,
+    RuntimePresenceState,
 )
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from services.runtime_state import RuntimeStateRepository, clear_states_for_tests
 
 
@@ -4013,3 +4019,452 @@ def test_reservation_schema_has_no_expiry_lifecycle_mirror_or_receipt(tmp_path: 
             (owner_id, conversation_id),
         ).fetchone()[0]
     assert state == "idle"
+
+
+def _presence_scope(tmp_path, *, active=False):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    scope = dict(
+        request_id="presence-test", owner_id="owner", conversation_id="thread", surface="web",
+    )
+    if active:
+        session, turn, _ = repo.start_turn(**scope)
+    else:
+        session = repo.resolve_session(**scope)
+        turn = None
+    request = RuntimePresenceEvaluateRequest(
+        **scope, runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id if turn else None,
+    )
+    return db_path, repo, request
+
+
+@pytest.mark.parametrize("field,value", [
+    ("raw_user_text", "private text"), ("current_user_text", "private text"),
+    ("emotional_state", "inferred"), ("provider_output", "private output"),
+    ("recent_messages", []), ("attention_state", "paused"), ("active_mode", "driving"),
+    ("thread_state", "idle"), ("policy", {}),
+    ("active_task_mode", "true"), ("active_task_mode", 1), ("active_task_mode", None),
+    ("proactive_output_suppressed", "false"), ("proactive_output_suppressed", 0),
+    ("proactive_output_suppressed", None),
+    ("request_id", ""), ("request_id", 1), ("request_id", "x" * 121),
+    ("owner_id", ""), ("owner_id", []), ("owner_id", "x" * 121),
+    ("conversation_id", ""), ("conversation_id", False), ("conversation_id", "x" * 121),
+    ("surface", ""), ("surface", 1), ("surface", "x" * 65),
+    ("runtime_session_id", ""), ("runtime_session_id", {}),
+    ("runtime_session_id", "x" * 121),
+    ("runtime_turn_id", ""), ("runtime_turn_id", 1), ("runtime_turn_id", "x" * 121),
+])
+def test_presence_request_rejects_malformed_fields_without_mutation(tmp_path, field, value):
+    db_path, _, request = _presence_scope(tmp_path)
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post(
+        "/v1/runtime/presence/evaluate", json={**request.model_dump(), field: value},
+    )
+    assert response.status_code == 422
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("field", [
+    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+])
+def test_presence_request_requires_scope_without_mutation(tmp_path, field):
+    db_path, _, request = _presence_scope(tmp_path)
+    payload = request.model_dump()
+    del payload[field]
+    before = _runtime_rows(db_path)
+    assert TestClient(app).post("/v1/runtime/presence/evaluate", json=payload).status_code == 422
+    assert _runtime_rows(db_path) == before
+
+
+def test_presence_taxonomy_and_request_defaults():
+    states = {
+        "not_present", "available", "active_conversation", "ambient_listening", "idle",
+        "returning_after_gap", "low_attention", "driving_or_active_task", "do_not_intrude",
+    }
+    assert set(get_args(RuntimePresenceState)) == states
+    for state in states:
+        assert TypeAdapter(RuntimePresenceState).validate_python(state, strict=True) == state
+    with pytest.raises(ValidationError):
+        TypeAdapter(RuntimePresenceState).validate_python("briefing")
+    request = RuntimePresenceEvaluateRequest(
+        request_id="request", owner_id="owner", conversation_id="thread",
+        surface="web", runtime_session_id="session",
+    )
+    assert request.active_task_mode is False
+    assert request.proactive_output_suppressed is False
+    assert request.runtime_turn_id is None
+
+
+@pytest.mark.parametrize("changes", [
+    {"extra": "private"}, {"presence_state": "unknown"},
+    {"previous_presence_state": "unknown"}, {"state_changed": "true"},
+    {"proactive_output_suppressed": 0}, {"required_help_allowed": 1},
+    {"reason_codes": []}, {"reason_codes": ["arbitrary"]},
+    {"reason_codes": ["session_available", "session_available"]},
+    {"reason_codes": ["session_available"] * 3},
+    {"reason_codes": ["session_idle"]}, {"reason_codes": ["proactive_suppression_requested"]},
+    {"policy_version": "unknown"}, {"state_changed": False},
+    {"required_help_allowed": False}, {"proactive_output_suppressed": True},
+    {"presence_state": "idle", "reason_codes": ["session_idle"]},
+    {"reason_codes": ["session_available", "proactive_suppression_requested"]},
+    {"previous_presence_state": "available"},
+])
+def test_presence_result_rejects_incoherent_or_nonstrict_values(changes):
+    valid = dict(
+        presence_state="available", previous_presence_state=None, state_changed=True,
+        proactive_output_suppressed=False, required_help_allowed=True,
+        reason_codes=["session_available"], policy_version="runtime-presence.v1",
+    )
+    assert RuntimePresenceResult.model_validate(valid).presence_state == "available"
+    with pytest.raises(ValidationError):
+        RuntimePresenceResult.model_validate({**valid, **changes})
+
+
+@pytest.mark.parametrize("changes", [
+    {"extra": "private"}, {"owner_id": 1}, {"runtime_turn_id": 1},
+    {"surface": ""}, {"runtime_session_id": "x" * 121}, {"result": {}},
+])
+def test_presence_response_is_strict(tmp_path, changes):
+    _, repo, request = _presence_scope(tmp_path)
+    response = repo.evaluate_presence(request).model_dump()
+    with pytest.raises(ValidationError):
+        RuntimePresenceEvaluateResponse.model_validate({**response, **changes})
+
+
+@pytest.mark.parametrize(
+    "status,mode,attention,active,active_task,expected,reason",
+    [
+        ("closing", "driving", "paused", True, True, "not_present", "session_not_present"),
+        ("closed", None, None, False, False, "not_present", "session_not_present"),
+        ("active", None, None, False, True, "driving_or_active_task", "active_task_mode"),
+        ("paused", None, "paused", True, True, "driving_or_active_task", "active_task_mode"),
+        ("active", "driving", None, False, False,
+         "driving_or_active_task", "session_active_task_mode"),
+        ("paused", "active_task", "paused", True, False,
+         "driving_or_active_task", "session_active_task_mode"),
+        ("idle", "driving_or_active_task", None, False, False,
+         "driving_or_active_task", "session_active_task_mode"),
+        ("active", "  DRIVING  ", None, False, False,
+         "driving_or_active_task", "session_active_task_mode"),
+        ("active", "Active-Task", None, False, False,
+         "driving_or_active_task", "session_active_task_mode"),
+        ("paused", None, None, True, False, "low_attention", "session_paused"),
+        ("idle", None, "paused", False, False, "low_attention", "attention_paused"),
+        ("active", None, "paused", True, False, "low_attention", "attention_paused"),
+        ("active", None, None, True, False, "active_conversation", "thread_active"),
+        ("idle", None, None, True, False, "active_conversation", "thread_active"),
+        ("idle", None, None, False, False, "idle", "session_idle"),
+        ("active", None, None, False, False, "available", "session_available"),
+        ("opening", None, None, False, False, "available", "session_available"),
+        ("active", "not_driving", None, False, False, "available", "session_available"),
+        ("active", "driving tomorrow", None, False, False, "available", "session_available"),
+        ("active", "ambient_listening", None, False, False, "available", "session_available"),
+        ("active", "returning_after_gap", None, False, False, "available", "session_available"),
+        ("active", "do_not_intrude", None, False, False, "available", "session_available"),
+    ],
+)
+def test_presence_state_precedence_and_bounded_event(
+    tmp_path, status, mode, attention, active, active_task, expected, reason,
+):
+    db_path, repo, request = _presence_scope(tmp_path, active=active)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE conversation_runtime_sessions
+               SET status = ?, active_mode = ?, attention_state = ?""",
+            (status, mode, attention),
+        )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post(
+        "/v1/runtime/presence/evaluate",
+        json={**request.model_dump(), "active_task_mode": active_task},
+    )
+    assert response.status_code == 200, response.text
+    body = RuntimePresenceEvaluateResponse.model_validate(response.json())
+    assert body.model_dump(exclude={"result"}) == request.model_dump(
+        exclude={"active_task_mode", "proactive_output_suppressed"},
+    )
+    result = body.result
+    assert result.presence_state == expected
+    assert result.reason_codes == [reason]
+    assert result.previous_presence_state is None
+    assert result.state_changed is True
+    assert result.required_help_allowed is (expected != "not_present")
+    assert result.proactive_output_suppressed is (expected in {
+        "not_present", "idle", "low_attention", "driving_or_active_task",
+    })
+    after = _runtime_rows(db_path)
+    assert after[:3] == before[:3]
+    assert after[3][:-1] == before[3]
+    assert len(after[3]) == len(before[3]) + 1
+    event = repo.list_events_for_tests(request.runtime_session_id)[-1]
+    assert event.event_type == "presence_evaluated"
+    assert event.runtime_turn_id == request.runtime_turn_id
+    assert event.event_payload_json == result.model_dump()
+    assert set(event.event_payload_json) == {
+        "presence_state", "previous_presence_state", "state_changed",
+        "proactive_output_suppressed", "required_help_allowed", "reason_codes", "policy_version",
+    }
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_presence_suppression_projection_only_narrows_output(tmp_path, active):
+    _, repo, request = _presence_scope(tmp_path, active=active)
+    initial = repo.evaluate_presence(request).result
+    suppressed = repo.evaluate_presence(request.model_copy(update={
+        "proactive_output_suppressed": True,
+    })).result
+    assert suppressed.presence_state == initial.presence_state
+    assert suppressed.previous_presence_state == initial.presence_state
+    assert suppressed.state_changed is False
+    assert initial.proactive_output_suppressed is False
+    assert suppressed.proactive_output_suppressed is True
+    assert initial.required_help_allowed is suppressed.required_help_allowed is True
+    assert suppressed.reason_codes == initial.reason_codes + ["proactive_suppression_requested"]
+
+
+@pytest.mark.parametrize("field,value,code,detail", [
+    ("owner_id", "other-owner", 400, "runtime_session_mismatch"),
+    ("conversation_id", "other-thread", 400, "runtime_session_mismatch"),
+    ("surface", "car", 400, "runtime_session_mismatch"),
+    ("surface", "WEB", 400, "runtime_session_mismatch"),
+    ("runtime_session_id", "missing", 404, "runtime_session_not_found"),
+    ("runtime_turn_id", "missing", 404, "runtime_turn_not_found"),
+])
+def test_presence_scope_mismatch_is_bounded_and_does_not_mutate(
+    tmp_path, field, value, code, detail,
+):
+    db_path, _, request = _presence_scope(tmp_path, active=True)
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post(
+        "/v1/runtime/presence/evaluate", json={**request.model_dump(), field: value},
+    )
+    assert response.status_code == code
+    assert response.json() == {"detail": detail}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("terminal", ["completed", "abandoned"])
+def test_presence_terminal_turn_fails_even_after_new_admission(tmp_path, terminal):
+    db_path, repo, request = _presence_scope(tmp_path, active=True)
+    repo.complete_turn(
+        request_id="complete", runtime_session_id=request.runtime_session_id,
+        runtime_turn_id=request.runtime_turn_id, turn_status=terminal,
+    )
+    repo.start_turn(request_id="next", owner_id="owner", conversation_id="thread", surface="web")
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/presence/evaluate", json=request.model_dump())
+    assert response.status_code == 409
+    assert response.json() == {"detail": "runtime_turn_not_current"}
+    assert _runtime_rows(db_path) == before
+
+
+def test_presence_turn_cannot_belong_to_another_session(tmp_path):
+    db_path, repo, request = _presence_scope(tmp_path, active=True)
+    other = repo.resolve_session(
+        request_id="other", owner_id="owner", conversation_id="thread", surface="car",
+    )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/presence/evaluate", json={
+        **request.model_dump(), "surface": "car", "runtime_session_id": other.runtime_session_id,
+    })
+    assert response.status_code == 400
+    assert response.json() == {"detail": "runtime_turn_session_mismatch"}
+    assert _runtime_rows(db_path) == before
+    # The same shared active thread does not make this other surface active.
+    result = repo.evaluate_presence(request.model_copy(update={
+        "surface": "car", "runtime_session_id": other.runtime_session_id, "runtime_turn_id": None,
+    })).result
+    assert result.presence_state == "available"
+
+
+@pytest.mark.parametrize("defect", [
+    "missing", "contended", "unavailable", "wrong_turn", "wrong_session", "wrong_surface",
+    "idle_with_active_turn", "extra_turn", "invalid_timestamp",
+])
+def test_presence_invalid_thread_fails_without_creating_or_repairing_state(tmp_path, defect):
+    db_path, _, request = _presence_scope(tmp_path, active=True)
+    with sqlite3.connect(db_path) as conn:
+        if defect == "missing":
+            conn.execute("DELETE FROM conversation_runtime_threads")
+        elif defect in {"contended", "unavailable"}:
+            conn.execute("UPDATE conversation_runtime_threads SET state = ?", (defect,))
+        elif defect in {"wrong_turn", "wrong_session", "wrong_surface", "invalid_timestamp"}:
+            field = {
+                "wrong_turn": "active_runtime_turn_id",
+                "wrong_session": "active_runtime_session_id",
+                "wrong_surface": "active_surface", "invalid_timestamp": "last_activity_at",
+            }[defect]
+            conn.execute(f"UPDATE conversation_runtime_threads SET {field} = 'invalid'")
+        elif defect == "idle_with_active_turn":
+            conn.execute("UPDATE conversation_runtime_threads SET state = 'idle'")
+        else:
+            conn.execute(
+                """INSERT INTO conversation_runtime_turns
+                   (runtime_turn_id, runtime_session_id, turn_status, created_at, updated_at)
+                   VALUES ('extra', ?, 'received', 'now', 'now')""",
+                (request.runtime_session_id,),
+            )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/presence/evaluate", json=request.model_dump())
+    assert response.status_code == (409 if defect == "contended" else 503)
+    assert response.json() == {"detail": (
+        "runtime_thread_contended" if defect == "contended" else "runtime_thread_unavailable"
+    )}
+    assert _runtime_rows(db_path) == before
+
+
+def test_presence_completed_thread_is_available_without_idle_threshold(tmp_path):
+    db_path, repo, request = _presence_scope(tmp_path, active=True)
+    repo.complete_turn(
+        request_id="complete", runtime_session_id=request.runtime_session_id,
+        runtime_turn_id=request.runtime_turn_id, turn_status="completed",
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE conversation_runtime_sessions SET last_activity_at = '2000-01-01'")
+    result = repo.evaluate_presence(request.model_copy(update={"runtime_turn_id": None})).result
+    assert result.presence_state == "available"
+
+
+def test_presence_transitions_survive_repository_recreation(tmp_path):
+    db_path, repo, request = _presence_scope(tmp_path)
+    first = repo.evaluate_presence(request).result
+    second = RuntimeStateRepository(db_path).evaluate_presence(request).result
+    assert first.previous_presence_state is None
+    assert second.previous_presence_state == "available"
+    assert second.state_changed is False
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE conversation_runtime_sessions SET status = 'idle'")
+    third = RuntimeStateRepository(db_path).evaluate_presence(request).result
+    assert third.presence_state == "idle"
+    assert third.previous_presence_state == "available"
+    assert third.state_changed is True
+    assert RuntimeStateRepository(db_path).list_events_for_tests(request.runtime_session_id)[
+        -1
+    ].event_payload_json == third.model_dump()
+
+
+@pytest.mark.parametrize("invalid_payload", [
+    "not-json", "null", "{}",
+    json.dumps({"presence_state": "do_not_intrude"}),
+    json.dumps(dict(
+        presence_state="idle", previous_presence_state=None, state_changed=True,
+        proactive_output_suppressed=False, required_help_allowed=True,
+        reason_codes=["session_idle"], policy_version="runtime-presence.v1",
+    )),
+])
+def test_presence_previous_state_uses_latest_valid_event_in_same_session(tmp_path, invalid_payload):
+    db_path, repo, request = _presence_scope(tmp_path)
+    repo.evaluate_presence(request)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE conversation_runtime_sessions SET status = 'idle'")
+    latest = repo.evaluate_presence(request).result
+    other = repo.resolve_session(
+        request_id="other", owner_id="other", conversation_id="other", surface="web",
+    )
+    repo.evaluate_presence(RuntimePresenceEvaluateRequest(
+        request_id="other", owner_id="other", conversation_id="other", surface="web",
+        runtime_session_id=other.runtime_session_id,
+    ))
+    repo.record_session_event(
+        runtime_session_id=request.runtime_session_id, runtime_turn_id=None,
+        event_type="situated_presence_evaluated",
+        event_payload_json={"presence_state": "available"},
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO conversation_runtime_events
+               (event_id, runtime_session_id, event_type, event_payload_json, created_at)
+               VALUES ('malformed', ?, 'presence_evaluated', ?, 'now')""",
+            (request.runtime_session_id, invalid_payload),
+        )
+    result = RuntimeStateRepository(db_path).evaluate_presence(request).result
+    assert result.previous_presence_state == latest.presence_state == "idle"
+    assert result.state_changed is False
+
+
+@pytest.mark.parametrize("failure", ["connect", "after_insert"])
+def test_presence_persistence_failure_is_bounded_and_atomic(tmp_path, monkeypatch, failure):
+    db_path, repo, request = _presence_scope(tmp_path)
+    before = _runtime_rows(db_path)
+    original = RuntimeStateRepository._record_event
+
+    def fail(*args, **kwargs):
+        if failure == "after_insert":
+            original(*args, **kwargs)
+        raise sqlite3.OperationalError("private database path and diagnostic")
+
+    monkeypatch.setattr(
+        RuntimeStateRepository, "_connect" if failure == "connect" else "_record_event", fail,
+    )
+    response = TestClient(app).post("/v1/runtime/presence/evaluate", json=request.model_dump())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _runtime_rows(db_path) == before
+
+
+def test_presence_concurrent_evaluations_serialize_transition_evidence(tmp_path):
+    db_path, repo, request = _presence_scope(tmp_path)
+    barrier = threading.Barrier(4)
+    before = _runtime_rows(db_path)
+
+    def evaluate(_):
+        barrier.wait(timeout=10)
+        return repo.evaluate_presence(request).result
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(evaluate, range(4)))
+    assert sum(result.previous_presence_state is None for result in results) == 1
+    assert sum(result.state_changed for result in results) == 1
+    assert all(result.presence_state == "available" for result in results)
+    after = _runtime_rows(db_path)
+    assert after[:3] == before[:3]
+    assert len(after[3]) == len(before[3]) + 4
+
+
+@pytest.mark.parametrize("surface", ["web", "telegram", "car", "unknown"])
+def test_presence_uses_truthful_surface_scope_without_surface_inference(tmp_path, surface):
+    db_path, repo, request = _presence_scope(tmp_path)
+    session = repo.resolve_session(
+        request_id="surface", owner_id="owner", conversation_id="thread", surface=surface,
+    )
+    payload = {
+        **request.model_dump(), "surface": surface,
+        "runtime_session_id": session.runtime_session_id,
+    }
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/presence/evaluate", json=payload)
+    assert response.status_code == 200
+    assert response.json()["surface"] == surface
+    assert response.json()["result"]["presence_state"] == "available"
+    assert _runtime_rows(db_path)[:3] == before[:3]
+
+
+def test_presence_evidence_omits_unrelated_private_runtime_state(tmp_path):
+    db_path, repo, request = _presence_scope(tmp_path, active=True)
+    private = "private-content-marker"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE conversation_runtime_sessions
+               SET active_scene = ?, temporary_constraints_json = ?, attention_focus_json = ?""",
+            (private, json.dumps([private]), json.dumps({"topic": private})),
+        )
+        conn.execute("UPDATE conversation_runtime_turns SET input_message_id = ?", (private,))
+    result = repo.evaluate_presence(request)
+    event = repo.list_events_for_tests(request.runtime_session_id)[-1]
+    assert private not in result.model_dump_json()
+    assert private not in event.model_dump_json()
+    assert set(event.event_payload_json) == set(RuntimePresenceResult.model_fields)
+
+
+def test_presence_unknown_session_status_fails_conservatively(tmp_path):
+    db_path, _, request = _presence_scope(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE conversation_runtime_sessions SET status = 'unrecognized-private-value'",
+        )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/presence/evaluate", json=request.model_dump())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _runtime_rows(db_path) == before

@@ -24,6 +24,9 @@ from models import (
     RetirementReservationResult,
     RuntimeEvent,
     RuntimeOverlay,
+    RuntimePresenceEvaluateRequest,
+    RuntimePresenceEvaluateResponse,
+    RuntimePresenceResult,
     RuntimeSession,
     RuntimeSessionDiagnosticsResponse,
     RuntimeState,
@@ -31,6 +34,7 @@ from models import (
     RuntimeThreadProjection,
     RuntimeTurn,
 )
+from pydantic import ValidationError
 
 DEFAULT_RUNTIME_DB_PATH = "./data/runtime_state.sqlite3"
 _TERMINAL_TURN_STATUSES = {"completed", "abandoned"}
@@ -215,6 +219,115 @@ class RuntimeStateRepository:
                 conversation_id=conversation_id,
             )
             return self._thread_from_row(conn, row)
+
+    def evaluate_presence(
+        self, request: RuntimePresenceEvaluateRequest,
+    ) -> RuntimePresenceEvaluateResponse:
+        with self._connect() as conn:
+            # Serialize scope inspection, previous-state lookup, and the sole write.
+            conn.execute("BEGIN IMMEDIATE;")
+            session = self._session_by_id(conn, request.runtime_session_id)
+            if session is None:
+                raise RuntimeError("runtime_session_not_found")
+            if (session.owner_id, session.conversation_id, session.surface) != (
+                request.owner_id, request.conversation_id, request.surface,
+            ):
+                raise RuntimeError("runtime_session_mismatch")
+
+            inspection = self._inspect_continuation_thread(
+                conn, owner_id=request.owner_id, conversation_id=request.conversation_id,
+            )
+            if inspection["state"] == "contended":
+                raise RuntimeError("runtime_thread_contended")
+            if inspection["state"] not in {"active", "idle"}:
+                raise RuntimeError("runtime_thread_unavailable")
+            row = self._thread_by_key(
+                conn, owner_id=request.owner_id, conversation_id=request.conversation_id,
+            )
+            assert row is not None
+            thread = self._thread_from_row(conn, row)
+            if request.runtime_turn_id is not None:
+                turn = self._turn_by_id(conn, request.runtime_turn_id)
+                if turn is None:
+                    raise RuntimeError("runtime_turn_not_found")
+                if turn.runtime_session_id != session.runtime_session_id:
+                    raise RuntimeError("runtime_turn_session_mismatch")
+                if turn.turn_status in _TERMINAL_TURN_STATUSES:
+                    raise RuntimeError("runtime_turn_not_current")
+                # Read-only inspection above proved the thread exists and is consistent;
+                # the existing current-turn validator cannot create or repair it here.
+                self._validate_current_turn(conn, session=session, turn=turn)
+
+            active_mode = (session.active_mode or "").strip().lower().replace("-", "_")
+            if session.status in {"closing", "closed"}:
+                state, reason = "not_present", "session_not_present"
+            elif request.active_task_mode:
+                state, reason = "driving_or_active_task", "active_task_mode"
+            elif active_mode in {"driving", "active_task", "driving_or_active_task"}:
+                state, reason = "driving_or_active_task", "session_active_task_mode"
+            elif session.status == "paused":
+                state, reason = "low_attention", "session_paused"
+            elif session.attention_state == "paused":
+                state, reason = "low_attention", "attention_paused"
+            elif (
+                thread.state == "active"
+                and thread.active_runtime_session_id == session.runtime_session_id
+            ):
+                state, reason = "active_conversation", "thread_active"
+            elif session.status == "idle":
+                state, reason = "idle", "session_idle"
+            else:
+                state, reason = "available", "session_available"
+
+            previous_state = None
+            events = conn.execute(
+                """
+                SELECT event_payload_json FROM conversation_runtime_events
+                WHERE runtime_session_id = ? AND event_type = 'presence_evaluated'
+                ORDER BY id DESC;
+                """,
+                (session.runtime_session_id,),
+            )
+            for event in events:
+                try:
+                    previous = RuntimePresenceResult.model_validate_json(
+                        event["event_payload_json"],
+                    )
+                except ValidationError:
+                    continue
+                previous_state = previous.presence_state
+                break
+
+            reasons = [reason]
+            if request.proactive_output_suppressed:
+                reasons.append("proactive_suppression_requested")
+            result = RuntimePresenceResult(
+                presence_state=state,
+                previous_presence_state=previous_state,
+                state_changed=state != previous_state,
+                proactive_output_suppressed=request.proactive_output_suppressed or state in {
+                    "not_present", "idle", "low_attention", "driving_or_active_task",
+                },
+                required_help_allowed=state != "not_present",
+                reason_codes=reasons,
+            )
+            response = RuntimePresenceEvaluateResponse(
+                request_id=request.request_id,
+                owner_id=request.owner_id,
+                conversation_id=request.conversation_id,
+                surface=request.surface,
+                runtime_session_id=request.runtime_session_id,
+                runtime_turn_id=request.runtime_turn_id,
+                result=result,
+            )
+            self._record_event(
+                conn,
+                runtime_session_id=session.runtime_session_id,
+                runtime_turn_id=request.runtime_turn_id,
+                event_type="presence_evaluated",
+                event_payload_json=result.model_dump(mode="json"),
+            )
+            return response
 
     def select_continuation(
         self,
@@ -2038,6 +2151,12 @@ def select_runtime_continuation(
     request: ContinuationSelectionRequest,
 ) -> ContinuationSelectionResponse:
     return runtime_state_repository().select_continuation(request)
+
+
+def evaluate_runtime_presence(
+    request: RuntimePresenceEvaluateRequest,
+) -> RuntimePresenceEvaluateResponse:
+    return runtime_state_repository().evaluate_presence(request)
 
 
 def reserve_runtime_retirement(

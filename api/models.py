@@ -136,6 +136,7 @@ RuntimeEventType = Literal[
     "persona_containment_evaluated",
     "restraint_evaluated",
     "situated_presence_evaluated",
+    "presence_evaluated",
     "memory_hygiene_evaluated",
     "privacy_context_evaluated",
     "world_state_verification_evaluated",
@@ -150,6 +151,96 @@ RuntimeEventType = Literal[
     "evidence_next_step_selected",
 ]
 RuntimeThreadState = Literal["idle", "active", "contended", "unavailable"]
+
+RuntimePresenceState = Literal[
+    "not_present",
+    "available",
+    "active_conversation",
+    "ambient_listening",
+    "idle",
+    "returning_after_gap",
+    "low_attention",
+    "driving_or_active_task",
+    "do_not_intrude",
+]
+RuntimePresenceReason = Literal[
+    "session_not_present",
+    "active_task_mode",
+    "session_active_task_mode",
+    "session_paused",
+    "attention_paused",
+    "thread_active",
+    "session_idle",
+    "session_available",
+    "proactive_suppression_requested",
+]
+
+
+class RuntimePresenceEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
+    active_task_mode: bool = False
+    proactive_output_suppressed: bool = False
+
+
+class RuntimePresenceResult(BaseModel):
+    """Suppression-only control facts; never permission for proactive output or actions."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    presence_state: RuntimePresenceState
+    previous_presence_state: RuntimePresenceState | None
+    state_changed: bool
+    proactive_output_suppressed: bool
+    required_help_allowed: bool
+    reason_codes: list[RuntimePresenceReason] = Field(min_length=1, max_length=2)
+    policy_version: Literal["runtime-presence.v1"] = "runtime-presence.v1"
+
+    @model_validator(mode="after")
+    def validate_coherence(self) -> "RuntimePresenceResult":
+        decision_states = {
+            "session_not_present": "not_present",
+            "active_task_mode": "driving_or_active_task",
+            "session_active_task_mode": "driving_or_active_task",
+            "session_paused": "low_attention",
+            "attention_paused": "low_attention",
+            "thread_active": "active_conversation",
+            "session_idle": "idle",
+            "session_available": "available",
+        }
+        if decision_states.get(self.reason_codes[0]) != self.presence_state or (
+            len(self.reason_codes) == 2
+            and self.reason_codes[1] != "proactive_suppression_requested"
+        ):
+            raise ValueError("presence_reason_codes_inconsistent")
+        suppressed = self.presence_state in {
+            "not_present", "idle", "low_attention", "driving_or_active_task",
+        } or "proactive_suppression_requested" in self.reason_codes
+        if self.proactive_output_suppressed != suppressed:
+            raise ValueError("presence_suppression_inconsistent")
+        if self.required_help_allowed != (self.presence_state != "not_present"):
+            raise ValueError("presence_required_help_inconsistent")
+        if self.state_changed != (self.presence_state != self.previous_presence_state):
+            raise ValueError("presence_transition_inconsistent")
+        return self
+
+
+class RuntimePresenceEvaluateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
+    result: RuntimePresenceResult
 
 
 class RuntimeSession(BaseModel):
