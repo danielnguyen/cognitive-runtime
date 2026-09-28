@@ -4047,6 +4047,11 @@ def _presence_scope(tmp_path, *, active=False):
     ("active_task_mode", "true"), ("active_task_mode", 1), ("active_task_mode", None),
     ("proactive_output_suppressed", "false"), ("proactive_output_suppressed", 0),
     ("proactive_output_suppressed", None),
+    ("explicit_proactive_opt_out", "true"), ("explicit_proactive_opt_out", 1),
+    ("explicit_proactive_opt_out", None), ("explicit_proactive_opt_out", 0),
+    ("explicit_proactive_opt_out", "false"), ("explicit_proactive_opt_out", {}),
+    ("preferences", {}), ("quiet_hours", "night"), ("surface_allowlist", ["web"]),
+    ("do_not_intrude", True), ("preference_state", "opt_out"),
     ("request_id", ""), ("request_id", 1), ("request_id", "x" * 121),
     ("owner_id", ""), ("owner_id", []), ("owner_id", "x" * 121),
     ("conversation_id", ""), ("conversation_id", False), ("conversation_id", "x" * 121),
@@ -4091,6 +4096,7 @@ def test_presence_taxonomy_and_request_defaults():
         request_id="request", owner_id="owner", conversation_id="thread",
         surface="web", runtime_session_id="session",
     )
+    assert request.explicit_proactive_opt_out is False
     assert request.active_task_mode is False
     assert request.proactive_output_suppressed is False
     assert request.runtime_turn_id is None
@@ -4164,8 +4170,9 @@ def test_presence_response_is_strict(tmp_path, changes):
         ("active", "do_not_intrude", None, False, False, "available", "session_available"),
     ],
 )
+@pytest.mark.parametrize("opt_out", [None, False, True], ids=["omitted", "false", "true"])
 def test_presence_state_precedence_and_bounded_event(
-    tmp_path, status, mode, attention, active, active_task, expected, reason,
+    tmp_path, status, mode, attention, active, active_task, expected, reason, opt_out,
 ):
     db_path, repo, request = _presence_scope(tmp_path, active=active)
     with sqlite3.connect(db_path) as conn:
@@ -4174,15 +4181,18 @@ def test_presence_state_precedence_and_bounded_event(
                SET status = ?, active_mode = ?, attention_state = ?""",
             (status, mode, attention),
         )
+    payload = {**request.model_dump(exclude={"explicit_proactive_opt_out"}),
+               "active_task_mode": active_task}
+    if opt_out is not None:
+        payload["explicit_proactive_opt_out"] = opt_out
+    if opt_out is True and expected != "not_present":
+        expected, reason = "do_not_intrude", "explicit_proactive_opt_out"
     before = _runtime_rows(db_path)
-    response = TestClient(app).post(
-        "/v1/runtime/presence/evaluate",
-        json={**request.model_dump(), "active_task_mode": active_task},
-    )
+    response = TestClient(app).post("/v1/runtime/presence/evaluate", json=payload)
     assert response.status_code == 200, response.text
     body = RuntimePresenceEvaluateResponse.model_validate(response.json())
     assert body.model_dump(exclude={"result"}) == request.model_dump(
-        exclude={"active_task_mode", "proactive_output_suppressed"},
+        exclude={"active_task_mode", "proactive_output_suppressed", "explicit_proactive_opt_out"},
     )
     result = body.result
     assert result.presence_state == expected
@@ -4191,7 +4201,7 @@ def test_presence_state_precedence_and_bounded_event(
     assert result.state_changed is True
     assert result.required_help_allowed is (expected != "not_present")
     assert result.proactive_output_suppressed is (expected in {
-        "not_present", "idle", "low_attention", "driving_or_active_task",
+        "not_present", "do_not_intrude", "idle", "low_attention", "driving_or_active_task",
     })
     after = _runtime_rows(db_path)
     assert after[:3] == before[:3]
@@ -4468,3 +4478,71 @@ def test_presence_unknown_session_status_fails_conservatively(tmp_path):
     assert response.status_code == 503
     assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
     assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("suppressed", [False, True])
+def test_presence_explicit_opt_out_preserves_help_and_secondary_reason(tmp_path, suppressed):
+    _, repo, request = _presence_scope(tmp_path, active=True)
+    result = repo.evaluate_presence(request.model_copy(update={
+        "explicit_proactive_opt_out": True, "proactive_output_suppressed": suppressed,
+    })).result
+    assert result.presence_state == "do_not_intrude"
+    assert result.proactive_output_suppressed is True
+    assert result.required_help_allowed is True
+    assert result.reason_codes == ["explicit_proactive_opt_out"] + (
+        ["proactive_suppression_requested"] if suppressed else []
+    )
+    assert len(result.reason_codes) == len(set(result.reason_codes))
+    assert result.policy_version == "runtime-presence.v1"
+
+
+@pytest.mark.parametrize("changes", [
+    {"proactive_output_suppressed": False}, {"required_help_allowed": False},
+    {"reason_codes": ["session_available"]},
+    {"reason_codes": ["explicit_proactive_opt_out", "explicit_proactive_opt_out"]},
+    {"presence_state": "available"},
+])
+def test_presence_explicit_opt_out_result_rejects_incoherent_controls(changes):
+    valid = dict(
+        presence_state="do_not_intrude", previous_presence_state=None, state_changed=True,
+        proactive_output_suppressed=True, required_help_allowed=True,
+        reason_codes=["explicit_proactive_opt_out"], policy_version="runtime-presence.v1",
+    )
+    assert RuntimePresenceResult.model_validate(valid).required_help_allowed is True
+    with pytest.raises(ValidationError):
+        RuntimePresenceResult.model_validate({**valid, **changes})
+
+
+def test_presence_explicit_opt_out_transition_chain_survives_recreation(tmp_path):
+    db_path, _, request = _presence_scope(tmp_path)
+    before = _runtime_rows(db_path)
+    sequence = [
+        (False, "available", None, True),
+        (True, "do_not_intrude", "available", True),
+        (True, "do_not_intrude", "do_not_intrude", False),
+        (False, "available", "do_not_intrude", True),
+    ]
+    results = []
+    for opt_out, state, previous, changed in sequence:
+        result = RuntimeStateRepository(db_path).evaluate_presence(request.model_copy(update={
+            "explicit_proactive_opt_out": opt_out,
+        })).result
+        assert result.presence_state == state
+        assert result.previous_presence_state == previous
+        assert result.state_changed is changed
+        results.append(result.model_dump())
+    after = _runtime_rows(db_path)
+    assert after[:3] == before[:3]
+    assert len(after[3]) == len(before[3]) + len(sequence)
+    events = RuntimeStateRepository(db_path).list_events_for_tests(request.runtime_session_id)
+    assert [
+        event.event_payload_json for event in events if event.event_type == "presence_evaluated"
+    ] == results
+    for result in results:
+        assert set(result) == {
+            "presence_state", "previous_presence_state", "state_changed",
+            "proactive_output_suppressed", "required_help_allowed",
+            "reason_codes", "policy_version",
+        }
+        assert result["required_help_allowed"] is True
+        assert result["policy_version"] == "runtime-presence.v1"

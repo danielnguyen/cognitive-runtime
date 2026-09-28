@@ -165,6 +165,7 @@ RuntimePresenceState = Literal[
 ]
 RuntimePresenceReason = Literal[
     "session_not_present",
+    "explicit_proactive_opt_out",
     "active_task_mode",
     "session_active_task_mode",
     "session_paused",
@@ -187,6 +188,8 @@ class RuntimePresenceEvaluateRequest(BaseModel):
     runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
     active_task_mode: bool = False
     proactive_output_suppressed: bool = False
+    # False means no opt-out was projected; it does not grant proactive permission.
+    explicit_proactive_opt_out: bool = False
 
 
 class RuntimePresenceResult(BaseModel):
@@ -206,6 +209,7 @@ class RuntimePresenceResult(BaseModel):
     def validate_coherence(self) -> "RuntimePresenceResult":
         decision_states = {
             "session_not_present": "not_present",
+            "explicit_proactive_opt_out": "do_not_intrude",
             "active_task_mode": "driving_or_active_task",
             "session_active_task_mode": "driving_or_active_task",
             "session_paused": "low_attention",
@@ -220,7 +224,7 @@ class RuntimePresenceResult(BaseModel):
         ):
             raise ValueError("presence_reason_codes_inconsistent")
         suppressed = self.presence_state in {
-            "not_present", "idle", "low_attention", "driving_or_active_task",
+            "not_present", "do_not_intrude", "idle", "low_attention", "driving_or_active_task",
         } or "proactive_suppression_requested" in self.reason_codes
         if self.proactive_output_suppressed != suppressed:
             raise ValueError("presence_suppression_inconsistent")
