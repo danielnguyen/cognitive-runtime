@@ -24,6 +24,15 @@ from models import (
     RuntimePresenceEvaluateResponse,
     RuntimePresenceResult,
     RuntimePresenceState,
+    RuntimeTimingBudgetClass,
+    RuntimeTimingContinuationState,
+    RuntimeTimingDegradationMode,
+    RuntimeTimingDependencyState,
+    RuntimeTimingEvaluateRequest,
+    RuntimeTimingEvaluateResponse,
+    RuntimeTimingPolicy,
+    RuntimeTimingRequestedDetail,
+    RuntimeTimingResult,
 )
 from pydantic import TypeAdapter, ValidationError
 from services.runtime_state import RuntimeStateRepository, clear_states_for_tests
@@ -4546,3 +4555,622 @@ def test_presence_explicit_opt_out_transition_chain_survives_recreation(tmp_path
         }
         assert result["required_help_allowed"] is True
         assert result["policy_version"] == "runtime-presence.v1"
+
+
+def _timing_scope(
+    tmp_path, *, intent="information_request", restraint="answer_normally", surface="web",
+):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    scope = dict(request_id="timing-test", owner_id="owner", conversation_id="thread",
+                 surface=surface)
+    session, turn, _ = repo.start_turn(**scope, intent_class=intent, restraint_policy=restraint)
+    request = RuntimeTimingEvaluateRequest(
+        **scope, runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id,
+        spoken_output=False, active_task_mode=False, requested_detail="unspecified",
+        latency_budget_class="ordinary_text", dependency_state="ready",
+    )
+    return db_path, repo, request
+
+
+def _timing_presence(repo, request, state):
+    if state is None:
+        return
+    if state == "low_attention":
+        with repo._connect() as conn:
+            conn.execute("UPDATE conversation_runtime_sessions SET attention_state = 'paused'")
+    result = repo.evaluate_presence(RuntimePresenceEvaluateRequest(
+        **{field: getattr(request, field) for field in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )}, active_task_mode=state == "driving_or_active_task",
+        explicit_proactive_opt_out=state == "do_not_intrude",
+    )).result
+    assert result.presence_state == state
+
+
+_TIMING_STATE_EXPANSION = {
+    "answer_now": ("none", True),
+    "acknowledge_then_answer": ("none", True),
+    "ask_clarifying_question": ("clarification_required", False),
+    "pause_or_wait": ("waiting", False),
+    "defer_expansion": ("deferred_expansion", False),
+    "yield_to_user": ("yielded_to_user", False),
+    "resume_previous_thread": ("resuming_previous_thread", True),
+    "close_turn": ("closed", False),
+}
+
+
+@pytest.mark.parametrize("dependency", ["ready", "degraded"])
+@pytest.mark.parametrize("intent,restraint,facts,presence,policy,reason", [
+    ("information_request", "answer_normally", {}, None, "answer_now", "ordinary_ready"),
+    ("action_command", "answer_normally", {"spoken_output": True}, None,
+     "acknowledge_then_answer", "spoken_action_acknowledgment"),
+    ("low_confidence_unclear", "answer_normally", {}, None,
+     "ask_clarifying_question", "unclear_intent_clarification"),
+    ("information_request", "ask_clarifying_question", {}, None,
+     "ask_clarifying_question", "restraint_clarification"),
+    ("information_request", "defer_expansion", {}, None,
+     "defer_expansion", "restraint_defer_expansion"),
+    ("interruption", "answer_normally", {}, None, "yield_to_user", "intent_interruption"),
+    ("information_request", "answer_normally", {"continuation_timing_policy": "pause_or_wait"},
+     None, "pause_or_wait", "continuation_pause_or_wait"),
+    ("information_request", "answer_normally",
+     {"continuation_timing_policy": "resume_previous_thread"}, None,
+     "resume_previous_thread", "continuation_resume"),
+    ("information_request", "answer_normally", {"continuation_timing_policy": "close_turn"},
+     None, "close_turn", "continuation_close_turn"),
+    ("interruption", "ask_clarifying_question",
+     {"dependency_state": "blocking", "continuation_timing_policy": "resume_previous_thread",
+      "spoken_output": True}, "low_attention", "close_turn", "dependency_blocking"),
+    ("action_command", "defer_expansion", {"dependency_state": "blocking",
+     "spoken_output": True}, "driving_or_active_task", "close_turn", "dependency_blocking"),
+    ("low_confidence_unclear", "ask_clarifying_question", {"dependency_state": "blocking"},
+     None, "close_turn", "dependency_blocking"),
+    ("action_command", "ask_clarifying_question", {"continuation_timing_policy": "close_turn",
+     "spoken_output": True}, "low_attention", "close_turn", "continuation_close_turn"),
+    ("interruption", "ask_clarifying_question",
+     {"continuation_timing_policy": "pause_or_wait", "spoken_output": True},
+     "low_attention", "pause_or_wait", "continuation_pause_or_wait"),
+    ("interruption", "defer_expansion", {"continuation_timing_policy": "ask_clarifying_question"},
+     None, "ask_clarifying_question", "continuation_clarification"),
+    ("interruption", "ask_clarifying_question",
+     {"continuation_timing_policy": "resume_previous_thread", "spoken_output": True},
+     "driving_or_active_task", "resume_previous_thread", "continuation_resume"),
+    ("interruption", "ask_clarifying_question", {"spoken_output": True}, "low_attention",
+     "yield_to_user", "intent_interruption"),
+    ("interruption", "defer_expansion", {"spoken_output": True}, None,
+     "yield_to_user", "intent_interruption"),
+    ("action_command", "ask_clarifying_question", {"spoken_output": True}, "low_attention",
+     "ask_clarifying_question", "restraint_clarification"),
+    ("low_confidence_unclear", "defer_expansion", {"spoken_output": True}, None,
+     "ask_clarifying_question", "unclear_intent_clarification"),
+    ("action_command", "defer_expansion", {"spoken_output": True}, "low_attention",
+     "acknowledge_then_answer", "spoken_action_acknowledgment"),
+    ("information_request", "defer_expansion", {"requested_detail": "expanded"}, "low_attention",
+     "defer_expansion", "restraint_defer_expansion"),
+    ("information_request", "answer_normally", {}, "low_attention",
+     "defer_expansion", "presence_low_attention"),
+    ("information_request", "answer_normally", {}, "driving_or_active_task",
+     "defer_expansion", "presence_active_task"),
+    ("information_request", "answer_normally", {"requested_detail": "expanded"}, "low_attention",
+     "answer_now", "ordinary_ready"),
+    ("information_request", "answer_normally", {"requested_detail": "expanded"},
+     "driving_or_active_task", "answer_now", "ordinary_ready"),
+    ("information_request", "answer_normally", {}, "do_not_intrude",
+     "answer_now", "ordinary_ready"),
+    ("information_request", "answer_normally", {"active_task_mode": True}, None,
+     "answer_now", "ordinary_ready"),
+    ("information_request", "answer_normally", {"continuation_timing_policy": "answer_now"},
+     None, "answer_now", "continuation_answer_now"),
+    ("interruption", "defer_expansion", {"continuation_timing_policy": "answer_now"}, None,
+     "yield_to_user", "intent_interruption"),
+    ("action_command", "ask_clarifying_question", {"spoken_output": True,
+     "continuation_timing_policy": "answer_now"}, None,
+     "ask_clarifying_question", "restraint_clarification"),
+    ("action_command", "answer_normally", {"spoken_output": True,
+     "continuation_timing_policy": "answer_now"}, None,
+     "acknowledge_then_answer", "spoken_action_acknowledgment"),
+    ("information_request", "defer_expansion", {"continuation_timing_policy": "answer_now"}, None,
+     "defer_expansion", "restraint_defer_expansion"),
+    ("information_request", "answer_normally", {"continuation_timing_policy": "answer_now"},
+     "driving_or_active_task", "defer_expansion", "presence_active_task"),
+])
+def test_timing_policies_and_precedence_persist_only_timing(
+    tmp_path, dependency, intent, restraint, facts, presence, policy, reason,
+):
+    db_path, repo, request = _timing_scope(tmp_path, intent=intent, restraint=restraint)
+    _timing_presence(repo, request, presence)
+    payload = {**request.model_dump(), "dependency_state": dependency, **facts}
+    before = _runtime_rows(db_path)
+    old_turn = repo.turn_by_id(request.runtime_turn_id).model_dump()
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json=payload)
+    assert response.status_code == 200, response.text
+    result = RuntimeTimingEvaluateResponse.model_validate(response.json())
+    assert result.model_dump(exclude={"result"}) == {
+        field: payload[field] for field in (
+            "request_id", "owner_id", "conversation_id", "surface",
+            "runtime_session_id", "runtime_turn_id",
+        )
+    }
+    timing = result.result
+    assert timing.timing_policy == policy
+    state, expansion = _TIMING_STATE_EXPANSION[policy]
+    assert (timing.continuation_state, timing.expansion_allowed) == (state, expansion)
+    assert timing.reason_codes == [reason] + (
+        ["dependency_degraded"] if payload["dependency_state"] == "degraded" else []
+    )
+    assert timing.degradation_mode == {
+        "ready": "none", "degraded": "bounded", "blocking": "fail_closed",
+    }[payload["dependency_state"]]
+    assert timing.policy_version == "runtime-timing.v1"
+    after = _runtime_rows(db_path)
+    assert after[:2] == before[:2]  # No session activity, thread revision, or ownership writes.
+    turn = repo.turn_by_id(request.runtime_turn_id).model_dump()
+    assert turn == {**old_turn, "timing_policy": policy, "continuation_state": state,
+                    "updated_at": turn["updated_at"]}
+    assert datetime.fromisoformat(turn["updated_at"]) >= datetime.fromisoformat(
+        old_turn["updated_at"],
+    )
+    events = repo.list_events_for_tests(request.runtime_session_id)
+    assert len(after[3]) == len(before[3]) + 1
+    assert events[-1].event_type == "timing_evaluated"
+    assert events[-1].runtime_session_id == request.runtime_session_id
+    assert events[-1].runtime_turn_id == request.runtime_turn_id
+    assert events[-1].event_payload_json == {
+        **timing.model_dump(exclude={"prompt_overlay", "trace_ref"}),
+        **{field: payload[field] for field in (
+            "request_id", "spoken_output", "active_task_mode", "requested_detail",
+            "dependency_state", "continuation_timing_policy",
+        )},
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("extra", "private"), ("intent_class", "action_command"),
+    ("restraint_policy", "answer_normally"), ("presence_state", "available"),
+    ("timing_policy", "answer_now"), ("current_user_text", "private"),
+    ("spoken_output", "true"), ("spoken_output", 1), ("spoken_output", None),
+    ("active_task_mode", "false"), ("active_task_mode", 0), ("active_task_mode", None),
+    ("requested_detail", "unknown"), ("requested_detail", None),
+    ("latency_budget_class", "unknown"), ("latency_budget_class", 300),
+    ("dependency_state", "unknown"), ("dependency_state", False),
+    ("continuation_timing_policy", "unknown"),
+    ("continuation_timing_policy", "acknowledge_then_answer"),
+    ("continuation_timing_policy", "defer_expansion"),
+    ("continuation_timing_policy", "yield_to_user"),
+    ("continuation_timing_policy", True),
+    ("request_id", ""), ("request_id", "   "), ("request_id", 1), ("request_id", "x" * 121),
+    ("owner_id", ""), ("owner_id", []), ("conversation_id", ""), ("conversation_id", False),
+    ("surface", ""), ("surface", "x" * 65), ("runtime_session_id", ""),
+    ("runtime_session_id", {}), ("runtime_turn_id", None), ("runtime_turn_id", "x" * 121),
+])
+def test_timing_request_rejects_malformed_values_before_service(
+    tmp_path, monkeypatch, field, value,
+):
+    db_path, _, request = _timing_scope(tmp_path)
+    before = _runtime_rows(db_path)
+
+    def forbidden(*args):
+        pytest.fail("invalid request reached runtime evaluation")
+
+    monkeypatch.setattr(main_module, "evaluate_runtime_timing", forbidden)
+    payload = {**request.model_dump(), field: value}
+    with pytest.raises(ValidationError):
+        RuntimeTimingEvaluateRequest.model_validate(payload)
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json=payload)
+    assert response.status_code == 422
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("field", [
+    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id", "runtime_turn_id",
+    "spoken_output", "active_task_mode", "requested_detail", "latency_budget_class",
+    "dependency_state",
+])
+def test_timing_request_requires_scope_and_projected_facts(tmp_path, field):
+    db_path, _, request = _timing_scope(tmp_path)
+    payload = request.model_dump()
+    del payload[field]
+    before = _runtime_rows(db_path)
+    assert TestClient(app).post("/v1/runtime/timing/evaluate", json=payload).status_code == 422
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("budget,ms", [
+    ("ordinary_text", 300), ("evidence_governed", 350), ("history_followup", 160),
+    ("safe_action_preview", 300), ("provider_fallback", 350), ("voice_acknowledgment", 250),
+    ("voice_provider_dispatch", 300),
+])
+def test_timing_budget_is_exact_metadata_and_does_not_choose_policy(tmp_path, budget, ms):
+    _, repo, request = _timing_scope(tmp_path, intent="action_command", restraint="defer_expansion")
+    result = repo.evaluate_timing(RuntimeTimingEvaluateRequest.model_validate({
+        **request.model_dump(), "latency_budget_class": budget, "spoken_output": True,
+    })).result
+    assert result.latency_budget_ms == ms
+    assert result.latency_budget_class == budget
+    assert result.timing_policy == "acknowledge_then_answer"
+
+
+@pytest.mark.parametrize("surface", ["car", "alexa", "telegram", "web", "custom-surface"])
+@pytest.mark.parametrize("spoken", [False, True])
+def test_timing_spoken_fact_has_no_surface_name_inference(tmp_path, surface, spoken):
+    _, repo, request = _timing_scope(tmp_path, intent="action_command", surface=surface)
+    result = repo.evaluate_timing(request.model_copy(update={"spoken_output": spoken})).result
+    assert result.timing_policy == ("acknowledge_then_answer" if spoken else "answer_now")
+    if spoken:
+        assert "does not authorize, confirm, or execute any action" in result.prompt_overlay
+        assert not any("action" in field or "confirm" in field for field in result.model_dump())
+
+
+@pytest.mark.parametrize("field,value,status,error", [
+    ("owner_id", "other", 400, "runtime_session_mismatch"),
+    ("conversation_id", "other", 400, "runtime_session_mismatch"),
+    ("surface", "other", 400, "runtime_session_mismatch"),
+    ("runtime_session_id", "missing", 404, "runtime_session_not_found"),
+    ("runtime_turn_id", "missing", 404, "runtime_turn_not_found"),
+])
+def test_timing_scope_mismatch_rejects_without_writing(tmp_path, field, value, status, error):
+    db_path, _, request = _timing_scope(tmp_path)
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json={
+        **request.model_dump(), field: value,
+    })
+    assert response.status_code == status
+    assert response.json() == {"detail": error}
+    assert _runtime_rows(db_path) == before
+
+
+def test_timing_turn_session_association_is_exact(tmp_path):
+    db_path, repo, request = _timing_scope(tmp_path)
+    other, _, _ = repo.start_turn(request_id="other", owner_id="owner",
+                                  conversation_id="other-thread", surface="web")
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json={
+        **request.model_dump(), "runtime_session_id": other.runtime_session_id,
+        "conversation_id": other.conversation_id,
+    })
+    assert response.status_code == 400
+    assert response.json() == {"detail": "runtime_turn_session_mismatch"}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("terminal", ["completed", "abandoned"])
+def test_timing_terminal_turn_rejected_after_new_admission(tmp_path, terminal):
+    db_path, repo, request = _timing_scope(tmp_path)
+    repo.complete_turn(request_id="complete", runtime_session_id=request.runtime_session_id,
+                       runtime_turn_id=request.runtime_turn_id, turn_status=terminal)
+    repo.start_turn(request_id="new", owner_id=request.owner_id,
+                    conversation_id=request.conversation_id, surface=request.surface,
+                    intent_class="information_request", restraint_policy="answer_normally")
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json=request.model_dump())
+    assert response.status_code == 409
+    assert response.json() == {"detail": "runtime_turn_not_current"}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("defect", [
+    "missing", "contended", "unavailable", "wrong_turn", "wrong_session", "wrong_surface",
+    "idle_with_active_turn", "extra_turn", "invalid_timestamp",
+])
+def test_timing_invalid_thread_does_not_create_or_repair_state(tmp_path, defect):
+    db_path, _, request = _timing_scope(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        if defect == "missing":
+            conn.execute("DELETE FROM conversation_runtime_threads")
+        elif defect in {"contended", "unavailable"}:
+            conn.execute("UPDATE conversation_runtime_threads SET state = ?", (defect,))
+        elif defect in {"wrong_turn", "wrong_session", "wrong_surface", "invalid_timestamp"}:
+            field = {
+                "wrong_turn": "active_runtime_turn_id",
+                "wrong_session": "active_runtime_session_id",
+                "wrong_surface": "active_surface", "invalid_timestamp": "last_activity_at",
+            }[defect]
+            conn.execute(f"UPDATE conversation_runtime_threads SET {field} = 'invalid'")
+        elif defect == "idle_with_active_turn":
+            conn.execute("UPDATE conversation_runtime_threads SET state = 'idle'")
+        else:
+            conn.execute(
+                """INSERT INTO conversation_runtime_turns
+                   (runtime_turn_id, runtime_session_id, turn_status, created_at, updated_at)
+                   VALUES ('extra', ?, 'received', 'now', 'now')""",
+                (request.runtime_session_id,),
+            )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json=request.model_dump())
+    assert response.status_code == (409 if defect == "contended" else 503)
+    assert response.json() == {"detail": (
+        "runtime_thread_contended" if defect == "contended" else "runtime_thread_unavailable"
+    )}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("intent_class", None), ("restraint_policy", None),
+    ("intent_class", "UNKNOWN-PRIVATE-INTENT"), ("restraint_policy", "UNKNOWN-PRIVATE-RESTRAINT"),
+    ("intent_class", ""), ("restraint_policy", ""),
+    ("intent_class", "x" * 65), ("restraint_policy", "x" * 65),
+])
+@pytest.mark.parametrize("dependency", ["ready", "blocking"])
+def test_timing_missing_or_unknown_upstream_fails_without_output_or_write(
+    tmp_path, field, value, dependency,
+):
+    db_path, _, request = _timing_scope(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(f"UPDATE conversation_runtime_turns SET {field} = ?", (value,))
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json={
+        **request.model_dump(), "dependency_state": dependency,
+    })
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_timing_inputs_invalid"}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("intent", [
+    "information_request", "confirmation_response", "correction", "clarification_request",
+    "continuation", "topic_shift", "venting_signal", "context_update", "memory_candidate",
+    "surface_action", "support_explanation", "acquisition_checked", "acquisition_coverage",
+    "acquisition_gaps", "new_verification_request", "ambiguous_history_followup",
+    "not_history_followup",
+])
+def test_timing_accepts_bounded_persisted_intents_including_history(tmp_path, intent):
+    _, repo, request = _timing_scope(tmp_path, intent=intent)
+    assert repo.evaluate_timing(request).result.timing_policy == "answer_now"
+
+
+@pytest.mark.parametrize("restraint", [
+    "short_answer", "do_not_retrieve", "do_not_personalize", "suppress_proactive_output",
+])
+def test_timing_non_timing_restraint_policies_are_not_reclassified(tmp_path, restraint):
+    _, repo, request = _timing_scope(tmp_path, restraint=restraint)
+    assert repo.evaluate_timing(request).result.timing_policy == "answer_now"
+    assert repo.turn_by_id(request.runtime_turn_id).restraint_policy == restraint
+
+
+def test_timing_uses_latest_presence_event_only_for_exact_turn(tmp_path):
+    _, repo, request = _timing_scope(tmp_path)
+    _timing_presence(repo, request, "low_attention")
+    _timing_presence(repo, request, "driving_or_active_task")
+    result = repo.evaluate_timing(request).result
+    assert result.reason_codes == ["presence_active_task"]
+    _timing_presence(repo, request, "do_not_intrude")
+    assert repo.evaluate_timing(request).result.timing_policy == "answer_now"
+
+
+def test_timing_does_not_consume_presence_from_previous_turn(tmp_path):
+    _, repo, request = _timing_scope(tmp_path)
+    _timing_presence(repo, request, "low_attention")
+    repo.complete_turn(request_id="complete", runtime_session_id=request.runtime_session_id,
+                       runtime_turn_id=request.runtime_turn_id, turn_status="completed")
+    _, turn, _ = repo.start_turn(
+        request_id="next", owner_id=request.owner_id, conversation_id=request.conversation_id,
+        surface=request.surface, intent_class="information_request",
+        restraint_policy="answer_normally",
+    )
+    # Persisted attention and the earlier turn's presence still say low attention.
+    # Timing must consume only a validated presence result for this admitted turn.
+    result = repo.evaluate_timing(request.model_copy(update={
+        "request_id": "next", "runtime_turn_id": turn.runtime_turn_id, "active_task_mode": True,
+    })).result
+    assert result.timing_policy == "answer_now"
+    assert result.reason_codes == ["ordinary_ready"]
+
+
+@pytest.mark.parametrize("payload", [
+    "not-json", "null", "[]", '{}', '{"presence_state":"low_attention"}',
+    json.dumps(dict(presence_state="low_attention", previous_presence_state=None,
+                    state_changed=True,
+                    proactive_output_suppressed=False, required_help_allowed=True,
+                    reason_codes=["attention_paused"], policy_version="runtime-presence.v1")),
+    json.dumps(dict(presence_state="available", previous_presence_state=None, state_changed="true",
+                    proactive_output_suppressed=False, required_help_allowed=True,
+                    reason_codes=["session_available"], policy_version="runtime-presence.v1")),
+    json.dumps(dict(presence_state="ambient_listening", previous_presence_state=None,
+                    state_changed=True,
+                    proactive_output_suppressed=False, required_help_allowed=True,
+                    reason_codes=["session_available"], policy_version="runtime-presence.v1")),
+    json.dumps(dict(presence_state="returning_after_gap", previous_presence_state=None,
+                    state_changed=True,
+                    proactive_output_suppressed=False, required_help_allowed=True,
+                    reason_codes=["session_available"], policy_version="runtime-presence.v1")),
+])
+def test_timing_malformed_latest_presence_fails_instead_of_using_older_result(tmp_path, payload):
+    db_path, repo, request = _timing_scope(tmp_path)
+    _timing_presence(repo, request, "low_attention")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO conversation_runtime_events
+               (event_id, runtime_session_id, runtime_turn_id, event_type,
+                event_payload_json, created_at)
+               VALUES ('malformed-latest', ?, ?, 'presence_evaluated', ?, 'now')""",
+            (request.runtime_session_id, request.runtime_turn_id, payload),
+        )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json=request.model_dump())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_timing_inputs_invalid"}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("failure", ["connect", "before_insert", "after_insert"])
+def test_timing_event_failure_rolls_back_existing_turn_policy_and_state(
+    tmp_path, monkeypatch, failure,
+):
+    db_path, repo, request = _timing_scope(tmp_path)
+    repo.update_turn(request_id="previous-policy", runtime_session_id=request.runtime_session_id,
+                     runtime_turn_id=request.runtime_turn_id, timing_policy="pause_or_wait",
+                     continuation_state="waiting", turn_status="received")
+    before = _runtime_rows(db_path)
+    original = RuntimeStateRepository._record_event
+
+    def fail(self, conn=None, **kwargs):
+        if failure != "connect":
+            updated = self._turn_by_id(conn, request.runtime_turn_id)
+            assert updated.timing_policy == "answer_now"
+            assert updated.continuation_state == "none"
+        if failure == "after_insert":
+            original(self, conn, **kwargs)
+        raise sqlite3.OperationalError("PRIVATE DATABASE AND RAW CONTENT DIAGNOSTIC")
+
+    monkeypatch.setattr(
+        RuntimeStateRepository, "_connect" if failure == "connect" else "_record_event", fail,
+    )
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json=request.model_dump())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _runtime_rows(db_path) == before
+
+
+def test_timing_decision_and_event_survive_reopen_without_new_schema(tmp_path):
+    db_path, repo, request = _timing_scope(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        schema = conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert tables == {
+            "conversation_runtime_sessions", "conversation_runtime_threads",
+            "conversation_runtime_turns", "conversation_runtime_events",
+            "conversation_runtime_retirement_reservations", "sqlite_sequence",
+        }
+    request = request.model_copy(update={"continuation_timing_policy": "resume_previous_thread"})
+    response = repo.evaluate_timing(request)
+    reopened = RuntimeStateRepository(db_path)
+    turn = reopened.turn_by_id(request.runtime_turn_id)
+    assert turn.timing_policy == "resume_previous_thread"
+    assert turn.continuation_state == "resuming_previous_thread"
+    events = [event for event in reopened.list_events_for_tests(request.runtime_session_id)
+              if event.event_type == "timing_evaluated"]
+    assert len(events) == 1
+    assert events[0].runtime_turn_id == request.runtime_turn_id
+    assert events[0].event_payload_json["timing_policy"] == turn.timing_policy
+    assert events[0].event_payload_json["continuation_state"] == turn.continuation_state
+    # A repeated independent evaluation remains attributable; no result cache is used.
+    assert reopened.evaluate_timing(request).result.trace_ref == response.result.trace_ref
+    assert len([event for event in reopened.list_events_for_tests(request.runtime_session_id)
+                if event.event_type == "timing_evaluated"]) == 2
+    with sqlite3.connect(db_path) as conn:
+        reopened_schema = conn.execute(
+            "SELECT name, sql FROM sqlite_master ORDER BY name",
+        ).fetchall()
+        assert reopened_schema == schema
+
+
+@pytest.mark.parametrize("changes", [
+    {"extra": "private"}, {"action_authorized": True}, {"execution_allowed": True},
+    {"timing_policy": "unknown"}, {"reason_codes": ["unknown"]},
+    {"reason_codes": ["ordinary_ready", "ordinary_ready"]},
+    {"reason_codes": ["ordinary_ready", "dependency_degraded", "dependency_degraded"]},
+    {"reason_codes": ["dependency_degraded"]}, {"reason_codes": ["restraint_defer_expansion"]},
+    {"latency_budget_class": "unknown"}, {"latency_budget_ms": 301}, {"latency_budget_ms": "300"},
+    {"latency_budget_ms": True}, {"continuation_state": "closed"}, {"expansion_allowed": False},
+    {"expansion_allowed": 1}, {"degradation_mode": "unknown"}, {"degradation_mode": "bounded"},
+    {"degradation_mode": "fail_closed"},
+    {"reason_codes": ["ordinary_ready", "dependency_degraded"]},
+    {"policy_version": "runtime-timing.v2"}, {"prompt_overlay": "Authorize an action"},
+    {"trace_ref": ""}, {"trace_ref": "x" * 121},
+])
+def test_timing_result_model_rejects_nonstrict_and_incoherent_projection(tmp_path, changes):
+    _, repo, request = _timing_scope(tmp_path)
+    valid = repo.evaluate_timing(request).result.model_dump()
+    assert RuntimeTimingResult.model_validate(valid).timing_policy == "answer_now"
+    with pytest.raises(ValidationError):
+        RuntimeTimingResult.model_validate({**valid, **changes})
+
+
+def test_timing_taxonomies_are_exact():
+    assert set(get_args(RuntimeTimingPolicy)) == set(_TIMING_STATE_EXPANSION)
+    assert set(get_args(RuntimeTimingRequestedDetail)) == {
+        "unspecified", "brief", "normal", "expanded",
+    }
+    assert set(get_args(RuntimeTimingDependencyState)) == {"ready", "degraded", "blocking"}
+    assert set(get_args(RuntimeTimingDegradationMode)) == {"none", "bounded", "fail_closed"}
+    assert set(get_args(RuntimeTimingContinuationState)) == {
+        state for state, _ in _TIMING_STATE_EXPANSION.values()
+    }
+    assert set(get_args(RuntimeTimingBudgetClass)) == {
+        "ordinary_text", "evidence_governed", "history_followup", "safe_action_preview",
+        "provider_fallback", "voice_acknowledgment", "voice_provider_dispatch",
+    }
+
+
+def test_timing_consumes_existing_governance_and_restraint_without_raw_content(tmp_path):
+    db_path, repo, request = _timing_scope(tmp_path, intent=None, restraint=None)
+    client = TestClient(app)
+    upstream = {field: getattr(request, field) for field in (
+        "request_id", "owner_id", "conversation_id", "surface",
+        "runtime_session_id", "runtime_turn_id",
+    )}
+    for endpoint in ("interaction-governance", "restraint"):
+        response = client.post(f"/v1/runtime/{endpoint}/evaluate", json={
+            **upstream, "current_user_text": "What does PRIVATE-TIMING-RAW-CONTENT mean?",
+            "recent_messages": [],
+        })
+        assert response.status_code == 200, response.text
+    old_turn = repo.turn_by_id(request.runtime_turn_id)
+    assert old_turn.intent_class == "information_request"
+    assert old_turn.restraint_policy == "answer_normally"
+    response = client.post("/v1/runtime/timing/evaluate", json=request.model_dump())
+    assert response.status_code == 200
+    assert response.json()["result"]["timing_policy"] == "answer_now"
+    event = repo.list_events_for_tests(request.runtime_session_id)[-1]
+    assert "PRIVATE-TIMING-RAW-CONTENT" not in json.dumps(event.model_dump()) + response.text
+    assert set(event.event_payload_json) == {
+        "request_id", "timing_policy", "reason_codes", "latency_budget_class", "latency_budget_ms",
+        "expansion_allowed", "continuation_state", "degradation_mode", "policy_version",
+        "spoken_output", "active_task_mode", "requested_detail", "dependency_state",
+        "continuation_timing_policy",
+    }
+    assert repo.turn_by_id(request.runtime_turn_id).intent_class == old_turn.intent_class
+    assert repo.turn_by_id(request.runtime_turn_id).restraint_policy == old_turn.restraint_policy
+
+
+@pytest.mark.parametrize("intent,restraint,continuation,policy", [
+    ("information_request", "answer_normally", None, "answer_now"),
+    ("action_command", "answer_normally", None, "acknowledge_then_answer"),
+    ("low_confidence_unclear", "answer_normally", None, "ask_clarifying_question"),
+    ("information_request", "answer_normally", "pause_or_wait", "pause_or_wait"),
+    ("information_request", "defer_expansion", None, "defer_expansion"),
+    ("interruption", "answer_normally", None, "yield_to_user"),
+    ("information_request", "answer_normally", "resume_previous_thread", "resume_previous_thread"),
+    ("information_request", "answer_normally", "close_turn", "close_turn"),
+])
+def test_timing_result_rejects_wrong_state_and_expansion_for_each_policy(
+    tmp_path, intent, restraint, continuation, policy,
+):
+    _, repo, request = _timing_scope(tmp_path, intent=intent, restraint=restraint)
+    valid = repo.evaluate_timing(request.model_copy(update={
+        "spoken_output": True, "continuation_timing_policy": continuation,
+    })).result.model_dump()
+    assert valid["timing_policy"] == policy
+    wrong_state = "waiting" if valid["continuation_state"] == "none" else "none"
+    for changes in (
+        {"continuation_state": wrong_state},
+        {"expansion_allowed": not valid["expansion_allowed"]},
+    ):
+        with pytest.raises(ValidationError, match="timing_projection_inconsistent"):
+            RuntimeTimingResult.model_validate({**valid, **changes})
+
+
+@pytest.mark.parametrize("changes", [
+    {"extra": "private"}, {"request_id": 1}, {"owner_id": ""},
+    {"conversation_id": " "}, {"surface": "x" * 65},
+    {"runtime_session_id": None}, {"runtime_turn_id": 1}, {"result": {}},
+])
+def test_timing_response_model_is_strict(tmp_path, changes):
+    _, repo, request = _timing_scope(tmp_path)
+    valid = repo.evaluate_timing(request).model_dump()
+    with pytest.raises(ValidationError):
+        RuntimeTimingEvaluateResponse.model_validate({**valid, **changes})
+
+
+@pytest.mark.parametrize("detail", ["brief", "normal"])
+def test_timing_only_expanded_detail_overrides_low_attention(tmp_path, detail):
+    _, repo, request = _timing_scope(tmp_path)
+    _timing_presence(repo, request, "low_attention")
+    result = repo.evaluate_timing(request.model_copy(update={"requested_detail": detail})).result
+    assert result.timing_policy == "defer_expansion"
+    assert result.reason_codes == ["presence_low_attention"]

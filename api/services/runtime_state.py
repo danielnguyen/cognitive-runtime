@@ -6,15 +6,20 @@ import sqlite3
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 from uuid import uuid4
 
 from models import (
+    RUNTIME_TIMING_BUDGET_MS,
+    RUNTIME_TIMING_PROJECTIONS,
+    RUNTIME_TIMING_REASON_POLICIES,
     AttentionFocus,
     ContinuationCandidate,
     ContinuationSelectionRequest,
     ContinuationSelectionResponse,
     ContinuationSelectionResult,
+    HistoryFollowupIntent,
+    RestraintPolicy,
     RetirementReservationCancelRequest,
     RetirementReservationCancelResponse,
     RetirementReservationFinalizeRequest,
@@ -32,12 +37,20 @@ from models import (
     RuntimeState,
     RuntimeStateUpdate,
     RuntimeThreadProjection,
+    RuntimeTimingEvaluateRequest,
+    RuntimeTimingEvaluateResponse,
+    RuntimeTimingResult,
     RuntimeTurn,
 )
 from pydantic import ValidationError
 
 DEFAULT_RUNTIME_DB_PATH = "./data/runtime_state.sqlite3"
 _TERMINAL_TURN_STATUSES = {"completed", "abandoned"}
+_TIMING_INTENT_CLASSES = {
+    "information_request", "action_command", "confirmation_response", "correction",
+    "clarification_request", "continuation", "interruption", "topic_shift", "venting_signal",
+    "context_update", "memory_candidate", "surface_action", "low_confidence_unclear",
+} | set(get_args(HistoryFollowupIntent))
 _CONTINUATION_CLOCK_SKEW_SECONDS = 300
 _CONTINUATION_REASON_ORDER = (
     "candidate_set_incomplete",
@@ -331,6 +344,144 @@ class RuntimeStateRepository:
                 event_payload_json=result.model_dump(mode="json"),
             )
             return response
+
+    def evaluate_timing(
+        self, request: RuntimeTimingEvaluateRequest,
+    ) -> RuntimeTimingEvaluateResponse:
+        with self._connect() as conn:
+            # Inspect authority and persist both turn fields and audit event atomically.
+            conn.execute("BEGIN IMMEDIATE;")
+            session = self._session_by_id(conn, request.runtime_session_id)
+            if session is None:
+                raise RuntimeError("runtime_session_not_found")
+            if (session.owner_id, session.conversation_id, session.surface) != (
+                request.owner_id, request.conversation_id, request.surface,
+            ):
+                raise RuntimeError("runtime_session_mismatch")
+            try:
+                turn = self._turn_by_id(conn, request.runtime_turn_id)
+            except ValidationError:
+                raise RuntimeError("runtime_timing_inputs_invalid") from None
+            if turn is None:
+                raise RuntimeError("runtime_turn_not_found")
+            if turn.runtime_session_id != session.runtime_session_id:
+                raise RuntimeError("runtime_turn_session_mismatch")
+            if turn.turn_status in _TERMINAL_TURN_STATUSES:
+                raise RuntimeError("runtime_turn_not_current")
+            inspection = self._inspect_continuation_thread(
+                conn, owner_id=request.owner_id, conversation_id=request.conversation_id,
+            )
+            if inspection["state"] == "contended":
+                raise RuntimeError("runtime_thread_contended")
+            if inspection["state"] != "active":
+                raise RuntimeError("runtime_thread_unavailable")
+            # Read-only inspection proves this validator cannot create or repair state.
+            self._validate_current_turn(conn, session=session, turn=turn)
+            if (
+                turn.intent_class not in _TIMING_INTENT_CLASSES
+                or turn.restraint_policy not in get_args(RestraintPolicy)
+            ):
+                raise RuntimeError("runtime_timing_inputs_invalid")
+
+            presence_state = None
+            event = conn.execute(
+                """
+                SELECT event_payload_json FROM conversation_runtime_events
+                WHERE runtime_session_id = ? AND runtime_turn_id = ?
+                  AND event_type = 'presence_evaluated'
+                ORDER BY id DESC LIMIT 1;
+                """,
+                (session.runtime_session_id, turn.runtime_turn_id),
+            ).fetchone()
+            if event is not None:
+                try:
+                    presence = RuntimePresenceResult.model_validate_json(
+                        event["event_payload_json"],
+                    )
+                except ValidationError:
+                    raise RuntimeError("runtime_timing_inputs_invalid") from None
+                presence_state = presence.presence_state
+
+            reason = self._timing_reason(request, turn=turn, presence_state=presence_state)
+            policy = RUNTIME_TIMING_REASON_POLICIES[reason]
+            continuation, expansion, overlay = RUNTIME_TIMING_PROJECTIONS[policy]
+            reasons = [reason]
+            if request.dependency_state == "degraded":
+                reasons.append("dependency_degraded")
+            result = RuntimeTimingResult(
+                timing_policy=policy,
+                reason_codes=reasons,
+                latency_budget_class=request.latency_budget_class,
+                latency_budget_ms=RUNTIME_TIMING_BUDGET_MS[request.latency_budget_class],
+                expansion_allowed=expansion,
+                continuation_state=continuation,
+                degradation_mode={
+                    "ready": "none", "degraded": "bounded", "blocking": "fail_closed",
+                }[request.dependency_state],
+                prompt_overlay=overlay,
+                trace_ref=_digest("rtrace", _json({
+                    **request.model_dump(mode="json"), "intent_class": turn.intent_class,
+                    "restraint_policy": turn.restraint_policy, "presence_state": presence_state,
+                    "timing_policy": policy,
+                })),
+            )
+            response = RuntimeTimingEvaluateResponse(
+                **{field: getattr(request, field) for field in (
+                    "request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id",
+                )}, result=result,
+            )
+            self._update_turn_row(conn, turn.runtime_turn_id, {
+                "timing_policy": result.timing_policy,
+                "continuation_state": result.continuation_state,
+                "updated_at": _now(),
+            })
+            self._record_event(
+                conn, runtime_session_id=session.runtime_session_id,
+                runtime_turn_id=turn.runtime_turn_id, event_type="timing_evaluated",
+                event_payload_json={
+                    **result.model_dump(mode="json", exclude={"prompt_overlay", "trace_ref"}),
+                    **{field: getattr(request, field) for field in (
+                        "request_id", "spoken_output", "active_task_mode", "requested_detail",
+                        "dependency_state", "continuation_timing_policy",
+                    )},
+                },
+            )
+            return response
+
+    @staticmethod
+    def _timing_reason(
+        request: RuntimeTimingEvaluateRequest, *, turn: RuntimeTurn, presence_state: str | None,
+    ) -> str:
+        if request.dependency_state == "blocking":
+            return "dependency_blocking"
+        if request.continuation_timing_policy == "close_turn":
+            return "continuation_close_turn"
+        continuation_reasons = {
+            "pause_or_wait": "continuation_pause_or_wait",
+            "ask_clarifying_question": "continuation_clarification",
+            "resume_previous_thread": "continuation_resume",
+        }
+        if request.continuation_timing_policy in continuation_reasons:
+            return continuation_reasons[request.continuation_timing_policy]
+        if turn.intent_class == "interruption":
+            return "intent_interruption"
+        if turn.restraint_policy == "ask_clarifying_question":
+            return "restraint_clarification"
+        if turn.intent_class == "low_confidence_unclear":
+            return "unclear_intent_clarification"
+        if turn.intent_class == "action_command" and request.spoken_output:
+            return "spoken_action_acknowledgment"
+        if turn.restraint_policy == "defer_expansion":
+            return "restraint_defer_expansion"
+        if request.requested_detail != "expanded":
+            if presence_state == "low_attention":
+                return "presence_low_attention"
+            if presence_state == "driving_or_active_task":
+                return "presence_active_task"
+        if request.continuation_timing_policy == "answer_now":
+            return "continuation_answer_now"
+        return "ordinary_ready"
 
     def select_continuation(
         self,
@@ -2160,6 +2311,12 @@ def evaluate_runtime_presence(
     request: RuntimePresenceEvaluateRequest,
 ) -> RuntimePresenceEvaluateResponse:
     return runtime_state_repository().evaluate_presence(request)
+
+
+def evaluate_runtime_timing(
+    request: RuntimeTimingEvaluateRequest,
+) -> RuntimeTimingEvaluateResponse:
+    return runtime_state_repository().evaluate_timing(request)
 
 
 def reserve_runtime_retirement(
