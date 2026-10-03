@@ -4681,6 +4681,8 @@ def test_timing_policies_and_precedence_persist_only_timing(
     tmp_path, dependency, intent, restraint, facts, presence, policy, reason,
 ):
     db_path, repo, request = _timing_scope(tmp_path, intent=intent, restraint=restraint)
+    if intent == "low_confidence_unclear":
+        _timing_governance_event(repo, request, {"clarifying_question_allowed": True})
     _timing_presence(repo, request, presence)
     payload = {**request.model_dump(), "dependency_state": dependency, **facts}
     before = _runtime_rows(db_path)
@@ -4731,6 +4733,7 @@ def test_timing_policies_and_precedence_persist_only_timing(
     ("extra", "private"), ("intent_class", "action_command"),
     ("restraint_policy", "answer_normally"), ("presence_state", "available"),
     ("timing_policy", "answer_now"), ("current_user_text", "private"),
+    ("clarifying_question_allowed", True),
     ("spoken_output", "true"), ("spoken_output", 1), ("spoken_output", None),
     ("active_task_mode", "false"), ("active_task_mode", 0), ("active_task_mode", None),
     ("requested_detail", "unknown"), ("requested_detail", None),
@@ -5142,6 +5145,8 @@ def test_timing_result_rejects_wrong_state_and_expansion_for_each_policy(
     tmp_path, intent, restraint, continuation, policy,
 ):
     _, repo, request = _timing_scope(tmp_path, intent=intent, restraint=restraint)
+    if intent == "low_confidence_unclear":
+        _timing_governance_event(repo, request, {"clarifying_question_allowed": True})
     valid = repo.evaluate_timing(request.model_copy(update={
         "spoken_output": True, "continuation_timing_policy": continuation,
     })).result.model_dump()
@@ -5174,3 +5179,124 @@ def test_timing_only_expanded_detail_overrides_low_attention(tmp_path, detail):
     result = repo.evaluate_timing(request.model_copy(update={"requested_detail": detail})).result
     assert result.timing_policy == "defer_expansion"
     assert result.reason_codes == ["presence_low_attention"]
+
+
+def _timing_governance_event(repo, request, payload):
+    return repo.record_session_event(
+        runtime_session_id=request.runtime_session_id,
+        runtime_turn_id=request.runtime_turn_id,
+        event_type="interaction_governance_evaluated",
+        event_payload_json=payload,
+    )
+
+
+@pytest.mark.parametrize("allowed,restraint,policy,reason", [
+    (True, "answer_normally", "ask_clarifying_question", "unclear_intent_clarification"),
+    (False, "answer_normally", "answer_now", "ordinary_ready"),
+    (None, "answer_normally", "answer_now", "ordinary_ready"),
+    (False, "defer_expansion", "defer_expansion", "restraint_defer_expansion"),
+    (None, "defer_expansion", "defer_expansion", "restraint_defer_expansion"),
+    (False, "ask_clarifying_question", "ask_clarifying_question", "restraint_clarification"),
+    (None, "ask_clarifying_question", "ask_clarifying_question", "restraint_clarification"),
+])
+def test_timing_unclear_intent_consumes_only_r43_permission(
+    tmp_path, allowed, restraint, policy, reason,
+):
+    _, repo, request = _timing_scope(
+        tmp_path, intent="low_confidence_unclear", restraint=restraint,
+    )
+    if allowed is not None:
+        _timing_governance_event(repo, request, {"clarifying_question_allowed": allowed})
+    result = repo.evaluate_timing(request).result
+    assert result.timing_policy == policy
+    assert result.reason_codes == [reason]
+
+
+@pytest.mark.parametrize("text,kind,allowed,policy", [
+    ("lol roast my tiny todo list", "joke_or_playful", False, "answer_now"),
+    ("brainstorm options for this name", "brainstorm", False, "answer_now"),
+    ("nuke this", "ambiguous", True, "ask_clarifying_question"),
+])
+def test_timing_real_governance_clarification_authority(tmp_path, text, kind, allowed, policy):
+    _, repo, request = _timing_scope(tmp_path, intent=None)
+    client = TestClient(app)
+    scope = {field: getattr(request, field) for field in (
+        "request_id", "owner_id", "conversation_id", "surface",
+        "runtime_session_id", "runtime_turn_id",
+    )}
+    response = client.post("/v1/runtime/interaction-governance/evaluate", json={
+        **scope, "current_user_text": text, "recent_messages": [],
+    })
+    assert response.status_code == 200, response.text
+    governance = response.json()["result"]
+    assert governance["interaction_kind"] == kind
+    assert governance["clarifying_question_allowed"] is allowed
+    assert repo.turn_by_id(request.runtime_turn_id).intent_class == "low_confidence_unclear"
+    event = repo.list_events_for_tests(request.runtime_session_id)[-1]
+    assert event.event_type == "interaction_governance_evaluated"
+    assert event.event_payload_json["clarifying_question_allowed"] is allowed
+    timing = client.post("/v1/runtime/timing/evaluate", json=request.model_dump())
+    assert timing.status_code == 200, timing.text
+    assert timing.json()["result"]["timing_policy"] == policy
+    timing_event = repo.list_events_for_tests(request.runtime_session_id)[-1]
+    serialized = json.dumps(timing_event.model_dump()) + timing.text
+    assert text not in serialized
+    assert "interaction_kind" not in timing_event.event_payload_json
+    assert "clarifying_question_allowed" not in timing_event.event_payload_json
+
+
+@pytest.mark.parametrize("payload", [
+    "not-json", "null", "[]", "{}", '{"clarifying_question_allowed":null}',
+    '{"clarifying_question_allowed":0}', '{"clarifying_question_allowed":1}',
+    '{"clarifying_question_allowed":"true"}', '{"clarifying_question_allowed":[]}',
+    '{"clarifying_question_allowed":{}}',
+])
+def test_timing_malformed_latest_governance_fails_without_writes(tmp_path, payload):
+    db_path, repo, request = _timing_scope(tmp_path, intent="low_confidence_unclear")
+    _timing_governance_event(repo, request, {"clarifying_question_allowed": True})
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO conversation_runtime_events
+               (event_id, runtime_session_id, runtime_turn_id, event_type,
+                event_payload_json, created_at)
+               VALUES ('malformed-governance', ?, ?,
+                       'interaction_governance_evaluated', ?, 'now')""",
+            (request.runtime_session_id, request.runtime_turn_id, payload),
+        )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json=request.model_dump())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_timing_inputs_invalid"}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("latest", [True, False])
+def test_timing_uses_latest_exact_turn_governance_permission(tmp_path, latest):
+    _, repo, request = _timing_scope(tmp_path, intent="low_confidence_unclear")
+    _timing_governance_event(repo, request, {"clarifying_question_allowed": not latest})
+    _timing_governance_event(repo, request, {"clarifying_question_allowed": latest})
+    result = repo.evaluate_timing(request).result
+    assert result.timing_policy == ("ask_clarifying_question" if latest else "answer_now")
+
+
+@pytest.mark.parametrize("payload", [{"clarifying_question_allowed": True}, {}])
+def test_timing_governance_from_previous_turn_is_ignored(tmp_path, payload):
+    _, repo, old_request = _timing_scope(tmp_path, intent="low_confidence_unclear")
+    _timing_governance_event(repo, old_request, payload)
+    repo.complete_turn(
+        request_id="complete-old", runtime_session_id=old_request.runtime_session_id,
+        runtime_turn_id=old_request.runtime_turn_id, turn_status="completed",
+    )
+    _, turn, _ = repo.start_turn(
+        request_id="later", owner_id=old_request.owner_id,
+        conversation_id=old_request.conversation_id, surface=old_request.surface,
+        intent_class="low_confidence_unclear", restraint_policy="answer_normally",
+    )
+    request = old_request.model_copy(update={"runtime_turn_id": turn.runtime_turn_id})
+    assert repo.evaluate_timing(request).result.timing_policy == "answer_now"
+
+
+def test_timing_non_unclear_intent_does_not_read_malformed_governance(tmp_path):
+    _, repo, request = _timing_scope(tmp_path)
+    _timing_governance_event(repo, request, {"clarifying_question_allowed": "not-bool"})
+    assert repo.evaluate_timing(request).result.timing_policy == "answer_now"

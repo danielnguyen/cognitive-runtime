@@ -383,6 +383,29 @@ class RuntimeStateRepository:
             ):
                 raise RuntimeError("runtime_timing_inputs_invalid")
 
+            clarifying_question_allowed = None
+            if turn.intent_class == "low_confidence_unclear":
+                governance_event = conn.execute(
+                    """
+                    SELECT event_payload_json FROM conversation_runtime_events
+                    WHERE runtime_session_id = ? AND runtime_turn_id = ?
+                      AND event_type = 'interaction_governance_evaluated'
+                    ORDER BY id DESC LIMIT 1;
+                    """,
+                    (session.runtime_session_id, turn.runtime_turn_id),
+                ).fetchone()
+                if governance_event is not None:
+                    try:
+                        governance = json.loads(governance_event["event_payload_json"])
+                    except (TypeError, ValueError):
+                        raise RuntimeError("runtime_timing_inputs_invalid") from None
+                    if (
+                        not isinstance(governance, dict)
+                        or type(governance.get("clarifying_question_allowed")) is not bool
+                    ):
+                        raise RuntimeError("runtime_timing_inputs_invalid")
+                    clarifying_question_allowed = governance["clarifying_question_allowed"]
+
             presence_state = None
             event = conn.execute(
                 """
@@ -402,7 +425,10 @@ class RuntimeStateRepository:
                     raise RuntimeError("runtime_timing_inputs_invalid") from None
                 presence_state = presence.presence_state
 
-            reason = self._timing_reason(request, turn=turn, presence_state=presence_state)
+            reason = self._timing_reason(
+                request, turn=turn, presence_state=presence_state,
+                clarifying_question_allowed=clarifying_question_allowed,
+            )
             policy = RUNTIME_TIMING_REASON_POLICIES[reason]
             continuation, expansion, overlay = RUNTIME_TIMING_PROJECTIONS[policy]
             reasons = [reason]
@@ -423,6 +449,7 @@ class RuntimeStateRepository:
                     **request.model_dump(mode="json"), "intent_class": turn.intent_class,
                     "restraint_policy": turn.restraint_policy, "presence_state": presence_state,
                     "timing_policy": policy,
+                    "clarifying_question_allowed": clarifying_question_allowed,
                 })),
             )
             response = RuntimeTimingEvaluateResponse(
@@ -452,6 +479,7 @@ class RuntimeStateRepository:
     @staticmethod
     def _timing_reason(
         request: RuntimeTimingEvaluateRequest, *, turn: RuntimeTurn, presence_state: str | None,
+        clarifying_question_allowed: bool | None,
     ) -> str:
         if request.dependency_state == "blocking":
             return "dependency_blocking"
@@ -468,7 +496,7 @@ class RuntimeStateRepository:
             return "intent_interruption"
         if turn.restraint_policy == "ask_clarifying_question":
             return "restraint_clarification"
-        if turn.intent_class == "low_confidence_unclear":
+        if turn.intent_class == "low_confidence_unclear" and clarifying_question_allowed is True:
             return "unclear_intent_clarification"
         if turn.intent_class == "action_command" and request.spoken_output:
             return "spoken_action_acknowledgment"
