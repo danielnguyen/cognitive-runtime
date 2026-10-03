@@ -630,6 +630,7 @@ def evaluate_interaction_governance(
             "commentary_allowed": result.commentary_allowed,
             "humor_allowed": result.humor_allowed,
             "action_allowed": result.action_allowed,
+            "clarifying_question_allowed": result.clarifying_question_allowed,
             "requires_confirmation": result.requires_confirmation,
             "reason_summary": result.reason_summary,
             "history_followup_policy": result.history_followup_policy.model_dump(),
