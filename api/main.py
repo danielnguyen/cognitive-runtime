@@ -84,6 +84,8 @@ from models import (
     RuntimeStateUpdateRequest,
     RuntimeThreadProjection,
     RuntimeThreadResolveRequest,
+    RuntimeTimingEvaluateRequest,
+    RuntimeTimingEvaluateResponse,
     RuntimeTurnCompleteRequest,
     RuntimeTurnResponse,
     RuntimeTurnsReconcileRequest,
@@ -161,6 +163,7 @@ from services.runtime_state import (
     cancel_runtime_retirement,
     complete_turn,
     evaluate_runtime_presence,
+    evaluate_runtime_timing,
     finalize_runtime_retirement,
     get_runtime_session,
     reconcile_interrupted_turns,
@@ -291,6 +294,7 @@ _EVIDENCE_SHAPE_ERROR_STATUS = {
 }
 
 _RUNTIME_STATE_ERROR_STATUS = {
+    "runtime_timing_inputs_invalid": 503,
     "runtime_session_mismatch": 400,
     "runtime_retirement_reservation_conflict": 409,
     "runtime_retirement_reservation_invariant_conflict": 409,
@@ -387,6 +391,19 @@ async def evaluate_runtime_presence_endpoint(
 ) -> RuntimePresenceEvaluateResponse:
     try:
         return evaluate_runtime_presence(body)
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
+
+
+@app.post(
+    "/v1/runtime/timing/evaluate",
+    response_model=RuntimeTimingEvaluateResponse,
+)
+async def evaluate_runtime_timing_endpoint(
+    body: RuntimeTimingEvaluateRequest,
+) -> RuntimeTimingEvaluateResponse:
+    try:
+        return evaluate_runtime_timing(body)
     except Exception as exc:
         raise _runtime_state_http_error(exc) from None
 

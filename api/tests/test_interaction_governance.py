@@ -200,6 +200,7 @@ async def test_runtime_event_payload_is_summarized_only():
         "commentary_allowed",
         "humor_allowed",
         "action_allowed",
+        "clarifying_question_allowed",
         "requires_confirmation",
         "reason_summary",
         "history_followup_policy",
@@ -1185,3 +1186,32 @@ async def test_policy_result_never_claims_history_or_external_work_occurred():
         "verification_performed",
     ):
         assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,kind,allowed", [
+    ("nuke this", "ambiguous", True),
+    ("brainstorm options for this name", "brainstorm", False),
+    ("lol roast my tiny todo list", "joke_or_playful", False),
+])
+async def test_governance_event_projects_exact_clarification_permission(text, kind, allowed):
+    started = await _post("/v1/runtime/turns/start", {
+        field: value for field, value in _base().items() if field != "recent_messages"
+    })
+    assert started.status_code == 200
+    session_id = started.json()["runtime_session"]["runtime_session_id"]
+    turn_id = started.json()["runtime_turn"]["runtime_turn_id"]
+    response = await _post("/v1/runtime/interaction-governance/evaluate", _base(
+        runtime_session_id=session_id, runtime_turn_id=turn_id, current_user_text=text,
+    ))
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["interaction_kind"] == kind
+    assert result["clarifying_question_allowed"] is allowed
+    diagnostics = await _get(f"/v1/runtime/sessions/{session_id}")
+    events = [event for event in diagnostics.json()["events"]
+              if event["event_type"] == "interaction_governance_evaluated"
+              and event["runtime_turn_id"] == turn_id]
+    assert len(events) == 1
+    assert events[0]["event_payload_json"]["clarifying_question_allowed"] is allowed
+    assert "current_user_text" not in events[0]["event_payload_json"]
