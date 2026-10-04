@@ -43,6 +43,7 @@ from models import (
     RuntimeTurn,
 )
 from pydantic import ValidationError
+from services.companion_contracts import companion_contracts_repository
 
 DEFAULT_RUNTIME_DB_PATH = "./data/runtime_state.sqlite3"
 _TERMINAL_TURN_STATUSES = {"completed", "abandoned"}
@@ -425,6 +426,26 @@ class RuntimeStateRepository:
                     raise RuntimeError("runtime_timing_inputs_invalid") from None
                 presence_state = presence.presence_state
 
+            try:
+                profile = companion_contracts_repository().active_profile()
+                if (
+                    not isinstance(profile.profile_id, str)
+                    or not profile.profile_id.strip()
+                    or len(profile.profile_id) > 120
+                    or type(profile.version) is not int
+                    or profile.version <= 0
+                    or profile.active is not True
+                    or profile.status != "active"
+                ):
+                    raise ValueError("invalid_companion_identity")
+                identity_provenance = {
+                    "source": "companion_profile_registry",
+                    "profile_id": profile.profile_id,
+                    "profile_version": profile.version,
+                }
+            except Exception:
+                raise RuntimeError("runtime_timing_identity_unavailable") from None
+
             reason = self._timing_reason(
                 request, turn=turn, presence_state=presence_state,
                 clarifying_question_allowed=clarifying_question_allowed,
@@ -450,6 +471,7 @@ class RuntimeStateRepository:
                     "restraint_policy": turn.restraint_policy, "presence_state": presence_state,
                     "timing_policy": policy,
                     "clarifying_question_allowed": clarifying_question_allowed,
+                    "identity_provenance": identity_provenance,
                 })),
             )
             response = RuntimeTimingEvaluateResponse(
@@ -468,6 +490,7 @@ class RuntimeStateRepository:
                 runtime_turn_id=turn.runtime_turn_id, event_type="timing_evaluated",
                 event_payload_json={
                     **result.model_dump(mode="json", exclude={"prompt_overlay", "trace_ref"}),
+                    "identity_provenance": identity_provenance,
                     **{field: getattr(request, field) for field in (
                         "request_id", "spoken_output", "active_task_mode", "requested_detail",
                         "dependency_state", "continuation_timing_policy",
