@@ -2,7 +2,9 @@ import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import get_args
 
@@ -35,6 +37,7 @@ from models import (
     RuntimeTimingResult,
 )
 from pydantic import TypeAdapter, ValidationError
+from services.companion_contracts import companion_contracts_repository
 from services.runtime_state import RuntimeStateRepository, clear_states_for_tests
 
 
@@ -4720,7 +4723,12 @@ def test_timing_policies_and_precedence_persist_only_timing(
     assert events[-1].event_type == "timing_evaluated"
     assert events[-1].runtime_session_id == request.runtime_session_id
     assert events[-1].runtime_turn_id == request.runtime_turn_id
+    profile = companion_contracts_repository().active_profile()
     assert events[-1].event_payload_json == {
+        "identity_provenance": {
+            "source": "companion_profile_registry",
+            "profile_id": profile.profile_id, "profile_version": profile.version,
+        },
         **timing.model_dump(exclude={"prompt_overlay", "trace_ref"}),
         **{field: payload[field] for field in (
             "request_id", "spoken_output", "active_task_mode", "requested_detail",
@@ -4733,6 +4741,10 @@ def test_timing_policies_and_precedence_persist_only_timing(
     ("extra", "private"), ("intent_class", "action_command"),
     ("restraint_policy", "answer_normally"), ("presence_state", "available"),
     ("timing_policy", "answer_now"), ("current_user_text", "private"),
+    ("profile_id", "caller-profile"), ("profile_version", 99),
+    ("identity_provenance", {"profile_id": "caller-profile", "profile_version": 99}),
+    ("requested_profile", "caller-profile"), ("profile_name", "caller-profile"),
+    ("effective_profile_ref", "caller-profile"),
     ("clarifying_question_allowed", True),
     ("spoken_output", "true"), ("spoken_output", 1), ("spoken_output", None),
     ("active_task_mode", "false"), ("active_task_mode", 0), ("active_task_mode", None),
@@ -5125,7 +5137,7 @@ def test_timing_consumes_existing_governance_and_restraint_without_raw_content(t
         "request_id", "timing_policy", "reason_codes", "latency_budget_class", "latency_budget_ms",
         "expansion_allowed", "continuation_state", "degradation_mode", "policy_version",
         "spoken_output", "active_task_mode", "requested_detail", "dependency_state",
-        "continuation_timing_policy",
+        "continuation_timing_policy", "identity_provenance",
     }
     assert repo.turn_by_id(request.runtime_turn_id).intent_class == old_turn.intent_class
     assert repo.turn_by_id(request.runtime_turn_id).restraint_policy == old_turn.restraint_policy
@@ -5300,3 +5312,160 @@ def test_timing_non_unclear_intent_does_not_read_malformed_governance(tmp_path):
     _, repo, request = _timing_scope(tmp_path)
     _timing_governance_event(repo, request, {"clarifying_question_allowed": "not-bool"})
     assert repo.evaluate_timing(request).result.timing_policy == "answer_now"
+
+
+def test_timing_identity_provenance_is_bounded_and_private(tmp_path, monkeypatch):
+    _, repo, request = _timing_scope(tmp_path)
+    contracts = companion_contracts_repository()
+    profile = replace(
+        contracts.active_profile(), content="PRIVATE-PROFILE-CONTENT",
+        core_traits_json={"private": "PRIVATE-TRAITS"},
+        behavioral_laws_json=["PRIVATE-LAWS"],
+        surface_overrides_json={"private": "PRIVATE-SURFACE"},
+    )
+    monkeypatch.setattr(contracts, "active_profile", lambda: profile)
+    response = repo.evaluate_timing(request)
+    event = repo.list_events_for_tests(request.runtime_session_id)[-1]
+    assert event.event_payload_json["identity_provenance"] == {
+        "source": "companion_profile_registry",
+        "profile_id": profile.profile_id, "profile_version": profile.version,
+    }
+    assert "PRIVATE-" not in json.dumps(event.model_dump())
+    assert set(response.model_dump()) == {
+        "request_id", "owner_id", "conversation_id", "surface",
+        "runtime_session_id", "runtime_turn_id", "result",
+    }
+    assert set(response.result.model_dump()) == {
+        "timing_policy", "reason_codes", "latency_budget_class", "latency_budget_ms",
+        "expansion_allowed", "continuation_state", "degradation_mode", "policy_version",
+        "prompt_overlay", "trace_ref",
+    }
+    assert set(request.model_dump()) == {
+        "request_id", "owner_id", "conversation_id", "surface",
+        "runtime_session_id", "runtime_turn_id", "spoken_output", "active_task_mode",
+        "requested_detail", "latency_budget_class", "dependency_state",
+        "continuation_timing_policy",
+    }
+    assert not any(key in event.event_payload_json for key in (
+        "content", "core_traits_json", "behavioral_laws_json", "surface_overrides_json",
+        "scene", "interaction_contract", "effective_profile_ref", "profile_name",
+    ))
+
+
+@pytest.mark.parametrize("identity_field", ["profile_id", "version"])
+def test_timing_trace_ref_binds_exact_canonical_identity(tmp_path, monkeypatch, identity_field):
+    _, repo, request = _timing_scope(tmp_path)
+    contracts = companion_contracts_repository()
+    profile = contracts.active_profile()
+    first = repo.evaluate_timing(request).result
+    provenance = {
+        "source": "companion_profile_registry",
+        "profile_id": profile.profile_id, "profile_version": profile.version,
+    }
+    material = {
+        **request.model_dump(mode="json"), "intent_class": "information_request",
+        "restraint_policy": "answer_normally", "presence_state": None,
+        "timing_policy": "answer_now", "clarifying_question_allowed": None,
+        "identity_provenance": provenance,
+    }
+    serialized = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    assert first.trace_ref == "rtrace_" + sha256(serialized.encode()).hexdigest()[:16]
+    changed = replace(profile, **{identity_field: (
+        "another-canonical-profile" if identity_field == "profile_id" else profile.version + 1
+    )})
+    monkeypatch.setattr(contracts, "active_profile", lambda: changed)
+    second = repo.evaluate_timing(request).result
+    assert second.trace_ref != first.trace_ref
+    assert second.model_dump(exclude={"trace_ref"}) == first.model_dump(exclude={"trace_ref"})
+    assert repo.evaluate_timing(request).result.trace_ref == second.trace_ref
+    event = repo.list_events_for_tests(request.runtime_session_id)[-1]
+    assert event.event_payload_json["identity_provenance"] == {
+        "source": "companion_profile_registry",
+        "profile_id": changed.profile_id, "profile_version": changed.version,
+    }
+
+
+@pytest.mark.parametrize("failure", ["missing", "storage"])
+def test_timing_unavailable_identity_fails_without_writes(tmp_path, monkeypatch, failure):
+    db_path, repo, request = _timing_scope(tmp_path)
+    contracts = companion_contracts_repository()
+    if failure == "missing":
+        with contracts._connect() as conn:
+            conn.execute("UPDATE companion_profiles SET active = 0")
+    else:
+        def unavailable():
+            raise sqlite3.OperationalError("PRIVATE-PROFILE-STORAGE-DETAIL")
+        monkeypatch.setattr(contracts, "active_profile", unavailable)
+    before = _runtime_rows(db_path)
+    with pytest.raises(RuntimeError, match="^runtime_timing_identity_unavailable$"):
+        repo.evaluate_timing(request)
+    assert _runtime_rows(db_path) == before
+    response = TestClient(app).post("/v1/runtime/timing/evaluate", json=request.model_dump())
+    # Preserve the existing HTTP mapper for unknown bounded runtime dependencies.
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("profile_id", ""), ("profile_id", "   "), ("profile_id", "x" * 121),
+    ("profile_id", None), ("profile_id", 1),
+    ("version", True), ("version", 0), ("version", -1), ("version", "2"),
+    ("version", 1.5), ("version", None),
+    ("active", False), ("active", 1), ("status", "retired"),
+])
+def test_timing_malformed_identity_fails_without_writes(tmp_path, monkeypatch, field, value):
+    db_path, repo, request = _timing_scope(tmp_path)
+    contracts = companion_contracts_repository()
+    profile = replace(contracts.active_profile(), **{field: value})
+    monkeypatch.setattr(contracts, "active_profile", lambda: profile)
+    before = _runtime_rows(db_path)
+    with pytest.raises(RuntimeError, match="^runtime_timing_identity_unavailable$"):
+        repo.evaluate_timing(request)
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("case,error", [
+    ("session", "runtime_session_not_found"), ("surface", "runtime_session_mismatch"),
+    ("terminal", "runtime_turn_not_current"), ("intent", "runtime_timing_inputs_invalid"),
+    ("restraint", "runtime_timing_inputs_invalid"), ("permission", "runtime_timing_inputs_invalid"),
+    ("presence", "runtime_timing_inputs_invalid"),
+])
+def test_timing_invalid_current_inputs_precede_identity_resolution(
+    tmp_path, monkeypatch, case, error,
+):
+    db_path, repo, request = _timing_scope(
+        tmp_path, intent=None if case == "intent" else (
+            "low_confidence_unclear" if case == "permission" else "information_request"
+        ), restraint=None if case == "restraint" else "answer_normally",
+    )
+    if case == "session":
+        request = request.model_copy(update={"runtime_session_id": "missing-session"})
+    elif case == "surface":
+        request = request.model_copy(update={"surface": "other-surface"})
+    elif case == "terminal":
+        repo.complete_turn(
+            request_id=request.request_id, runtime_session_id=request.runtime_session_id,
+            runtime_turn_id=request.runtime_turn_id, turn_status="completed",
+        )
+    elif case == "permission":
+        _timing_governance_event(repo, request, {})
+    elif case == "presence":
+        with repo._connect() as conn:
+            repo._record_event(
+                conn, runtime_session_id=request.runtime_session_id,
+                runtime_turn_id=request.runtime_turn_id, event_type="presence_evaluated",
+                event_payload_json={},
+            )
+    calls = []
+
+    def unavailable():
+        calls.append(True)
+        raise RuntimeError("PRIVATE-IDENTITY-FAILURE")
+
+    monkeypatch.setattr(companion_contracts_repository(), "active_profile", unavailable)
+    before = _runtime_rows(db_path)
+    with pytest.raises(RuntimeError, match=f"^{error}$"):
+        repo.evaluate_timing(request)
+    assert calls == []
+    assert _runtime_rows(db_path) == before
