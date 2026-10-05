@@ -377,6 +377,8 @@ def _select_continuation(
             "request_id": "continuation-selection-request",
             "owner_id": owner_id,
             "surface": surface,
+            "surface_permission_status": "configured",
+            "conversation_context_allowed": True,
             "candidate_set_complete": candidate_set_complete,
             "stale_after_seconds": stale_after_seconds,
             "candidates": candidates,
@@ -2292,6 +2294,7 @@ def test_one_fresh_idle_candidate_resumes_without_mutation_and_survives_reopen(
             "request_id": "selection-after-reopen",
             "owner_id": owner_id,
             "surface": "surface-after-reopen",
+            "surface_permission_status": "configured", "conversation_context_allowed": True,
             "candidate_set_complete": True,
             "stale_after_seconds": 3600,
             "candidates": [
@@ -4047,6 +4050,7 @@ def _presence_scope(tmp_path, *, active=False):
     request = RuntimePresenceEvaluateRequest(
         **scope, runtime_session_id=session.runtime_session_id,
         runtime_turn_id=turn.runtime_turn_id if turn else None,
+        surface_permission_status="configured", proactive_presence_allowed=True,
     )
     return db_path, repo, request
 
@@ -4204,7 +4208,10 @@ def test_presence_state_precedence_and_bounded_event(
     assert response.status_code == 200, response.text
     body = RuntimePresenceEvaluateResponse.model_validate(response.json())
     assert body.model_dump(exclude={"result"}) == request.model_dump(
-        exclude={"active_task_mode", "proactive_output_suppressed", "explicit_proactive_opt_out"},
+        exclude={
+            "active_task_mode", "proactive_output_suppressed", "explicit_proactive_opt_out",
+            "surface_permission_status", "proactive_presence_allowed", "ambient_listening_allowed",
+        },
     )
     result = body.result
     assert result.presence_state == expected
@@ -5469,3 +5476,166 @@ def test_timing_invalid_current_inputs_precede_identity_resolution(
         repo.evaluate_timing(request)
     assert calls == []
     assert _runtime_rows(db_path) == before
+
+@pytest.mark.parametrize("status,allowed,surface,outcome,reason", [
+    ("configured", True, "alexa", "resume", "one_eligible_candidate"),
+    ("configured", False, "alexa", "create_new", "surface_context_denied"),
+    ("configured", False, "telegram", "create_new", "surface_context_denied"),
+    ("unconfigured", False, "telegram", "resume", "one_eligible_candidate"),
+    ("unconfigured", False, "alexa", "create_new", "surface_permission_absent"),
+    ("unavailable", False, "telegram", "create_new", "surface_permission_unavailable"),
+])
+def test_continuation_permission_narrows_actual_thread_without_mutation(
+    tmp_path, status, allowed, surface, outcome, reason,
+):
+    db = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db)
+    session, turn, _ = repo.start_turn(
+        request_id="permission-start", owner_id="owner", conversation_id="thread",
+        surface="telegram",
+    )
+    repo.complete_turn(
+        request_id="permission-complete", runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id, turn_status="completed",
+    )
+    before = _runtime_rows(db)
+    request = ContinuationSelectionRequest(
+        request_id="permission-select", owner_id="owner", surface=surface,
+        candidate_set_complete=True, stale_after_seconds=3600,
+        surface_permission_status=status, conversation_context_allowed=allowed,
+        candidates=[_continuation_candidate("thread")],
+    )
+    result = repo.select_continuation(request).result
+    assert result.outcome == outcome
+    assert reason in result.reason_codes
+    assert result.selected_conversation_id == ("thread" if outcome == "resume" else None)
+    assert _runtime_rows(db) == before
+
+
+@pytest.mark.parametrize("status", ["configured", "unconfigured", "unavailable"])
+@pytest.mark.parametrize("defect,outcome", [
+    ("active", "wait"), ("closed", "create_new"), ("stale", "create_new"),
+    ("incomplete", "clarify"),
+])
+def test_surface_permission_never_overrides_stricter_continuation(
+    tmp_path, status, defect, outcome,
+):
+    db = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db)
+    session, turn, _ = repo.start_turn(
+        request_id="strict-start", owner_id="owner", conversation_id="thread", surface="telegram",
+    )
+    if defect != "active":
+        repo.complete_turn(
+            request_id="strict-complete", runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id, turn_status="completed",
+        )
+    candidate = _continuation_candidate(
+        "thread", lifecycle_state="closed" if defect == "closed" else "open",
+        durable_updated_at=datetime.now(UTC) - timedelta(days=2) if defect == "stale" else None,
+    )
+    request = ContinuationSelectionRequest(
+        request_id="strict-select", owner_id="owner", surface="alexa",
+        candidate_set_complete=defect != "incomplete", stale_after_seconds=3600,
+        surface_permission_status=status, conversation_context_allowed=status == "configured",
+        candidates=[candidate],
+    )
+    before = _runtime_rows(db)
+    assert repo.select_continuation(request).result.outcome == outcome
+    assert _runtime_rows(db) == before
+
+
+@pytest.mark.parametrize("status,ambient,mode,active,task,opt_out,state", [
+    ("configured", True, "ambient_listening", False, False, False, "ambient_listening"),
+    ("unconfigured", False, "ambient_listening", False, False, False, "available"),
+    ("unavailable", False, "ambient_listening", False, False, False, "available"),
+    ("configured", False, "ambient_listening", False, False, False, "available"),
+    ("configured", True, None, False, False, False, "available"),
+    ("configured", True, "ambient_listening", True, False, False, "active_conversation"),
+    ("configured", True, "ambient_listening", False, True, False, "driving_or_active_task"),
+    ("configured", True, "ambient_listening", False, False, True, "do_not_intrude"),
+])
+def test_ambient_presence_requires_mode_permission_and_no_stricter_state(
+    tmp_path, status, ambient, mode, active, task, opt_out, state,
+):
+    db, repo, request = _presence_scope(tmp_path, active=active)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE conversation_runtime_sessions SET active_mode=?", (mode,))
+    request = RuntimePresenceEvaluateRequest.model_validate({
+        **request.model_dump(), "surface_permission_status": status,
+        "proactive_presence_allowed": status == "configured",
+        "ambient_listening_allowed": ambient,
+        "active_task_mode": task, "explicit_proactive_opt_out": opt_out,
+    })
+    result = repo.evaluate_presence(request).result
+    assert result.presence_state == state
+    assert result.required_help_allowed is True
+    event = repo.list_events_for_tests(request.runtime_session_id)[-1]
+    assert event.event_payload_json == result.model_dump()
+    assert "permission" not in json.dumps(event.event_payload_json).replace(
+        "surface_permission_unconfigured", ""
+    ).replace("surface_permission_unavailable", "")
+
+
+@pytest.mark.parametrize("status,allowed,reason", [
+    ("configured", False, "surface_proactive_denied"),
+    ("unconfigured", False, "surface_permission_unconfigured"),
+    ("unavailable", False, "surface_permission_unavailable"),
+])
+def test_presence_surface_suppression_is_not_owner_opt_out(tmp_path, status, allowed, reason):
+    _, repo, request = _presence_scope(tmp_path, active=True)
+    result = repo.evaluate_presence(RuntimePresenceEvaluateRequest.model_validate({
+        **request.model_dump(), "surface_permission_status": status,
+        "proactive_presence_allowed": allowed, "proactive_output_suppressed": True,
+    })).result
+    assert result.presence_state == "active_conversation"
+    assert result.proactive_output_suppressed is True
+    assert result.required_help_allowed is True
+    assert result.reason_codes == ["thread_active", "proactive_suppression_requested", reason]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("surface_permission_status", "unknown"), ("proactive_presence_allowed", 1),
+    ("ambient_listening_allowed", "true"),
+])
+def test_presence_permission_projection_is_strict(tmp_path, field, value):
+    db, _, request = _presence_scope(tmp_path)
+    before = _runtime_rows(db)
+    response = TestClient(app).post("/v1/runtime/presence/evaluate", json={
+        **request.model_dump(), field: value,
+    })
+    assert response.status_code == 422
+    assert _runtime_rows(db) == before
+
+
+@pytest.mark.parametrize("status", ["unconfigured", "unavailable"])
+@pytest.mark.parametrize("model,extra", [
+    (RuntimePresenceEvaluateRequest, {
+        "conversation_id": "thread", "runtime_session_id": "session",
+        "ambient_listening_allowed": True,
+    }),
+    (RuntimePresenceEvaluateRequest, {
+        "conversation_id": "thread", "runtime_session_id": "session",
+        "proactive_presence_allowed": True,
+    }),
+    (ContinuationSelectionRequest, {
+        "conversation_context_allowed": True,
+        "candidate_set_complete": True, "stale_after_seconds": 3600,
+    }),
+])
+def test_permission_absence_and_failure_cannot_project_affirmative_permission(status, model, extra):
+    with pytest.raises(ValidationError, match="surface_permission_inconsistent"):
+        model.model_validate({
+            "request_id": "request", "owner_id": "owner", "surface": "web",
+            "surface_permission_status": status, **extra,
+        })
+
+
+def test_presence_result_rejects_contradictory_permission_reasons():
+    with pytest.raises(ValidationError, match="presence_reason_codes_inconsistent"):
+        RuntimePresenceResult(
+            presence_state="active_conversation", previous_presence_state=None, state_changed=True,
+            proactive_output_suppressed=True, required_help_allowed=True,
+            reason_codes=["thread_active", "surface_permission_unavailable",
+                          "surface_proactive_denied"],
+        )

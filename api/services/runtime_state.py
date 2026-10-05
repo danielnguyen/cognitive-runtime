@@ -67,6 +67,9 @@ _CONTINUATION_REASON_ORDER = (
     "runtime_state_missing",
     "runtime_session_missing",
     "candidate_stale",
+    "surface_context_denied",
+    "surface_permission_absent",
+    "surface_permission_unavailable",
 )
 _RUNTIME_REPOSITORY: RuntimeStateRepository | None = None
 
@@ -290,6 +293,13 @@ class RuntimeStateRepository:
                 and thread.active_runtime_session_id == session.runtime_session_id
             ):
                 state, reason = "active_conversation", "thread_active"
+            elif (
+                active_mode == "ambient_listening"
+                and request.surface_permission_status == "configured"
+                and request.ambient_listening_allowed
+                and thread.state != "active"
+            ):
+                state, reason = "ambient_listening", "ambient_mode_permitted"
             elif session.status == "idle":
                 state, reason = "idle", "session_idle"
             else:
@@ -317,14 +327,26 @@ class RuntimeStateRepository:
             reasons = [reason]
             if request.proactive_output_suppressed:
                 reasons.append("proactive_suppression_requested")
+            permission_suppressed = (
+                request.surface_permission_status != "configured"
+                or not request.proactive_presence_allowed
+            )
+            if permission_suppressed:
+                reasons.append({
+                    "unconfigured": "surface_permission_unconfigured",
+                    "unavailable": "surface_permission_unavailable",
+                    "configured": "surface_proactive_denied",
+                }[request.surface_permission_status])
             result = RuntimePresenceResult(
                 presence_state=state,
                 previous_presence_state=previous_state,
                 state_changed=state != previous_state,
-                proactive_output_suppressed=request.proactive_output_suppressed or state in {
-                    "not_present", "do_not_intrude", "idle", "low_attention",
-                    "driving_or_active_task",
-                },
+                proactive_output_suppressed=(
+                    permission_suppressed or request.proactive_output_suppressed or state in {
+                        "not_present", "do_not_intrude", "idle", "low_attention",
+                        "driving_or_active_task",
+                    }
+                ),
                 required_help_allowed=state != "not_present",
                 reason_codes=reasons,
             )
@@ -566,6 +588,25 @@ class RuntimeStateRepository:
                         evaluated_at=now,
                     )
                 )
+                item = evaluations[-1]
+                if item["eligible"]:
+                    permission_reason = None
+                    if request.surface_permission_status == "unavailable":
+                        permission_reason = "surface_permission_unavailable"
+                    elif request.surface_permission_status == "configured":
+                        if not request.conversation_context_allowed:
+                            permission_reason = "surface_context_denied"
+                    else:
+                        row = self._thread_by_key(
+                            conn, owner_id=request.owner_id,
+                            conversation_id=candidate.conversation_id,
+                        )
+                        thread = self._thread_from_row(conn, row)
+                        if request.surface not in thread.participating_surfaces:
+                            permission_reason = "surface_permission_absent"
+                    if permission_reason:
+                        item["eligible"] = False
+                        item["reason_codes"].add(permission_reason)
 
         eligible = [item for item in evaluations if item["eligible"]]
         blocking_reasons = {
@@ -621,6 +662,9 @@ class RuntimeStateRepository:
                     for reason in item["reason_codes"]
                     if reason
                     in {
+                        "surface_context_denied",
+                        "surface_permission_absent",
+                        "surface_permission_unavailable",
                         "candidate_not_open",
                         "runtime_state_missing",
                         "runtime_session_missing",
