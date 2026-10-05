@@ -164,7 +164,13 @@ RuntimePresenceState = Literal[
     "driving_or_active_task",
     "do_not_intrude",
 ]
+SurfacePermissionStatus = Literal["configured", "unconfigured", "unavailable"]
+
 RuntimePresenceReason = Literal[
+    "ambient_mode_permitted",
+    "surface_permission_unconfigured",
+    "surface_permission_unavailable",
+    "surface_proactive_denied",
     "session_not_present",
     "explicit_proactive_opt_out",
     "active_task_mode",
@@ -187,8 +193,19 @@ class RuntimePresenceEvaluateRequest(BaseModel):
     surface: str = Field(min_length=1, max_length=64)
     runtime_session_id: str = Field(min_length=1, max_length=120)
     runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
+    surface_permission_status: SurfacePermissionStatus = "unconfigured"
+    proactive_presence_allowed: bool = False
+    ambient_listening_allowed: bool = False
     active_task_mode: bool = False
     proactive_output_suppressed: bool = False
+    @model_validator(mode="after")
+    def validate_permission(self) -> "RuntimePresenceEvaluateRequest":
+        if self.surface_permission_status != "configured" and (
+            self.proactive_presence_allowed or self.ambient_listening_allowed
+        ):
+            raise ValueError("surface_permission_inconsistent")
+        return self
+
     # False means no opt-out was projected; it does not grant proactive permission.
     explicit_proactive_opt_out: bool = False
 
@@ -203,12 +220,13 @@ class RuntimePresenceResult(BaseModel):
     state_changed: bool
     proactive_output_suppressed: bool
     required_help_allowed: bool
-    reason_codes: list[RuntimePresenceReason] = Field(min_length=1, max_length=2)
+    reason_codes: list[RuntimePresenceReason] = Field(min_length=1, max_length=3)
     policy_version: Literal["runtime-presence.v1"] = "runtime-presence.v1"
 
     @model_validator(mode="after")
     def validate_coherence(self) -> "RuntimePresenceResult":
         decision_states = {
+            "ambient_mode_permitted": "ambient_listening",
             "session_not_present": "not_present",
             "explicit_proactive_opt_out": "do_not_intrude",
             "active_task_mode": "driving_or_active_task",
@@ -220,13 +238,23 @@ class RuntimePresenceResult(BaseModel):
             "session_available": "available",
         }
         if decision_states.get(self.reason_codes[0]) != self.presence_state or (
-            len(self.reason_codes) == 2
-            and self.reason_codes[1] != "proactive_suppression_requested"
+            any(reason not in {
+                "proactive_suppression_requested", "surface_permission_unconfigured",
+                "surface_permission_unavailable", "surface_proactive_denied",
+            } for reason in self.reason_codes[1:])
+            or len(self.reason_codes) != len(set(self.reason_codes))
+            or len(set(self.reason_codes) & {
+                "surface_permission_unconfigured", "surface_permission_unavailable",
+                "surface_proactive_denied",
+            }) > 1
         ):
             raise ValueError("presence_reason_codes_inconsistent")
         suppressed = self.presence_state in {
             "not_present", "do_not_intrude", "idle", "low_attention", "driving_or_active_task",
-        } or "proactive_suppression_requested" in self.reason_codes
+        } or any(reason in self.reason_codes for reason in {
+            "proactive_suppression_requested", "surface_permission_unconfigured",
+            "surface_permission_unavailable", "surface_proactive_denied",
+        })
         if self.proactive_output_suppressed != suppressed:
             raise ValueError("presence_suppression_inconsistent")
         if self.required_help_allowed != (self.presence_state != "not_present"):
@@ -490,6 +518,9 @@ class RuntimeTimingEvaluateResponse(_RuntimeTimingScope):
 
 
 ContinuationSelectionReason = Literal[
+    "surface_context_denied",
+    "surface_permission_absent",
+    "surface_permission_unavailable",
     "candidate_set_incomplete",
     "no_candidates",
     "one_eligible_candidate",
@@ -539,12 +570,16 @@ class ContinuationSelectionRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=120)
     owner_id: str = Field(min_length=1, max_length=120)
     surface: str = Field(min_length=1, max_length=64)
+    surface_permission_status: SurfacePermissionStatus = "unconfigured"
+    conversation_context_allowed: bool = False
     candidate_set_complete: bool = Field(strict=True)
     stale_after_seconds: int = Field(ge=60, le=86400, strict=True)
     candidates: list[ContinuationCandidate] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def validate_unique_candidates(self) -> "ContinuationSelectionRequest":
+        if self.surface_permission_status != "configured" and self.conversation_context_allowed:
+            raise ValueError("surface_permission_inconsistent")
         conversation_ids = [candidate.conversation_id for candidate in self.candidates]
         if len(conversation_ids) != len(set(conversation_ids)):
             raise ValueError("duplicate_conversation_id")
