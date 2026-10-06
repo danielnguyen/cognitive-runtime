@@ -112,6 +112,14 @@ _CONTINUATION_MARKERS = (
     "more detail",
     "more details",
 )
+_INTERRUPTION_MARKERS = (
+    "hold on",
+    "wait a second",
+    "one moment",
+    "let me finish",
+    "pause there",
+    "stop there",
+)
 _VENT_MARKERS = (
     "frustrated",
     "annoyed",
@@ -339,6 +347,21 @@ def _is_continuation(text: str, body: InteractionGovernanceEvaluateRequest) -> b
     return False
 
 
+def _is_interruption(text: str, body: InteractionGovernanceEvaluateRequest) -> bool:
+    if _canonical_turn_text(text) not in _INTERRUPTION_MARKERS:
+        return False
+    if not body.runtime_session_id or not body.runtime_turn_id:
+        return False
+    snapshot = runtime_state_repository().return_after_gap_snapshot(
+        body.runtime_session_id, body.runtime_turn_id,
+    )
+    return (
+        snapshot is not None
+        and snapshot.status == "below_threshold"
+        and snapshot.prior_terminal_turn_id is not None
+    )
+
+
 def _map_intent_class(
     kind: InteractionGovernanceKind,
     text: str,
@@ -350,6 +373,8 @@ def _map_intent_class(
         return "confirmation_response"
     if _is_continuation(text, body):
         return "continuation"
+    if _is_interruption(text, body):
+        return "interruption"
     if kind == "question":
         return "information_request"
     if kind == "command":
