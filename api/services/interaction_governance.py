@@ -15,6 +15,7 @@ from services.runtime_state import (
     record_runtime_event,
     resolve_runtime_session,
     runtime_session_by_id,
+    runtime_state_repository,
     update_runtime_turn_intent_class,
 )
 
@@ -325,10 +326,17 @@ def _is_confirmation_response(
 
 
 def _is_continuation(text: str, body: InteractionGovernanceEvaluateRequest) -> bool:
-    if not _immediately_preceding_assistant_text(body):
-        return False
     canonical = _canonical_turn_text(text)
-    return canonical in _CONTINUATION_MARKERS
+    if canonical not in _CONTINUATION_MARKERS:
+        return False
+    if _immediately_preceding_assistant_text(body):
+        return True
+    if body.runtime_session_id and body.runtime_turn_id:
+        snapshot = runtime_state_repository().return_after_gap_snapshot(
+            body.runtime_session_id, body.runtime_turn_id,
+        )
+        return snapshot is not None and snapshot.status == "eligible"
+    return False
 
 
 def _map_intent_class(

@@ -106,7 +106,20 @@
           "event_payload_json": {
             "input_message_id": "input-replay",
             "request_id": "replay-turn-start",
-            "turn_status": "received"
+            "turn_status": "received",
+            "return_after_gap": {
+              "schema_version": "runtime-return-after-gap.v1",
+              "status": "not_applicable",
+              "threshold_seconds": 300,
+              "threshold_met": false,
+              "prior_thread_state": "idle",
+              "prior_thread_revision": 0,
+              "prior_last_activity_at": "<timestamp>",
+              "elapsed_seconds": 0,
+              "prior_terminal_turn_id": null,
+              "prior_continuation_state": null,
+              "reason_code": "no_completed_turn"
+            }
           },
           "created_at": "<timestamp>"
         }
@@ -239,7 +252,20 @@
             "event_payload_json": {
               "input_message_id": "input-replay",
               "request_id": "replay-turn-start",
-              "turn_status": "received"
+              "turn_status": "received",
+              "return_after_gap": {
+                "schema_version": "runtime-return-after-gap.v1",
+                "status": "not_applicable",
+                "threshold_seconds": 300,
+                "threshold_met": false,
+                "prior_thread_state": "idle",
+                "prior_thread_revision": 0,
+                "prior_last_activity_at": "<timestamp>",
+                "elapsed_seconds": 0,
+                "prior_terminal_turn_id": null,
+                "prior_continuation_state": null,
+                "reason_code": "no_completed_turn"
+              }
             },
             "created_at": "<timestamp>"
           },

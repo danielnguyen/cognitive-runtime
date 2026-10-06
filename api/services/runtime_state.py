@@ -32,6 +32,7 @@ from models import (
     RuntimePresenceEvaluateRequest,
     RuntimePresenceEvaluateResponse,
     RuntimePresenceResult,
+    RuntimeReturnAfterGap,
     RuntimeSession,
     RuntimeSessionDiagnosticsResponse,
     RuntimeState,
@@ -237,6 +238,142 @@ class RuntimeStateRepository:
             )
             return self._thread_from_row(conn, row)
 
+    def _return_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        thread: sqlite3.Row,
+        admitted_at: str,
+    ) -> dict[str, Any]:
+        inspection = self._inspect_continuation_thread(
+            conn,
+            owner_id=thread["owner_id"],
+            conversation_id=thread["conversation_id"],
+        )
+        now = datetime.fromisoformat(admitted_at)
+        prior_time = inspection["last_activity_at"]
+        if (
+            inspection["state"] != "idle"
+            or prior_time is None
+            or self._continuation_time_is_future(prior_time, now)
+        ):
+            raise RuntimeError("runtime_thread_unavailable")
+        prior = conn.execute(
+            """
+            SELECT t.* FROM conversation_runtime_turns t
+            JOIN conversation_runtime_sessions s USING(runtime_session_id)
+            WHERE s.owner_id = ? AND s.conversation_id = ?
+              AND t.turn_status = 'completed'
+            ORDER BY t.completed_at DESC, t.id DESC LIMIT 1;
+        """,
+            (thread["owner_id"], thread["conversation_id"]),
+        ).fetchone()
+        completed = prior is not None and prior["turn_status"] == "completed"
+        elapsed = max(0, int((now - prior_time).total_seconds()))
+        state = prior["continuation_state"] if completed else None
+        if state not in {
+            "none",
+            "clarification_required",
+            "waiting",
+            "deferred_expansion",
+            "yielded_to_user",
+            "resuming_previous_thread",
+            "closed",
+        }:
+            state = None
+        status = (
+            "not_applicable"
+            if not completed
+            else ("eligible" if elapsed >= 300 else "below_threshold")
+        )
+        return RuntimeReturnAfterGap(
+            status=status,
+            threshold_met=status == "eligible",
+            prior_thread_state="idle",
+            prior_thread_revision=thread["revision"],
+            prior_last_activity_at=prior_time.isoformat(),
+            elapsed_seconds=elapsed,
+            prior_terminal_turn_id=prior["runtime_turn_id"] if completed else None,
+            prior_continuation_state=state,
+            reason_code={
+                "eligible": "return_gap_elapsed",
+                "below_threshold": "return_gap_below_threshold",
+                "not_applicable": "no_completed_turn",
+            }[status],
+        ).model_dump(mode="json")
+
+    def _turn_return_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        session: RuntimeSession,
+        runtime_turn_id: str | None,
+    ) -> RuntimeReturnAfterGap | None:
+        if runtime_turn_id is None:
+            return None
+        event = conn.execute(
+            """
+            SELECT e.event_payload_json, t.created_at AS admission_at
+            FROM conversation_runtime_events e
+            JOIN conversation_runtime_turns t ON t.runtime_turn_id = e.runtime_turn_id
+            WHERE e.runtime_session_id = ? AND e.runtime_turn_id = ?
+              AND e.event_type = 'turn_started'
+            ORDER BY e.id DESC LIMIT 1;
+        """,
+            (session.runtime_session_id, runtime_turn_id),
+        ).fetchone()
+        try:
+            payload = json.loads(event["event_payload_json"]) if event else {}
+            if not isinstance(payload, dict):
+                return None
+            material = payload.get("return_after_gap")
+            if not isinstance(material, dict) or set(material) != set(
+                RuntimeReturnAfterGap.model_fields
+            ):
+                return None
+            snapshot = RuntimeReturnAfterGap.model_validate(material)
+            admitted_at = datetime.fromisoformat(event["admission_at"])
+            prior_at = datetime.fromisoformat(snapshot.prior_last_activity_at)
+            if (
+                admitted_at.tzinfo is None
+                or self._continuation_time_is_future(prior_at, admitted_at)
+                or snapshot.elapsed_seconds != max(0, int((admitted_at - prior_at).total_seconds()))
+            ):
+                return None
+            if snapshot.prior_terminal_turn_id:
+                prior = conn.execute(
+                    """
+                    SELECT t.turn_status FROM conversation_runtime_turns t
+                    JOIN conversation_runtime_sessions s USING(runtime_session_id)
+                    WHERE t.runtime_turn_id = ? AND s.owner_id = ? AND s.conversation_id = ?;
+                """,
+                    (snapshot.prior_terminal_turn_id, session.owner_id, session.conversation_id),
+                ).fetchone()
+                if (
+                    prior is None
+                    or prior["turn_status"] != "completed"
+                    or snapshot.prior_terminal_turn_id == runtime_turn_id
+                ):
+                    return None
+            return snapshot
+        except (TypeError, ValueError, ValidationError):
+            return None
+
+    def return_after_gap_snapshot(
+        self,
+        runtime_session_id: str,
+        runtime_turn_id: str,
+    ) -> RuntimeReturnAfterGap | None:
+        with self._connect() as conn:
+            session = self._session_by_id(conn, runtime_session_id)
+            turn = self._turn_by_id(conn, runtime_turn_id)
+            if (
+                session is None
+                or turn is None
+                or turn.runtime_session_id != runtime_session_id
+                or turn.turn_status in _TERMINAL_TURN_STATUSES
+            ):
+                return None
+            self._validate_current_turn(conn, session=session, turn=turn)
+            return self._turn_return_snapshot(conn, session, runtime_turn_id)
     def evaluate_presence(
         self, request: RuntimePresenceEvaluateRequest,
     ) -> RuntimePresenceEvaluateResponse:
@@ -275,6 +412,7 @@ class RuntimeStateRepository:
                 # the existing current-turn validator cannot create or repair it here.
                 self._validate_current_turn(conn, session=session, turn=turn)
 
+            return_snapshot = self._turn_return_snapshot(conn, session, request.runtime_turn_id)
             active_mode = (session.active_mode or "").strip().lower().replace("-", "_")
             if session.status in {"closing", "closed"}:
                 state, reason = "not_present", "session_not_present"
@@ -288,6 +426,8 @@ class RuntimeStateRepository:
                 state, reason = "low_attention", "session_paused"
             elif session.attention_state == "paused":
                 state, reason = "low_attention", "attention_paused"
+            elif return_snapshot is not None and return_snapshot.status == "eligible":
+                state, reason = "returning_after_gap", "return_gap_elapsed"
             elif (
                 thread.state == "active"
                 and thread.active_runtime_session_id == session.runtime_session_id
@@ -300,6 +440,8 @@ class RuntimeStateRepository:
                 and thread.state != "active"
             ):
                 state, reason = "ambient_listening", "ambient_mode_permitted"
+            elif session.attention_state == "idle" and thread.state != "active":
+                state, reason = "idle", "attention_idle"
             elif session.status == "idle":
                 state, reason = "idle", "session_idle"
             else:
@@ -471,6 +613,7 @@ class RuntimeStateRepository:
             reason = self._timing_reason(
                 request, turn=turn, presence_state=presence_state,
                 clarifying_question_allowed=clarifying_question_allowed,
+                return_snapshot=self._turn_return_snapshot(conn, session, turn.runtime_turn_id),
             )
             policy = RUNTIME_TIMING_REASON_POLICIES[reason]
             continuation, expansion, overlay = RUNTIME_TIMING_PROJECTIONS[policy]
@@ -525,6 +668,7 @@ class RuntimeStateRepository:
     def _timing_reason(
         request: RuntimeTimingEvaluateRequest, *, turn: RuntimeTurn, presence_state: str | None,
         clarifying_question_allowed: bool | None,
+        return_snapshot: RuntimeReturnAfterGap | None = None,
     ) -> str:
         if request.dependency_state == "blocking":
             return "dependency_blocking"
@@ -552,6 +696,10 @@ class RuntimeStateRepository:
                 return "presence_low_attention"
             if presence_state == "driving_or_active_task":
                 return "presence_active_task"
+        if (presence_state == "returning_after_gap" and turn.intent_class == "continuation"
+                and return_snapshot is not None and return_snapshot.status == "eligible"
+                and return_snapshot.prior_continuation_state == "deferred_expansion"):
+            return "return_deferred_continuation"
         if request.continuation_timing_policy == "answer_now":
             return "continuation_answer_now"
         return "ordinary_ready"
@@ -1536,6 +1684,8 @@ class RuntimeStateRepository:
             ):
                 raise RuntimeError("runtime_thread_revision_conflict")
 
+            created_at = _now()
+            return_snapshot = self._return_snapshot(conn, thread, created_at)
             session = self._resolve_session_in_transaction(
                 conn,
                 request_id=request_id,
@@ -1545,7 +1695,17 @@ class RuntimeStateRepository:
                 surface_session_id=surface_session_id,
                 active_mode=active_mode,
             )
-            created_at = _now()
+            idle_attention_updates = {}
+            if session.attention_state == "idle":
+                focus_row = conn.execute(
+                    "SELECT attention_focus_json FROM conversation_runtime_sessions "
+                    "WHERE runtime_session_id = ?;", (session.runtime_session_id,),
+                ).fetchone()
+                focus = _load_json(focus_row["attention_focus_json"], None)
+                idle_attention_updates = {
+                    "attention_state": "active",
+                    "attention_focus_json": _json({**focus, "status": "active"} if focus else None),
+                }
             runtime_turn_id = _turn_id(session.runtime_session_id, request_id, created_at)
             conn.execute(
                 """
@@ -1577,6 +1737,7 @@ class RuntimeStateRepository:
                     "last_activity_at": created_at,
                     "updated_at": created_at,
                     "surface_session_id": surface_session_id,
+                    **idle_attention_updates,
                 },
             )
             event = self._record_event(
@@ -1588,6 +1749,7 @@ class RuntimeStateRepository:
                     "request_id": request_id,
                     "turn_status": "received",
                     "input_message_id": input_message_id,
+                    "return_after_gap": return_snapshot,
                 },
             )
             thread_update = conn.execute(

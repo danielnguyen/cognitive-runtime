@@ -46,6 +46,7 @@ _TIMESTAMP_FIELDS = {
     "completed_at",
     "created_at",
     "last_activity_at",
+    "prior_last_activity_at",
     "started_at",
     "updated_at",
 }

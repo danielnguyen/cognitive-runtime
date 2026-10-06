@@ -3879,12 +3879,13 @@ def test_reservation_actions_reject_a_drifted_thread_invariant(
 
 
 def test_retirement_reservation_and_turn_admission_serialize_across_connections(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ):
     db_path = tmp_path / "retirement-concurrent.sqlite3"
     owner_id = "owner-retirement-concurrent"
     conversation_id = "conversation-retirement-concurrent"
     cutoff = datetime(2026, 12, 1, tzinfo=UTC)
+    monkeypatch.setattr("services.runtime_state._now", lambda: cutoff.isoformat())
     repositories = [RuntimeStateRepository(db_path), RuntimeStateRepository(db_path)]
     repositories[0].resolve_thread(owner_id=owner_id, conversation_id=conversation_id)
     _set_thread_activity(
@@ -5639,3 +5640,389 @@ def test_presence_result_rejects_contradictory_permission_reasons():
             reason_codes=["thread_active", "surface_permission_unavailable",
                           "surface_proactive_denied"],
         )
+
+
+_RETURN_NOW = datetime(2026, 1, 2, tzinfo=UTC)
+
+
+def _return_turn(
+    tmp_path,
+    monkeypatch,
+    *,
+    gap=301,
+    terminal="completed",
+    prior_state="none",
+    surface="web",
+    attention=None,
+):
+    import services.runtime_state as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_now", lambda: _RETURN_NOW.isoformat())
+    repo = RuntimeStateRepository(_use_database(tmp_path))
+    session, prior, _ = repo.start_turn(
+        request_id="prior",
+        owner_id="owner",
+        conversation_id="return-thread",
+        surface="telegram",
+    )
+    repo.complete_turn(
+        request_id="prior",
+        runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=prior.runtime_turn_id,
+        turn_status=terminal,
+        continuation_state=prior_state,
+    )
+    if attention:
+        from models import RuntimeStateUpdate
+
+        repo.resolve_session(
+            request_id="surface", owner_id="owner", conversation_id="return-thread", surface=surface
+        )
+        repo.update_state(
+            owner_id="owner",
+            conversation_id="return-thread",
+            surface=surface,
+            updates=RuntimeStateUpdate(attention_focus={"status": attention}),
+        )
+    with repo._connect() as conn:
+        conn.execute(
+            "UPDATE conversation_runtime_threads SET last_activity_at = ?",
+            ((_RETURN_NOW - timedelta(seconds=gap)).isoformat(),),
+        )
+    scope = dict(
+        request_id="current", owner_id="owner", conversation_id="return-thread", surface=surface
+    )
+    session, turn, event = repo.start_turn(
+        **scope, intent_class="information_request", restraint_policy="answer_normally"
+    )
+    return repo, scope, session, turn, event
+
+
+@pytest.mark.parametrize(
+    "gap,status", [(299, "below_threshold"), (300, "eligible"), (301, "eligible")]
+)
+def test_return_snapshot_boundary_replay_and_restart(tmp_path, monkeypatch, gap, status):
+    import services.runtime_state as runtime_module
+
+    repo, scope, session, turn, event = _return_turn(tmp_path, monkeypatch, gap=gap)
+    snapshot = event.event_payload_json["return_after_gap"]
+    assert snapshot["status"] == status
+    assert snapshot["threshold_met"] == (gap >= 300)
+    assert snapshot["elapsed_seconds"] == gap
+    assert snapshot["prior_thread_revision"] == 2
+    assert snapshot["prior_thread_state"] == "idle"
+    monkeypatch.setattr(
+        runtime_module, "_now", lambda: (_RETURN_NOW + timedelta(hours=1)).isoformat()
+    )
+    restarted = RuntimeStateRepository(repo.db_path)
+    replay = restarted.start_turn(**scope)
+    assert replay[0].runtime_session_id == session.runtime_session_id
+    assert replay[1].runtime_turn_id == turn.runtime_turn_id
+    assert replay[2] == event
+    starts = [
+        e
+        for e in restarted.list_events_for_tests(session.runtime_session_id)
+        if e.runtime_turn_id == turn.runtime_turn_id and e.event_type == "turn_started"
+    ]
+    assert starts == [event]
+    assert (
+        restarted.return_after_gap_snapshot(
+            session.runtime_session_id, turn.runtime_turn_id
+        ).model_dump()
+        == snapshot
+    )
+
+
+@pytest.mark.parametrize(
+    "terminal,prior_state,expected",
+    [
+        ("completed", "deferred_expansion", "deferred_expansion"),
+        ("completed", "closed", "closed"),
+        ("completed", "INVALID", None),
+        ("abandoned", "deferred_expansion", None),
+    ],
+)
+def test_return_prior_state_is_bounded_and_abandoned_not_authorizing(
+    tmp_path,
+    monkeypatch,
+    terminal,
+    prior_state,
+    expected,
+):
+    repo, scope, session, turn, event = _return_turn(
+        tmp_path,
+        monkeypatch,
+        terminal=terminal,
+        prior_state=prior_state,
+    )
+    snapshot = event.event_payload_json["return_after_gap"]
+    assert snapshot["prior_continuation_state"] == expected
+    assert snapshot["status"] == ("eligible" if terminal == "completed" else "not_applicable")
+    response = repo.evaluate_presence(
+        RuntimePresenceEvaluateRequest(
+            **scope,
+            runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id,
+        )
+    )
+    assert response.result.presence_state == (
+        "returning_after_gap" if terminal == "completed" else "active_conversation"
+    )
+
+
+def test_fresh_return_snapshot_is_not_applicable(tmp_path):
+    repo = RuntimeStateRepository(_use_database(tmp_path))
+    session, turn, event = repo.start_turn(
+        request_id="fresh",
+        owner_id="owner",
+        conversation_id="fresh",
+        surface="web",
+    )
+    snapshot = event.event_payload_json["return_after_gap"]
+    assert snapshot["status"] == "not_applicable"
+    assert snapshot["prior_terminal_turn_id"] is None
+    assert snapshot["threshold_met"] is False
+    assert set(snapshot) == {
+        "schema_version",
+        "status",
+        "threshold_seconds",
+        "threshold_met",
+        "prior_thread_state",
+        "prior_thread_revision",
+        "prior_last_activity_at",
+        "elapsed_seconds",
+        "prior_terminal_turn_id",
+        "prior_continuation_state",
+        "reason_code",
+    }
+
+
+@pytest.mark.parametrize("corruption", ["invalid", "naive", "future", "ownership", "revision"])
+def test_return_invalid_admission_never_writes_snapshot(tmp_path, monkeypatch, corruption):
+    repo, scope, session, turn, _ = _return_turn(tmp_path, monkeypatch)
+    repo.complete_turn(
+        request_id="current",
+        runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id,
+        turn_status="completed",
+    )
+    with repo._connect() as conn:
+        if corruption in {"invalid", "naive", "future"}:
+            stamp = {
+                "invalid": "bad",
+                "naive": "2026-01-01T00:00:00",
+                "future": (_RETURN_NOW + timedelta(seconds=301)).isoformat(),
+            }[corruption]
+            conn.execute("UPDATE conversation_runtime_threads SET last_activity_at = ?", (stamp,))
+        elif corruption == "ownership":
+            conn.execute("UPDATE conversation_runtime_threads SET active_surface = 'orphan'")
+    before = _runtime_rows(repo.db_path)
+    with pytest.raises(RuntimeError):
+        repo.start_turn(
+            **{**scope, "request_id": "rejected"},
+            expected_thread_revision=0 if corruption == "revision" else None,
+        )
+    assert _runtime_rows(repo.db_path) == before
+
+
+@pytest.mark.parametrize(
+    "attention,opt_out,active_task,state",
+    [
+        (None, False, False, "returning_after_gap"),
+        (None, True, False, "do_not_intrude"),
+        (None, False, True, "driving_or_active_task"),
+        ("paused", False, False, "low_attention"),
+        ("idle", False, False, "returning_after_gap"),
+    ],
+)
+def test_return_presence_precedence_and_idle_admission(
+    tmp_path,
+    monkeypatch,
+    attention,
+    opt_out,
+    active_task,
+    state,
+):
+    repo, scope, session, turn, event = _return_turn(tmp_path, monkeypatch, attention=attention)
+    if attention == "idle":
+        assert session.attention_state == "active"
+        assert repo.session_by_id(session.runtime_session_id).attention_state == "active"
+    response = repo.evaluate_presence(
+        RuntimePresenceEvaluateRequest(
+            **scope,
+            runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id,
+            explicit_proactive_opt_out=opt_out,
+            active_task_mode=active_task,
+        )
+    )
+    assert response.result.presence_state == state
+    assert response.result.required_help_allowed is True
+    assert response.result.proactive_output_suppressed is True
+    # No-turn lookup must not borrow the current turn's return snapshot.
+    assert (
+        repo.evaluate_presence(
+            RuntimePresenceEvaluateRequest(
+                **scope,
+                runtime_session_id=session.runtime_session_id,
+            )
+        ).result.presence_state
+        != "returning_after_gap"
+    )
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed", "wrong_turn", "wrong_prior"])
+def test_return_presence_cannot_use_bad_or_other_turn_snapshot(tmp_path, monkeypatch, fault):
+    repo, scope, session, turn, event = _return_turn(tmp_path, monkeypatch)
+    payload = event.event_payload_json.copy()
+    if fault == "missing":
+        payload.pop("return_after_gap")
+    elif fault == "malformed":
+        payload["return_after_gap"] = {"status": "eligible"}
+    elif fault == "wrong_prior":
+        payload["return_after_gap"]["prior_terminal_turn_id"] = "rtturn_0000000000000000"
+    with repo._connect() as conn:
+        conn.execute(
+            "UPDATE conversation_runtime_events SET event_payload_json = ?, "
+            "runtime_turn_id = ? WHERE event_id = ?",
+            (
+                json.dumps(payload),
+                "other-turn" if fault == "wrong_turn" else turn.runtime_turn_id,
+                event.event_id,
+            ),
+        )
+    assert (
+        repo.evaluate_presence(
+            RuntimePresenceEvaluateRequest(
+                **scope,
+                runtime_session_id=session.runtime_session_id,
+                runtime_turn_id=turn.runtime_turn_id,
+            )
+        ).result.presence_state
+        == "active_conversation"
+    )
+
+
+def test_explicit_idle_is_no_turn_presence_and_current_help_leaves_idle(tmp_path, monkeypatch):
+    from models import RuntimeStateUpdate
+
+    repo, scope, session, turn, _ = _return_turn(tmp_path, monkeypatch, gap=299, surface="telegram")
+    repo.complete_turn(
+        request_id="current",
+        runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id,
+        turn_status="completed",
+    )
+    repo.update_state(
+        owner_id="owner",
+        conversation_id="return-thread",
+        surface="telegram",
+        updates=RuntimeStateUpdate(attention_focus={"status": "idle"}),
+    )
+    request = RuntimePresenceEvaluateRequest(**scope, runtime_session_id=session.runtime_session_id)
+    result = repo.evaluate_presence(request).result
+    assert result.presence_state == "idle"
+    assert result.reason_codes[0] == "attention_idle"
+    assert result.proactive_output_suppressed and result.required_help_allowed
+    session, turn, _ = repo.start_turn(**{**scope, "request_id": "help"})
+    assert (
+        repo.evaluate_presence(
+            request.model_copy(
+                update={
+                    "runtime_turn_id": turn.runtime_turn_id,
+                }
+            )
+        ).result.presence_state
+        == "active_conversation"
+    )
+
+
+@pytest.mark.parametrize(
+    "intent,prior,gap,dependency,restraint,policy",
+    [
+        (
+            "continuation",
+            "deferred_expansion",
+            301,
+            "ready",
+            "answer_normally",
+            "resume_previous_thread",
+        ),
+        (
+            "information_request",
+            "deferred_expansion",
+            301,
+            "ready",
+            "answer_normally",
+            "answer_now",
+        ),
+        ("continuation", "none", 301, "ready", "answer_normally", "answer_now"),
+        ("continuation", "INVALID", 301, "ready", "answer_normally", "answer_now"),
+        ("continuation", "deferred_expansion", 299, "ready", "answer_normally", "answer_now"),
+        ("continuation", "deferred_expansion", 301, "blocking", "answer_normally", "close_turn"),
+        ("continuation", "deferred_expansion", 301, "ready", "defer_expansion", "defer_expansion"),
+        (
+            "continuation",
+            "deferred_expansion",
+            301,
+            "ready",
+            "ask_clarifying_question",
+            "ask_clarifying_question",
+        ),
+    ],
+)
+def test_return_timing_requires_exact_triple_and_preserves_stricter_rules(
+    tmp_path,
+    monkeypatch,
+    intent,
+    prior,
+    gap,
+    dependency,
+    restraint,
+    policy,
+):
+    repo, scope, session, turn, _ = _return_turn(tmp_path, monkeypatch, gap=gap, prior_state=prior)
+    repo.update_turn(
+        request_id="current",
+        runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id,
+        turn_status="retrieving",
+        restraint_policy=restraint,
+    )
+    repo.update_turn_intent_class(
+        runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id,
+        intent_class=intent,
+    )
+    repo.evaluate_presence(
+        RuntimePresenceEvaluateRequest(
+            **scope,
+            runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id,
+        )
+    )
+    result = repo.evaluate_timing(
+        RuntimeTimingEvaluateRequest(
+            **scope,
+            runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id,
+            spoken_output=False,
+            active_task_mode=False,
+            requested_detail="unspecified",
+            dependency_state=dependency,
+            latency_budget_class="ordinary_text",
+        )
+    ).result
+    assert result.timing_policy == policy
+    if policy == "resume_previous_thread":
+        assert result.reason_codes == ["return_deferred_continuation"]
+    assert (
+        len(
+            [
+                event
+                for event in repo.list_events_for_tests(session.runtime_session_id)
+                if event.event_type == "timing_evaluated"
+            ]
+        )
+        == 1
+    )

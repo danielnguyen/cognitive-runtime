@@ -1215,3 +1215,56 @@ async def test_governance_event_projects_exact_clarification_permission(text, ki
     assert len(events) == 1
     assert events[0]["event_payload_json"]["clarifying_question_allowed"] is allowed
     assert "current_user_text" not in events[0]["event_payload_json"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", ["continue", "go on", "keep going", "tell me more",
+                                    "more detail", "more details"])
+@pytest.mark.parametrize("case,expected", [("return", "continuation"),
+                                          ("below", "low_confidence_unclear"),
+                                          ("abandoned", "low_confidence_unclear"),
+                                          ("malformed", "low_confidence_unclear"),
+                                          ("wrong_turn", "low_confidence_unclear")])
+async def test_continuation_markers_use_only_exact_valid_completed_return(
+    tmp_path, monkeypatch, marker, case, expected,
+):
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    import services.runtime_state as runtime_module
+    from services.runtime_state import clear_states_for_tests
+
+    clear_states_for_tests(db_path=tmp_path / "return-governance.sqlite3")
+    now = datetime(2026, 1, 2, tzinfo=UTC)
+    monkeypatch.setattr(runtime_module, "_now", lambda: now.isoformat())
+    repo = runtime_state_repository()
+    scope = {"owner_id": "owner", "conversation_id": "return-governance", "surface": "web"}
+    session, prior, _ = repo.start_turn(request_id="prior", **scope)
+    repo.complete_turn(request_id="prior", runtime_session_id=session.runtime_session_id,
+                       runtime_turn_id=prior.runtime_turn_id,
+                       turn_status="abandoned" if case == "abandoned" else "completed")
+    with repo._connect() as conn:
+        conn.execute("UPDATE conversation_runtime_threads SET last_activity_at = ?",
+                     ((now - timedelta(seconds=299 if case == "below" else 301)).isoformat(),))
+    session, turn, event = repo.start_turn(request_id="current", **scope)
+    if case in {"malformed", "wrong_turn"}:
+        payload = event.event_payload_json.copy()
+        if case == "malformed":
+            payload["return_after_gap"]["threshold_met"] = "true"
+        with repo._connect() as conn:
+            conn.execute("UPDATE conversation_runtime_events SET event_payload_json = ?, "
+                         "runtime_turn_id = ? WHERE event_id = ?", (json.dumps(payload),
+                         "wrong-turn" if case == "wrong_turn" else turn.runtime_turn_id,
+                         event.event_id))
+    response = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "request_id": "current", "runtime_session_id": session.runtime_session_id,
+        "runtime_turn_id": turn.runtime_turn_id, "current_user_text": marker,
+    })
+    assert response.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == expected
+    response = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "request_id": "current", "runtime_session_id": session.runtime_session_id,
+        "runtime_turn_id": turn.runtime_turn_id, "current_user_text": "What is 2+2?",
+    })
+    assert response.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "information_request"
