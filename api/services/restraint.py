@@ -10,11 +10,13 @@ from models import (
     RestraintPolicy,
     RestraintResult,
 )
+from pydantic import ValidationError
 from services.runtime_state import (
     record_runtime_event,
     resolve_runtime_session,
     runtime_session_by_id,
     update_runtime_turn_restraint_policy,
+    validate_runtime_turn_session,
 )
 
 _QUESTION_WORDS = ("what", "why", "how", "when", "where", "who", "which", "should")
@@ -125,7 +127,10 @@ def _has_specific_debug_context(raw_text: str, text: str) -> bool:
     return (
         _contains_any(text, _TENSE_DEBUG_MARKERS)
         and len(text.split()) >= 5
-        and ("prod" in text or "production" in text or "server" in text or _ALL_CAPS_TOKEN.search(raw_text))
+        and (
+            "prod" in text or "production" in text or "server" in text
+            or _ALL_CAPS_TOKEN.search(raw_text)
+        )
     )
 
 
@@ -202,11 +207,23 @@ def evaluate_restraint(body: RestraintEvaluateRequest) -> RestraintEvaluateRespo
         )
         runtime_session_id = session.runtime_session_id
 
+    continuation_intent = False
+    if body.runtime_turn_id:
+        try:
+            turn = validate_runtime_turn_session(
+                runtime_session_id=runtime_session_id, runtime_turn_id=body.runtime_turn_id,
+            )
+        except ValidationError:
+            raise ValueError("runtime_turn_not_current") from None
+        if turn.turn_status in {"completed", "abandoned"}:
+            raise ValueError("runtime_turn_not_current")
+        continuation_intent = turn.intent_class == "continuation"
+
     raw_text = _latest_user_text(body)
     text = _normalize_text(raw_text)
     interaction_kind = body.interaction_kind or _infer_interaction_kind(raw_text, text)
 
-    retrieval_requested = _contains_any(text, _RETRIEVAL_REQUEST_MARKERS)
+    retrieval_requested = _contains_any(text, _RETRIEVAL_REQUEST_MARKERS) or continuation_intent
     personalization_requested = _contains_any(text, _PERSONALIZATION_REQUEST_MARKERS)
     proactive_requested = _contains_any(text, _PROACTIVE_REQUEST_MARKERS)
     required_guidance = _contains_any(text, _GUIDANCE_MARKERS)
@@ -216,6 +233,8 @@ def evaluate_restraint(body: RestraintEvaluateRequest) -> RestraintEvaluateRespo
     proactive_output_suppressed = not proactive_requested
 
     reason_summary: list[str] = []
+    if continuation_intent:
+        reason_summary.append("continuation_context_requested")
     if retrieval_suppressed:
         reason_summary.append("retrieval_not_requested")
     if personalization_suppressed:
@@ -225,7 +244,7 @@ def evaluate_restraint(body: RestraintEvaluateRequest) -> RestraintEvaluateRespo
     if required_guidance:
         reason_summary.append("required_guidance_preserved")
 
-    if interaction_kind == "ambiguous":
+    if interaction_kind == "ambiguous" and not continuation_intent:
         result = _result(
             request_id=body.request_id,
             restraint_policy="ask_clarifying_question",
@@ -335,10 +354,14 @@ def evaluate_restraint(body: RestraintEvaluateRequest) -> RestraintEvaluateRespo
             request_id=body.request_id,
             restraint_policy="answer_normally",
             domains=domains,
-            reason="normal_response_with_restraint",
+            reason=("continuation_intent_resolves_ambiguity"
+                    if continuation_intent and interaction_kind == "ambiguous"
+                    else "normal_response_with_restraint"),
             prompt_overlay="",
             confidence=0.74 if text else 0.5,
-            reason_summary=["normal_response_with_restraint", *reason_summary],
+            reason_summary=[("continuation_intent_resolves_ambiguity"
+                             if continuation_intent and interaction_kind == "ambiguous"
+                             else "normal_response_with_restraint"), *reason_summary],
             retrieval_suppressed=retrieval_suppressed,
             personalization_suppressed=personalization_suppressed,
             proactive_output_suppressed=proactive_output_suppressed,

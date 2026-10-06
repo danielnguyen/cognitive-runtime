@@ -13,7 +13,7 @@ from pydantic import (
     model_validator,
 )
 
-AttentionStatus = Literal["active", "paused", "resolved"]
+AttentionStatus = Literal["active", "paused", "resolved", "idle"]
 BoundedLabel = Annotated[str, Field(min_length=1, max_length=64)]
 BoundedSurface = Annotated[str, Field(max_length=64)]
 BoundedTraceRef = Annotated[str, Field(min_length=1, max_length=120)]
@@ -153,6 +153,60 @@ RuntimeEventType = Literal[
 ]
 RuntimeThreadState = Literal["idle", "active", "contended", "unavailable"]
 
+class RuntimeReturnAfterGap(BaseModel):
+    """Immutable admission provenance, never conversation selection or content authority."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: Literal["runtime-return-after-gap.v1"] = "runtime-return-after-gap.v1"
+    status: Literal["eligible", "below_threshold", "not_applicable"]
+    threshold_seconds: Literal[300] = 300
+    threshold_met: bool
+    prior_thread_state: Literal["idle"]
+    prior_thread_revision: int = Field(ge=0)
+    prior_last_activity_at: str = Field(max_length=64)
+    elapsed_seconds: int = Field(ge=0)
+    prior_terminal_turn_id: str | None = Field(default=None, pattern=r"^rtturn_[0-9a-f]{16}$")
+    prior_continuation_state: (
+        Literal[
+            "none",
+            "clarification_required",
+            "waiting",
+            "deferred_expansion",
+            "yielded_to_user",
+            "resuming_previous_thread",
+            "closed",
+        ]
+        | None
+    ) = None
+    reason_code: Literal["return_gap_elapsed", "return_gap_below_threshold", "no_completed_turn"]
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> "RuntimeReturnAfterGap":
+        value = datetime.fromisoformat(self.prior_last_activity_at)
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("return_timestamp_invalid")
+        expected = (
+            "not_applicable"
+            if self.prior_terminal_turn_id is None
+            else "eligible"
+            if self.elapsed_seconds >= 300
+            else "below_threshold"
+        )
+        reasons = {
+            "eligible": "return_gap_elapsed",
+            "below_threshold": "return_gap_below_threshold",
+            "not_applicable": "no_completed_turn",
+        }
+        if (
+            self.status != expected
+            or self.threshold_met != (expected == "eligible")
+            or self.reason_code != reasons[expected]
+            or (self.prior_terminal_turn_id is None and self.prior_continuation_state is not None)
+        ):
+            raise ValueError("return_snapshot_inconsistent")
+        return self
+
+
 RuntimePresenceState = Literal[
     "not_present",
     "available",
@@ -167,6 +221,8 @@ RuntimePresenceState = Literal[
 SurfacePermissionStatus = Literal["configured", "unconfigured", "unavailable"]
 
 RuntimePresenceReason = Literal[
+    "return_gap_elapsed",
+    "attention_idle",
     "ambient_mode_permitted",
     "surface_permission_unconfigured",
     "surface_permission_unavailable",
@@ -226,6 +282,8 @@ class RuntimePresenceResult(BaseModel):
     @model_validator(mode="after")
     def validate_coherence(self) -> "RuntimePresenceResult":
         decision_states = {
+            "return_gap_elapsed": "returning_after_gap",
+            "attention_idle": "idle",
             "ambient_mode_permitted": "ambient_listening",
             "session_not_present": "not_present",
             "explicit_proactive_opt_out": "do_not_intrude",
@@ -395,6 +453,7 @@ RuntimeTimingReason = Literal[
     "restraint_clarification", "unclear_intent_clarification", "spoken_action_acknowledgment",
     "restraint_defer_expansion", "presence_low_attention", "presence_active_task",
     "continuation_answer_now", "ordinary_ready", "dependency_degraded",
+    "return_deferred_continuation",
 ]
 
 # Local regression metadata only; these values never grant authority or set deadlines.
@@ -441,6 +500,7 @@ RUNTIME_TIMING_REASON_POLICIES = {
     "presence_active_task": "defer_expansion",
     "continuation_answer_now": "answer_now",
     "ordinary_ready": "answer_now",
+    "return_deferred_continuation": "resume_previous_thread",
 }
 
 
