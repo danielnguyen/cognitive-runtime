@@ -341,7 +341,8 @@ class RuntimeStateRepository:
             if snapshot.prior_terminal_turn_id:
                 prior = conn.execute(
                     """
-                    SELECT t.turn_status FROM conversation_runtime_turns t
+                    SELECT t.turn_status, t.continuation_state, t.completed_at
+                    FROM conversation_runtime_turns t
                     JOIN conversation_runtime_sessions s USING(runtime_session_id)
                     WHERE t.runtime_turn_id = ? AND s.owner_id = ? AND s.conversation_id = ?;
                 """,
@@ -352,6 +353,36 @@ class RuntimeStateRepository:
                     or prior["turn_status"] != "completed"
                     or snapshot.prior_terminal_turn_id == runtime_turn_id
                 ):
+                    return None
+                actual_state = prior["continuation_state"]
+                if actual_state not in {
+                    "none", "clarification_required", "waiting", "deferred_expansion",
+                    "yielded_to_user", "resuming_previous_thread", "closed",
+                }:
+                    actual_state = None
+                if snapshot.prior_continuation_state != actual_state:
+                    return None
+                completed_at = datetime.fromisoformat(prior["completed_at"])
+                if (completed_at.tzinfo is None or completed_at.utcoffset() is None
+                        or completed_at > admitted_at):
+                    return None
+                candidates = conn.execute(
+                    """
+                    SELECT t.runtime_turn_id, t.completed_at FROM conversation_runtime_turns t
+                    JOIN conversation_runtime_sessions s USING(runtime_session_id)
+                    WHERE s.owner_id = ? AND s.conversation_id = ? AND t.turn_status = 'completed'
+                    ORDER BY t.completed_at DESC, t.id DESC;
+                    """, (session.owner_id, session.conversation_id),
+                )
+                latest_prior_id = None
+                for candidate in candidates:
+                    terminal_at = datetime.fromisoformat(candidate["completed_at"])
+                    if terminal_at.tzinfo is None or terminal_at.utcoffset() is None:
+                        return None
+                    if terminal_at <= admitted_at:
+                        latest_prior_id = candidate["runtime_turn_id"]
+                        break
+                if latest_prior_id != snapshot.prior_terminal_turn_id:
                     return None
             return snapshot
         except (TypeError, ValueError, ValidationError):

@@ -6026,3 +6026,175 @@ def test_return_timing_requires_exact_triple_and_preserves_stricter_rules(
         )
         == 1
     )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "snapshot_state",
+        "actual_state",
+        "unknown_actual_state",
+        "other_completed_turn",
+        "missing_completed_at",
+        "malformed_completed_at",
+        "naive_completed_at",
+        "future_completed_at",
+    ],
+)
+def test_return_snapshot_semantic_corruption_cannot_create_resume_authority(
+    tmp_path,
+    monkeypatch,
+    fault,
+):
+    from models import InteractionGovernanceEvaluateRequest, RestraintEvaluateRequest
+    from services.interaction_governance import evaluate_interaction_governance
+    from services.restraint import evaluate_restraint
+
+    repo, scope, session, turn, event = _return_turn(
+        tmp_path,
+        monkeypatch,
+        prior_state="none" if fault == "snapshot_state" else "deferred_expansion",
+    )
+    prior_id = event.event_payload_json["return_after_gap"]["prior_terminal_turn_id"]
+    if fault == "other_completed_turn":
+        # Two completed turns share a timestamp; the existing row-id tie-breaker
+        # makes this newer completed turn the sole valid prior reference.
+        repo.complete_turn(
+            request_id=scope["request_id"],
+            runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id,
+            turn_status="completed",
+            continuation_state="none",
+        )
+        with repo._connect() as conn:
+            conn.execute(
+                "UPDATE conversation_runtime_threads SET last_activity_at = ?",
+                ((_RETURN_NOW - timedelta(seconds=301)).isoformat(),),
+            )
+        scope = {**scope, "request_id": "return-after-two"}
+        session, turn, event = repo.start_turn(**scope)
+        assert event.event_payload_json["return_after_gap"]["prior_terminal_turn_id"] != prior_id
+    payload = json.loads(json.dumps(event.event_payload_json))
+    with repo._connect() as conn:
+        if fault == "snapshot_state":
+            payload["return_after_gap"]["prior_continuation_state"] = "deferred_expansion"
+        elif fault in {"actual_state", "unknown_actual_state"}:
+            conn.execute(
+                "UPDATE conversation_runtime_turns SET continuation_state = ? "
+                "WHERE runtime_turn_id = ?",
+                ("none" if fault == "actual_state" else "MALFORMED", prior_id),
+            )
+        elif fault == "other_completed_turn":
+            payload["return_after_gap"].update(
+                prior_terminal_turn_id=prior_id, prior_continuation_state="deferred_expansion"
+            )
+        else:
+            completed_at = {
+                "missing_completed_at": None,
+                "malformed_completed_at": "invalid",
+                "naive_completed_at": "2026-01-02T00:00:00",
+                "future_completed_at": (_RETURN_NOW + timedelta(seconds=1)).isoformat(),
+            }[fault]
+            conn.execute(
+                "UPDATE conversation_runtime_turns SET completed_at = ? "
+                "WHERE runtime_turn_id = ?",
+                (completed_at, prior_id),
+            )
+        conn.execute(
+            "UPDATE conversation_runtime_events SET event_payload_json = ? WHERE event_id = ?",
+            (json.dumps(payload), event.event_id),
+        )
+    assert repo.return_after_gap_snapshot(session.runtime_session_id, turn.runtime_turn_id) is None
+    exact_scope = {
+        **scope,
+        "runtime_session_id": session.runtime_session_id,
+        "runtime_turn_id": turn.runtime_turn_id,
+    }
+    presence = repo.evaluate_presence(RuntimePresenceEvaluateRequest(**exact_scope)).result
+    assert presence.presence_state == "active_conversation"
+    governance = evaluate_interaction_governance(
+        InteractionGovernanceEvaluateRequest(
+            **exact_scope,
+            current_user_text="continue",
+        )
+    ).result
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class != "continuation"
+    restraint = evaluate_restraint(
+        RestraintEvaluateRequest(
+            **exact_scope,
+            current_user_text="continue",
+            interaction_kind=governance.interaction_kind,
+        )
+    ).result
+    assert restraint.retrieval_suppressed
+    result = repo.evaluate_timing(
+        RuntimeTimingEvaluateRequest(
+            **exact_scope,
+            spoken_output=False,
+            active_task_mode=False,
+            requested_detail="unspecified",
+            latency_budget_class="ordinary_text",
+            dependency_state="ready",
+        )
+    ).result
+    assert result.timing_policy != "resume_previous_thread"
+
+
+def test_return_snapshot_semantic_binding_preserves_legitimate_join(tmp_path, monkeypatch):
+    from models import InteractionGovernanceEvaluateRequest, RestraintEvaluateRequest
+    from services.interaction_governance import evaluate_interaction_governance
+    from services.restraint import evaluate_restraint
+
+    repo, scope, session, turn, event = _return_turn(
+        tmp_path,
+        monkeypatch,
+        prior_state="deferred_expansion",
+    )
+    snapshot = repo.return_after_gap_snapshot(session.runtime_session_id, turn.runtime_turn_id)
+    assert snapshot is not None and snapshot.status == "eligible"
+    assert snapshot.prior_continuation_state == "deferred_expansion"
+    exact_scope = {
+        **scope,
+        "runtime_session_id": session.runtime_session_id,
+        "runtime_turn_id": turn.runtime_turn_id,
+    }
+    assert (
+        repo.evaluate_presence(
+            RuntimePresenceEvaluateRequest(
+                **exact_scope,
+            )
+        ).result.presence_state
+        == "returning_after_gap"
+    )
+    governance = evaluate_interaction_governance(
+        InteractionGovernanceEvaluateRequest(
+            **exact_scope,
+            current_user_text="continue",
+        )
+    ).result
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "continuation"
+    restraint = evaluate_restraint(
+        RestraintEvaluateRequest(
+            **exact_scope,
+            current_user_text="continue",
+            interaction_kind=governance.interaction_kind,
+        )
+    ).result
+    assert not restraint.retrieval_suppressed and not restraint.clarification_preferred
+    result = repo.evaluate_timing(
+        RuntimeTimingEvaluateRequest(
+            **exact_scope,
+            spoken_output=False,
+            active_task_mode=False,
+            requested_detail="unspecified",
+            latency_budget_class="ordinary_text",
+            dependency_state="ready",
+        )
+    ).result
+    assert result.timing_policy == "resume_previous_thread"
+    assert repo.start_turn(**scope)[2] == event
+    reopened = RuntimeStateRepository(repo.db_path)
+    assert (
+        reopened.return_after_gap_snapshot(session.runtime_session_id, turn.runtime_turn_id)
+        == snapshot
+    )
