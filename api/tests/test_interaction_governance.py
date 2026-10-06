@@ -1268,3 +1268,164 @@ async def test_continuation_markers_use_only_exact_valid_completed_return(
     })
     assert response.status_code == 200
     assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "information_request"
+
+
+_INTERRUPTION_MARKERS = [
+    "hold on", "wait a second", "one moment", "let me finish", "pause there", "stop there",
+]
+
+
+def _interruption_turn(monkeypatch, gap=60, prior_status="completed", surface="web"):
+    from datetime import UTC, datetime, timedelta
+
+    import services.runtime_state as runtime_module
+
+    clock = [datetime(2026, 1, 2, tzinfo=UTC)]
+    monkeypatch.setattr(runtime_module, "_now", lambda: clock[0].isoformat())
+    repo = runtime_state_repository()
+    scope = dict(owner_id="owner", conversation_id="interruption", surface=surface)
+    if prior_status is not None:
+        session, prior, _ = repo.start_turn(request_id="prior", **scope)
+        repo.complete_turn(request_id="prior", runtime_session_id=session.runtime_session_id,
+                           runtime_turn_id=prior.runtime_turn_id, turn_status=prior_status)
+    clock[0] += timedelta(seconds=gap)
+    session, turn, event = repo.start_turn(request_id="current", **scope)
+    return repo, session, turn, event, {
+        **scope, "request_id": "current", "runtime_session_id": session.runtime_session_id,
+        "runtime_turn_id": turn.runtime_turn_id,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", _INTERRUPTION_MARKERS)
+@pytest.mark.parametrize("gap", [0, 60, 299])
+@pytest.mark.parametrize("surface", ["web", "telegram", "alexa"])
+async def test_fresh_exact_interruption_joins_restrictive_restraint_and_yield_timing(
+    monkeypatch, marker, gap, surface,
+):
+    repo, session, turn, event, scope = _interruption_turn(monkeypatch, gap, surface=surface)
+    assert event.event_payload_json["return_after_gap"]["status"] == "below_threshold"
+    governance = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "current_user_text": marker,
+    })
+    assert governance.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "interruption"
+    assert governance.json()["result"]["action_allowed"] is False
+    restraint = await _post("/v1/runtime/restraint/evaluate", {
+        **scope, "current_user_text": marker, "interaction_kind": "ambiguous",
+    })
+    assert restraint.status_code == 200
+    result = restraint.json()["result"]
+    assert result["restraint_policy"] == "ask_clarifying_question"
+    assert result["retrieval_suppressed"] and result["personalization_suppressed"]
+    assert result["proactive_output_suppressed"]
+    presence = await _post("/v1/runtime/presence/evaluate", scope)
+    assert presence.status_code == 200
+    assert presence.json()["result"]["presence_state"] == "active_conversation"
+    timing = await _post("/v1/runtime/timing/evaluate", {
+        **scope, "spoken_output": False, "active_task_mode": False,
+        "requested_detail": "unspecified", "latency_budget_class": "ordinary_text",
+        "dependency_state": "ready",
+    })
+    assert timing.status_code == 200
+    result = timing.json()["result"]
+    assert result["timing_policy"] == "yield_to_user"
+    assert result["reason_codes"][0] == "intent_interruption"
+    assert result["continuation_state"] == "yielded_to_user"
+    assert result["expansion_allowed"] is False
+    diagnostics = (await _get(f"/v1/runtime/sessions/{session.runtime_session_id}")).json()
+    events = [item for item in diagnostics["events"]
+              if item["runtime_turn_id"] == turn.runtime_turn_id]
+    assert sum(item["event_type"] == "timing_evaluated" for item in events) == 1
+    assert not any(item["event_type"] in {"action_authority_evaluated", "action_flow_evaluated"}
+                   for item in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", _INTERRUPTION_MARKERS)
+@pytest.mark.parametrize("punctuation", [".", "!", "?"])
+async def test_interruption_canonical_punctuation(monkeypatch, marker, punctuation):
+    repo, _, turn, _, scope = _interruption_turn(monkeypatch)
+    response = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "current_user_text": marker + punctuation,
+    })
+    assert response.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "interruption"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", _INTERRUPTION_MARKERS)
+@pytest.mark.parametrize("case", ["300", "301", "first", "abandoned", "missing", "malformed",
+                                  "wrong_turn", "wrong_session", "terminal"])
+async def test_interruption_requires_exact_fresh_completed_snapshot(monkeypatch, marker, case):
+    import json
+
+    repo, session, turn, event, scope = _interruption_turn(
+        monkeypatch, gap=int(case) if case in {"300", "301"} else 60,
+        prior_status=(None if case == "first" else
+                      "abandoned" if case == "abandoned" else "completed"),
+    )
+    if case in {"300", "301"}:
+        assert event.event_payload_json["return_after_gap"]["status"] == "eligible"
+    if case in {"missing", "malformed", "wrong_turn"}:
+        payload = event.event_payload_json.copy()
+        if case == "missing":
+            del payload["return_after_gap"]
+        if case == "malformed":
+            payload["return_after_gap"]["threshold_met"] = "false"
+        with repo._connect() as conn:
+            conn.execute("UPDATE conversation_runtime_events SET event_payload_json=?, "
+                         "runtime_turn_id=? WHERE event_id=?", (json.dumps(payload),
+                         "wrong-turn" if case == "wrong_turn" else turn.runtime_turn_id,
+                         event.event_id))
+    if case == "wrong_session":
+        other = repo.resolve_session(request_id="other", owner_id="owner",
+                                     conversation_id="other-conversation", surface="web")
+        scope["runtime_session_id"] = other.runtime_session_id
+    if case == "terminal":
+        repo.complete_turn(request_id="current", runtime_session_id=session.runtime_session_id,
+                           runtime_turn_id=turn.runtime_turn_id, turn_status="completed")
+    payload = {
+        **scope, "current_user_text": marker,
+        # Client-provided history cannot replace the authoritative snapshot.
+        "recent_messages": [{"role": "assistant", "content": "A recent response."}],
+    }
+    if case == "terminal":
+        assert repo.return_after_gap_snapshot(
+            session.runtime_session_id, turn.runtime_turn_id,
+        ) is None
+        # The existing governance endpoint propagates the bounded terminal-turn error.
+        with pytest.raises(RuntimeError, match="^runtime_turn_not_current$"):
+            await _post("/v1/runtime/interaction-governance/evaluate", payload)
+    else:
+        response = await _post("/v1/runtime/interaction-governance/evaluate", payload)
+        assert response.status_code == (400 if case == "wrong_session" else 200)
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class != "interruption"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["stop the server", "wait for the deployment", "pause the job",
+                                   'remove the "stop there" flag', "remove the stop there flag",
+                                   "tell me when to stop there", "fix this",
+                                   "stop", "wait", "pause"])
+async def test_interruption_never_matches_substrings_or_action_phrases(monkeypatch, text):
+    repo, _, turn, _, scope = _interruption_turn(monkeypatch)
+    response = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "current_user_text": text,
+    })
+    assert response.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class != "interruption"
+
+
+@pytest.mark.asyncio
+async def test_client_history_without_admitted_turn_cannot_authorize_interruption():
+    response = await _post("/v1/runtime/interaction-governance/evaluate", _base(
+        current_user_text="hold on",
+        recent_messages=[{"role": "assistant", "content": "A recent response."}],
+    ))
+    assert response.status_code == 200
+    diagnostics = (await _get(
+        f'/v1/runtime/sessions/{response.json()["runtime_session_id"]}'
+    )).json()
+    assert diagnostics["latest_turn"] is None
+    assert response.json()["result"]["action_allowed"] is False
