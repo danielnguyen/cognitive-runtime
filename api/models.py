@@ -4322,10 +4322,26 @@ class InterruptEvaluateResponse(BaseModel):
     style_selected: InterruptStyle | None = None
     should_interrupt: bool
     should_defer: bool
+    intervention_text: str | None = Field(default=None, min_length=1, max_length=240, strict=True)
     reason_json: dict[str, Any] = Field(default_factory=dict)
     contract_constraints_applied: dict[str, Any] = Field(default_factory=dict)
     warnings: list[BoundedLabel] = Field(default_factory=list, max_length=12)
     debug: InterruptDebug
+
+    @model_validator(mode="after")
+    def validate_intervention_projection(self) -> "InterruptEvaluateResponse":
+        if self.should_interrupt:
+            if (
+                self.should_defer
+                or self.trigger_class is None
+                or self.style_selected is None
+                or self.intervention_text is None
+                or not self.intervention_text.strip()
+            ):
+                raise ValueError("interrupt_intervention_inconsistent")
+        elif self.intervention_text is not None:
+            raise ValueError("interrupt_intervention_without_authorization")
+        return self
 
 DiagnosticResult = Literal["pass", "warn", "fail"]
 DiagnosticSeverity = Literal["none", "low", "medium", "high"]

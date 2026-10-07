@@ -122,6 +122,10 @@ def _build_advisory(trigger_class: str, style: str, scene: str | None) -> str | 
             "constraint_reset",
         ): "The scope is expanding beyond the task value. Reset to the immediate objective.",
         (
+            "known_recurring_trap_pattern",
+            "constraint_reset",
+        ): "Reset to the immediate objective.",
+        (
             "mismatch_between_context_and_answer_depth",
             "scene_aware_simplification",
         ): "The context calls for a lighter pass. Keep only what changes the next step.",
@@ -401,6 +405,7 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
         style_selected=selected_style,
         should_interrupt=should_interrupt,
         should_defer=not should_interrupt,
+        intervention_text=advisory_text,
         reason_json={
             "defer_reasons": defer_reasons,
             "trigger_class": trigger_class,
