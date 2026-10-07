@@ -1,12 +1,18 @@
+import json
 import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from main import app
 from models import InterruptEvaluateResponse
 from pydantic import ValidationError
-from services.companion_contracts import CONTRACT_RULES
+from services.companion_contracts import (
+    CONTRACT_RULES,
+    companion_contracts_repository,
+    reset_companion_contracts_for_tests,
+)
 from services.runtime_state import clear_states_for_tests
 
 
@@ -305,6 +311,7 @@ def test_intervention_does_not_copy_user_or_provider_text():
         "/v1/interrupt/evaluate", json=_base(current_user_text=_HIGH_BRANCHING),
     ).json()
     altered = client.post("/v1/interrupt/evaluate", json=_base(
+        request_id="rid-interrupt-private",
         current_user_text=_HIGH_BRANCHING + " PRIVATE-USER-SENTINEL",
         recent_messages=[{"role": "assistant", "content": "PRIVATE-PROVIDER-SENTINEL "
                           "I'm always listening. I need you here. Don't leave me."}],
@@ -421,3 +428,355 @@ def test_interrupt_uses_canonical_default_for_malformed_persisted_contract(
         assert 0 < len(body["intervention_text"]) <= 240
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT * FROM interaction_contracts ORDER BY id").fetchall() == before
+
+
+def _evaluate(request="eval-first", text=_HIGH_BRANCHING, **scope):
+    return TestClient(app).post(
+        "/v1/interrupt/evaluate",
+        json=_base(
+            request_id=request,
+            current_user_text=text,
+            **scope,
+        ),
+    )
+
+
+def _receipt(evaluation, **changes):
+    body = evaluation.json() if hasattr(evaluation, "json") else evaluation
+    payload = {
+        key: body[key]
+        for key in (
+            "request_id",
+            "owner_id",
+            "conversation_id",
+            "surface",
+            "trigger_class",
+            "style_selected",
+            "intervention_text",
+        )
+    }
+    return {**payload, **changes}
+
+
+def _execute(evaluation, **changes):
+    return TestClient(app).post("/v1/interrupt/execute", json=_receipt(evaluation, **changes))
+
+
+def _events():
+    return companion_contracts_repository().list_interaction_boundary_events_for_tests()
+
+
+def _debug(request="eval-first", owner="owner", conversation="conv-1"):
+    return TestClient(app).get(
+        f"/v1/interrupt/debug/{request}",
+        params={
+            "owner_id": owner,
+            "conversation_id": conversation,
+        },
+    )
+
+
+def test_evaluation_is_structural_idempotent_and_conflicting_reuse_rejected():
+    first = _evaluate(text=_HIGH_BRANCHING + " PRIVATE-USER-TEXT")
+    again = _evaluate(text=_HIGH_BRANCHING + " PRIVATE-USER-TEXT")
+    assert first.status_code == again.status_code == 200
+    assert first.json()["should_interrupt"] is True
+    assert first.json()["lifecycle"]["state"] == "none"
+    assert again.json()["lifecycle"] == first.json()["lifecycle"]
+    assert len(_events()) == 1
+    stored = _events()[0]
+    assert stored["check_type"] == "interrupt_evaluation"
+    assert stored["result"] == "authorized"
+    serialized = str(stored)
+    assert "PRIVATE-USER-TEXT" not in serialized
+    assert first.json()["intervention_text"] not in serialized
+    assert "advisory_text" not in serialized and "detector_signals" not in serialized
+    assert _evaluate(text="What is 2+2?").status_code == 409
+    assert len(_events()) == 1
+
+
+def test_execution_receipt_and_idempotency_survive_recovery_without_resetting_state():
+    evaluated = _evaluate()
+    first, duplicate = _execute(evaluated), _execute(evaluated)
+    assert first.status_code == duplicate.status_code == 200
+    assert first.json()["execution_recorded"] is True
+    assert first.json()["idempotent_replay"] is False
+    assert duplicate.json()["idempotent_replay"] is True
+    assert first.json()["lifecycle"]["state"] == "awaiting_feedback"
+    assert [row["check_type"] for row in _events()] == [
+        "interrupt_evaluation",
+        "interrupt_execution",
+    ]
+    assert evaluated.json()["intervention_text"] not in str(_events())
+    next_turn = _evaluate("eval-next")
+    assert next_turn.json()["lifecycle"]["state"] == "overridden"
+    again = _execute(evaluated)
+    assert again.json()["idempotent_replay"] is True
+    assert again.json()["lifecycle"]["state"] == "overridden"
+    assert len([e for e in _events() if e["check_type"] == "interrupt_execution"]) == 1
+    assert _evaluate("eval-third").json()["lifecycle"]["state"] == "repeat_suppressed"
+
+
+@pytest.mark.parametrize(
+    "changes,status",
+    [
+        ({"trigger_class": "known_recurring_trap_pattern"}, 409),
+        ({"style_selected": "soft_redirect"}, 409),
+        ({"intervention_text": "Different bounded text."}, 409),
+        ({"request_id": "unknown"}, 404),
+        ({"owner_id": "another-owner"}, 404),
+        ({"conversation_id": "another-conversation"}, 404),
+        ({"surface": "telegram"}, 404),
+        ({"intervention_text": " "}, 422),
+        ({"intervention_text": "x" * 241}, 422),
+        ({"extra": "private"}, 422),
+        ({"trigger_class": "unsupported"}, 422),
+        ({"request_id": True}, 422),
+    ],
+)
+def test_invalid_receipt_cannot_create_execution(changes, status):
+    evaluated = _evaluate()
+    assert _execute(evaluated, **changes).status_code == status
+    assert len(_events()) == 1
+
+
+def test_deferred_exploration_has_no_execution_authority():
+    response = _evaluate(text="Brainstorm possibilities with me. What if we explored options?")
+    assert response.json()["should_defer"] is True
+    assert response.json()["intervention_text"] is None
+    assert _events()[0]["result"] == "deferred"
+    assert (
+        _execute(
+            response,
+            intervention_text="A fabricated redirect.",
+            trigger_class="repetitive_branching",
+            style_selected="next_step_forcing",
+        ).status_code
+        == 409
+    )
+    assert len(_events()) == 1
+
+
+def test_nonrecurring_pattern_is_accepted_and_debug_is_private():
+    first = _evaluate()
+    assert _execute(first).status_code == 200
+    second = _evaluate("eval-next", "What is 2+2?")
+    assert second.status_code == 200
+    assert second.json()["lifecycle"]["state"] == "accepted"
+    assert second.json()["lifecycle"]["candidate_suppressed"] is False
+    assert [e["result"] for e in _events() if e["check_type"] == "interrupt_recovery"] == [
+        "accepted"
+    ]
+    debug = _debug()
+    assert debug.status_code == 200
+    assert debug.json()["execution_state"] == "executed"
+    assert debug.json()["recovery_outcome"] == "accepted"
+    assert debug.json()["lifecycle"]["prior_executed_request_id"] == "eval-first"
+    for forbidden in (
+        "intervention_text",
+        "candidate_digest",
+        "input_digest",
+        "reason_json",
+        "detector_signals",
+        "debug",
+        first.json()["intervention_text"],
+    ):
+        assert forbidden not in debug.text
+
+
+def test_override_suppresses_repeats_until_pattern_breaks_then_rearms():
+    first = _evaluate()
+    assert _execute(first).status_code == 200
+    for request, state, count in (
+        ("eval-second", "overridden", 1),
+        ("eval-third", "repeat_suppressed", 2),
+        ("eval-fourth", "repeat_suppressed", 3),
+    ):
+        response = _evaluate(request)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["trigger_class"] == "repetitive_branching"
+        assert body["style_selected"] == "next_step_forcing" and body["confidence"] >= 0.85
+        assert body["should_interrupt"] is False and body["should_defer"] is True
+        assert body["intervention_text"] is None
+        assert body["lifecycle"]["state"] == state
+        assert body["lifecycle"]["repeated_trigger_count"] == count
+        assert body["lifecycle"]["candidate_suppressed"] is True
+        assert body["reason_json"]["defer_reasons"] == []  # Existing CO enum remains unchanged.
+        repeated = _evaluate(request)
+        assert repeated.json()["lifecycle"] == body["lifecycle"]
+        assert (
+            _execute(response, intervention_text=first.json()["intervention_text"]).status_code
+            == 409
+        )
+    assert _debug().json()["recovery_outcome"] == "overridden"
+    recovered = _evaluate("eval-break", "What is 2+2?")
+    assert recovered.json()["lifecycle"]["state"] == "recovered"
+    assert recovered.json()["lifecycle"]["candidate_suppressed"] is False
+    assert _debug().json()["recovery_outcome"] == "recovered"
+    rearmed = _evaluate("eval-rearmed")
+    assert rearmed.json()["should_interrupt"] is True
+    assert rearmed.json()["lifecycle"]["state"] == "none"
+    assert [e["result"] for e in _events() if e["check_type"] == "interrupt_recovery"] == [
+        "overridden",
+        "recovered",
+    ]
+
+
+def test_cross_surface_lifecycle_is_conversation_scoped_but_owners_and_threads_are_isolated():
+    first = _evaluate(surface="telegram")
+    assert _execute(first).status_code == 200
+    assert (
+        _evaluate("eval-other-owner", owner_id="another-owner").json()["should_interrupt"] is True
+    )
+    assert (
+        _evaluate("eval-other-thread", conversation_id="another-conversation").json()[
+            "should_interrupt"
+        ]
+        is True
+    )
+    current = _evaluate("eval-web", surface="web")
+    assert current.json()["lifecycle"]["state"] == "overridden"
+    assert current.json()["lifecycle"]["prior_executed_request_id"] == "eval-first"
+    assert current.json()["should_interrupt"] is False
+    events = [e for e in _events() if e["owner_id"] == "owner" and e["conversation_id"] == "conv-1"]
+    assert [(e["check_type"], e["surface"]) for e in events] == [
+        ("interrupt_evaluation", "telegram"),
+        ("interrupt_execution", "telegram"),
+        ("interrupt_recovery", "web"),
+        ("interrupt_evaluation", "web"),
+    ]
+
+
+def test_lifecycle_survives_repository_replacement():
+    first = _evaluate()
+    assert _execute(first).status_code == 200
+    reset_companion_contracts_for_tests(db_path=Path(os.environ["COMPANION_CONTRACTS_DB_PATH"]))
+    assert _debug().json()["execution_state"] == "executed"
+    current = _evaluate("eval-after-restart")
+    assert current.status_code == 200
+    assert current.json()["lifecycle"]["state"] == "overridden"
+    assert current.json()["should_interrupt"] is False
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "bad_json",
+        "wrong_trigger",
+        "foreign_evaluation",
+        "wrong_surface",
+        "unknown_result",
+        "unknown_type",
+        "unexpected_key",
+        "missing_version",
+        "forged_lifecycle",
+        "duplicate_execution",
+    ],
+)
+def test_malformed_history_fails_closed_without_exposing_storage(corruption):
+    first = _evaluate()
+    assert _execute(first).status_code == 200
+    with sqlite3.connect(os.environ["COMPANION_CONTRACTS_DB_PATH"]) as conn:
+        execution = conn.execute(
+            "SELECT id,reason_json FROM interaction_boundary_events "
+            "WHERE check_type='interrupt_execution'"
+        ).fetchone()
+        proof = json.loads(execution[1])
+        if corruption == "bad_json":
+            conn.execute(
+                "UPDATE interaction_boundary_events SET reason_json=? WHERE id=?",
+                ("PRIVATE-MALFORMED-JSON", execution[0]),
+            )
+        elif corruption == "wrong_surface":
+            conn.execute(
+                "UPDATE interaction_boundary_events SET surface='alexa' WHERE id=?", (execution[0],)
+            )
+        elif corruption == "unknown_type":
+            conn.execute("UPDATE interaction_boundary_events SET check_type='interrupt_unknown' "
+                         "WHERE id=?", (execution[0],))
+        elif corruption == "unknown_result":
+            conn.execute(
+                "UPDATE interaction_boundary_events SET result='private-invalid' WHERE id=?",
+                (execution[0],),
+            )
+        elif corruption == "duplicate_execution":
+            columns = [
+                r[1] for r in conn.execute("PRAGMA table_info(interaction_boundary_events)")
+            ][1:]
+            names = ",".join(columns)
+            conn.execute(
+                f"INSERT INTO interaction_boundary_events ({names}) SELECT {names} "
+                "FROM interaction_boundary_events WHERE id=?",
+                (execution[0],),
+            )
+        elif corruption == "forged_lifecycle":
+            row = conn.execute(
+                "SELECT id,reason_json FROM interaction_boundary_events "
+                "WHERE check_type='interrupt_evaluation'"
+            ).fetchone()
+            data = json.loads(row[1])
+            data["lifecycle"]["candidate_suppressed"] = True
+            conn.execute(
+                "UPDATE interaction_boundary_events SET reason_json=? WHERE id=?",
+                (json.dumps(data), row[0]),
+            )
+        else:
+            if corruption == "wrong_trigger":
+                proof["trigger_class"] = "known_recurring_trap_pattern"
+            elif corruption == "foreign_evaluation":
+                foreign = _evaluate("eval-foreign", owner_id="foreign-owner")
+                assert foreign.status_code == 200
+                proof["evaluation_id"] = max(e["id"] for e in _events())
+            elif corruption == "missing_version":
+                del proof["schema_version"]
+            else:
+                proof["raw_private"] = "PRIVATE-MALFORMED-JSON"
+            conn.execute(
+                "UPDATE interaction_boundary_events SET reason_json=? WHERE id=?",
+                (json.dumps(proof), execution[0]),
+            )
+    current = _evaluate("eval-after-corruption")
+    assert current.status_code == 200
+    assert current.json()["lifecycle"]["state"] == "history_unavailable"
+    assert current.json()["lifecycle"]["prior_executed_request_id"] is None
+    assert current.json()["should_interrupt"] is False and current.json()["should_defer"] is True
+    assert current.json()["intervention_text"] is None
+    assert "PRIVATE-MALFORMED-JSON" not in current.text
+    assert "private-invalid" not in current.text
+    assert _execute(first).status_code == 409
+    assert _debug().status_code == 409
+    assert "PRIVATE-MALFORMED-JSON" not in _debug().text
+    assert not [e for e in _events() if e["check_type"] == "interrupt_recovery"]
+
+
+@pytest.mark.parametrize(
+    "request_key,owner,conversation",
+    [
+        ("unknown", "owner", "conv-1"),
+        ("eval-first", "other-owner", "conv-1"),
+        ("eval-first", "owner", "other-conversation"),
+    ],
+)
+def test_debug_isolation_has_indistinguishable_not_found(request_key, owner, conversation):
+    _evaluate()
+    response = _debug(request_key, owner, conversation)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "interrupt_request_not_found"}
+
+
+def test_debug_requires_scope_and_bounded_request():
+    client = TestClient(app)
+    assert client.get("/v1/interrupt/debug/eval-first").status_code == 422
+    assert _debug("x" * 121).status_code == 422
+
+
+def test_unrelated_lifecycle_storage_failure_is_not_success(monkeypatch):
+    def unavailable():
+        raise sqlite3.OperationalError("PRIVATE-STORAGE-ERROR")
+
+    monkeypatch.setattr(
+        companion_contracts_repository(), "interaction_boundary_transaction", unavailable
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        _evaluate()

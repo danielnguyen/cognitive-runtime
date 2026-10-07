@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 DEFAULT_DB_PATH = "./data/companion_contracts.sqlite3"
 DEFAULT_PROFILE_ID = "default_companion_profile"
@@ -896,6 +897,30 @@ class CompanionContractsRepository:
                 ),
             )
 
+    @contextmanager
+    def interaction_boundary_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Serialize event reads plus idempotent writes across repository instances."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+
+    def interaction_boundary_history(
+        self, *, connection: sqlite3.Connection, owner_id: str, conversation_id: str,
+        check_types: tuple[str, ...],
+        check_type_prefix: str | None = None,
+    ) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in check_types)
+        predicate = f"check_type IN ({placeholders})"
+        parameters = (owner_id, conversation_id, *check_types)
+        if check_type_prefix is not None:
+            predicate = f"({predicate} OR substr(check_type,1,?)=?)"
+            parameters += (len(check_type_prefix), check_type_prefix)
+        rows = connection.execute(
+            "SELECT * FROM interaction_boundary_events WHERE owner_id=? AND conversation_id=? "
+            f"AND {predicate} ORDER BY id ASC", parameters,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def record_interaction_boundary_event(
         self,
         *,
@@ -910,32 +935,59 @@ class CompanionContractsRepository:
         input_summary: str,
         result: str,
         reason_json: dict[str, Any],
-    ) -> None:
+        connection: sqlite3.Connection | None = None,
+        idempotent: bool = False,
+    ) -> int:
         created_at = datetime.now(UTC).isoformat()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO interaction_boundary_events (
-                    request_id, owner_id, conversation_id, surface, contract_id,
-                    contract_version, check_type, severity, input_summary, result,
-                    reason_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """,
-                (
-                    request_id,
-                    owner_id,
-                    conversation_id,
-                    surface,
-                    contract_id,
-                    contract_version,
-                    check_type,
-                    severity,
-                    input_summary,
-                    result,
-                    _json(reason_json),
-                    created_at,
-                ),
-            )
+        fields = dict(
+            request_id=request_id, owner_id=owner_id, conversation_id=conversation_id,
+            surface=surface, contract_id=contract_id, contract_version=contract_version,
+            check_type=check_type, severity=severity, input_summary=input_summary,
+            result=result, reason_json=reason_json,
+        )
+        if connection is None:
+            with self.interaction_boundary_transaction() as conn:
+                return self.record_interaction_boundary_event(
+                    **fields, connection=conn, idempotent=idempotent,
+                )
+        conn = connection
+        if idempotent:
+            rows = conn.execute(
+                "SELECT id, contract_id, contract_version, severity, input_summary, result, "
+                "reason_json FROM interaction_boundary_events WHERE request_id=? AND owner_id=? "
+                "AND conversation_id=? AND surface=? AND check_type=?",
+                (request_id, owner_id, conversation_id, surface, check_type),
+            ).fetchall()
+            expected = (contract_id, contract_version, severity, input_summary, result,
+                        _json(reason_json))
+            if rows:
+                if len(rows) != 1 or tuple(rows[0])[1:] != expected:
+                    raise ValueError("interaction_boundary_event_conflict")
+                return rows[0][0]
+        cursor = conn.execute(
+            """
+            INSERT INTO interaction_boundary_events (
+                request_id, owner_id, conversation_id, surface, contract_id,
+                contract_version, check_type, severity, input_summary, result,
+                reason_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                request_id,
+                owner_id,
+                conversation_id,
+                surface,
+                contract_id,
+                contract_version,
+                check_type,
+                severity,
+                input_summary,
+                result,
+                _json(reason_json),
+                created_at,
+            ),
+        )
+        return cursor.lastrowid
 
     def list_scene_resolution_events_for_tests(self) -> list[dict[str, Any]]:
         with self._connect() as conn:

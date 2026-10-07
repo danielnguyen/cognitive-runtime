@@ -190,10 +190,11 @@ def test_validation_event_uses_bounded_input_summary_not_full_text():
     assert events[0]["input_summary"] != long_text
 
 
-def test_compile_and_interrupt_do_not_record_interaction_boundary_events():
+def test_compile_is_read_only_and_interrupt_records_structural_evaluation():
     client = TestClient(app)
 
     compile_response = client.post("/v1/companion/policy/compile", json=_base())
+    assert companion_contracts_repository().list_interaction_boundary_events_for_tests() == []
     interrupt_response = client.post(
         "/v1/interrupt/evaluate",
         json={
@@ -204,4 +205,9 @@ def test_compile_and_interrupt_do_not_record_interaction_boundary_events():
 
     assert compile_response.status_code == 200
     assert interrupt_response.status_code == 200
-    assert companion_contracts_repository().list_interaction_boundary_events_for_tests() == []
+    events = companion_contracts_repository().list_interaction_boundary_events_for_tests()
+    assert len(events) == 1
+    assert events[0]["check_type"] == "interrupt_evaluation"
+    assert events[0]["result"] == "deferred"
+    assert events[0]["input_summary"] == "interrupt lifecycle"
+    assert "Should I split" not in str(events)

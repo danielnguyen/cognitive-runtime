@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
 from services.companion_contracts import (
     DEFAULT_DB_PATH,
     PERSONA_PROFILES,
@@ -81,3 +83,35 @@ def test_repository_resolves_seeded_records(tmp_path):
     assert persona.persona_owns_durable_memory is False
     assert surface_binding is not None
     assert surface_binding.default_persona_id == "technical_architect"
+
+
+
+def _event_fields():
+    return dict(request_id="bounded-receipt", owner_id="owner", conversation_id="conversation",
+                surface="web", contract_id="contract", contract_version=1,
+                check_type="neutral_receipt", severity="none", input_summary="bounded receipt",
+                result="recorded", reason_json={"reason_code": "recorded"}, idempotent=True)
+
+
+def test_boundary_event_idempotency_is_atomic_across_repository_instances(tmp_path):
+    db = tmp_path / "shared.sqlite3"
+    first = CompanionContractsRepository(db_path=db)
+    second = CompanionContractsRepository(db_path=db)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(repo.record_interaction_boundary_event, **_event_fields())
+                   for repo in (first, second)]
+        ids = [future.result() for future in futures]
+    assert ids[0] == ids[1]
+    assert len(first.list_interaction_boundary_events_for_tests()) == 1
+    with pytest.raises(ValueError, match="interaction_boundary_event_conflict"):
+        second.record_interaction_boundary_event(**{**_event_fields(), "result": "conflicting"})
+    assert len(first.list_interaction_boundary_events_for_tests()) == 1
+
+
+def test_boundary_event_transaction_rolls_back_partial_transition(tmp_path):
+    repository = CompanionContractsRepository(db_path=tmp_path / "rollback.sqlite3")
+    with pytest.raises(RuntimeError, match="abort"):
+        with repository.interaction_boundary_transaction() as connection:
+            repository.record_interaction_boundary_event(**_event_fields(), connection=connection)
+            raise RuntimeError("abort")
+    assert repository.list_interaction_boundary_events_for_tests() == []
