@@ -1,8 +1,12 @@
+import os
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 from main import app
 from models import InterruptEvaluateResponse
 from pydantic import ValidationError
+from services.companion_contracts import CONTRACT_RULES
 from services.runtime_state import clear_states_for_tests
 
 
@@ -360,3 +364,60 @@ def test_production_candidate_can_be_read_without_diagnostic_text():
     response["debug"]["advisory_text"] = None
     parsed = InterruptEvaluateResponse.model_validate(response)
     assert parsed.intervention_text == "You are branching again. Pick the next move and test it."
+
+
+@pytest.mark.parametrize("surface,exploration", [
+    ("web", False), ("telegram", False), ("alexa", False), ("car", False),
+    ("new_surface", False), ("unknown", False), ("web", True), ("new_surface", True),
+])
+@pytest.mark.parametrize("malformed", ['[]', '{private-invalid-json'])
+def test_interrupt_uses_canonical_default_for_malformed_persisted_contract(
+    surface, exploration, malformed,
+):
+    path = os.environ["COMPANION_CONTRACTS_DB_PATH"]
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE interaction_contracts SET trust_rules_json = ?", (malformed,))
+        before = conn.execute("SELECT * FROM interaction_contracts ORDER BY id").fetchall()
+    text = (
+        "Brainstorm possibilities with me. What if we tried several approaches, "
+        "compared options, and explored edge cases before choosing?"
+        if exploration else
+        "Should I rewrite this or add an abstraction or split the module or "
+        "rework the interface or simplify the module or compare every option?"
+    )
+    response = TestClient(app).post(
+        "/v1/interrupt/evaluate",
+        json=_base(surface=surface, requested_scene="planning", current_user_text=text),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    contract = body["interaction_contract"]
+    assert {field: contract[field] for field in CONTRACT_RULES} == CONTRACT_RULES
+    assert contract["source"] == "default_compiled"
+    assert contract["scope"] == "global_default"
+    assert contract["owner_id"] == "owner"
+    warning = "malformed_interaction_contract_defaulted"
+    assert body["warnings"].count(warning) == body["contract_trace"]["warnings"].count(warning) == 1
+    assert "default_contract_applied" in body["warnings"]
+    assert "private-invalid-json" not in response.text
+    if surface == "new_surface":
+        assert "unknown_surface_default_contract" in body["warnings"]
+        assert "unknown_surface_interrupt_policy" in body["warnings"]
+    if exploration:
+        assert body["should_interrupt"] is False
+        assert body["should_defer"] is True
+        assert body["intervention_text"] is None
+        assert "explicit_exploration_request" in body["reason_json"]["defer_reasons"]
+    else:
+        assert body["should_interrupt"] is True
+        assert body["should_defer"] is False
+        assert body["confidence"] >= 0.85
+        assert body["style_selected"] == "next_step_forcing"
+        assert body["contract_constraints_applied"]["matched_contract_style"] == "soft_redirect"
+        assert body["intervention_text"] == (
+            "You are branching again. Pick the next move and test it. "
+            "Keep it to the next concrete step."
+        )
+        assert 0 < len(body["intervention_text"]) <= 240
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT * FROM interaction_contracts ORDER BY id").fetchall() == before

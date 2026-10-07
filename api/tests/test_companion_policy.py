@@ -1,6 +1,18 @@
+import json
+import os
+import sqlite3
+
+import pytest
 from fastapi.testclient import TestClient
 from main import app
-from services.runtime_state import clear_states_for_tests
+from services.companion_contracts import (
+    CONTRACT_RULES,
+    DEFAULT_CONTRACT_ID,
+    DEFAULT_CONTRACT_VERSION,
+    companion_contracts_repository,
+)
+from services.companion_policy import compile_policy, resolve_interaction_contract
+from services.runtime_state import clear_states_for_tests, resolve_state
 
 
 def setup_function():
@@ -332,3 +344,104 @@ def test_compile_uses_seeded_general_scene_for_unknown_scene():
     assert "Scene policy: use the general operating mode" in body["overlays"][2]["content"]
     assert body["profile_version"] == 1
     assert body["contract_version"] == 2
+
+
+@pytest.mark.parametrize("column,value", [
+    ("trust_rules_json", "[]"),
+    ("interaction_boundaries_json", "[]"),
+    ("memory_or_recall_boundaries_json", "[]"),
+    ("autonomy_rules_json", "[]"),
+    ("tone_constraints_json", "[]"),
+    ("repair_rules_json", '["Only one repair rule"]'),
+    ("trust_rules_json", '{private-invalid-json'),
+    ("trust_rules_json", '{"wrong": "container"}'),
+    ("trust_rules_json", 'null'),
+    ("trust_rules_json", '[42]'),
+    ("scope", "invalid-scope"),
+])
+def test_compile_defaults_malformed_contract_without_rewriting(column, value):
+    path = os.environ["COMPANION_CONTRACTS_DB_PATH"]
+    with sqlite3.connect(path) as conn:
+        conn.execute(f"UPDATE interaction_contracts SET {column} = ?", (value,))
+        before = conn.execute("SELECT * FROM interaction_contracts ORDER BY id").fetchall()
+    client = TestClient(app)
+    first = client.post("/v1/companion/policy/compile", json=_base())
+    second = client.post("/v1/companion/policy/compile", json=_base())
+    assert first.status_code == second.status_code == 200
+    body = first.json()
+    contract = body["interaction_contract"]
+    assert {field: contract[field] for field in CONTRACT_RULES} == CONTRACT_RULES
+    assert contract["contract_id"] == DEFAULT_CONTRACT_ID
+    assert contract["contract_version"] == DEFAULT_CONTRACT_VERSION
+    assert contract["owner_id"] == "owner"
+    assert contract["source"] == "default_compiled"
+    assert contract["scope"] == "global_default"
+    profile = companion_contracts_repository().active_profile()
+    assert (body["profile_id"], body["profile_version"]) == (profile.profile_id, profile.version)
+    expected = ["default_contract_applied", "malformed_interaction_contract_defaulted"]
+    assert body["warnings"] == body["contract_trace"]["warnings"] == expected
+    assert second.json()["contract_trace"] == body["contract_trace"]
+    assert second.json()["overlays"] == body["overlays"]
+    assert "private-invalid-json" not in first.text
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT * FROM interaction_contracts ORDER BY id").fetchall() == before
+
+
+def test_compile_valid_persisted_contract_is_preserved():
+    rules = ["Use this valid configured trust rule."]
+    with sqlite3.connect(os.environ["COMPANION_CONTRACTS_DB_PATH"]) as conn:
+        conn.execute(
+            "UPDATE interaction_contracts SET trust_rules_json = ?, contract_version = 3",
+            (json.dumps(rules),),
+        )
+    response = TestClient(app).post("/v1/companion/policy/compile", json=_base())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["interaction_contract"]["trust_rules"] == rules
+    assert body["contract_version"] == 3
+    assert body["contract_trace"]["warnings"] == body["warnings"] == ["default_contract_applied"]
+
+
+@pytest.mark.parametrize("surface,scene,expected", [
+    ("new_surface", None, ["default_contract_applied", "unknown_surface_default_contract",
+                           "malformed_interaction_contract_defaulted"]),
+    ("dev", "not_a_scene", ["unknown_requested_scene", "default_contract_applied",
+                            "malformed_interaction_contract_defaulted"]),
+])
+def test_malformed_contract_warning_composes_with_surface_and_scene(surface, scene, expected):
+    with sqlite3.connect(os.environ["COMPANION_CONTRACTS_DB_PATH"]) as conn:
+        conn.execute("UPDATE interaction_contracts SET trust_rules_json = '[]'")
+    payload = {**_base(), "surface": surface}
+    if scene:
+        payload["requested_scene"] = scene
+    response = TestClient(app).post("/v1/companion/policy/compile", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["warnings"] == expected
+    assert body["contract_trace"]["warnings"].count("malformed_interaction_contract_defaulted") == 1
+    assert body["scene_id"] == "general"
+    assert body["scene_source"] == ("fallback_general" if scene else "general")
+    assert body["interaction_contract"]["trust_rules"] == CONTRACT_RULES["trust_rules"]
+
+
+@pytest.mark.parametrize("error", [
+    sqlite3.OperationalError("storage-unavailable"),
+    RuntimeError("unexpected-repository-failure"),
+    RuntimeError("active_interaction_contract_missing"),
+])
+@pytest.mark.parametrize("consumer", ["compile", "interrupt_contract"])
+def test_contract_operational_failures_do_not_default(monkeypatch, error, consumer):
+    repository = companion_contracts_repository()
+    state = resolve_state(owner_id="owner", conversation_id="conv-1", surface="dev")
+
+    def unavailable(**kwargs):
+        raise error
+
+    monkeypatch.setattr(repository, "active_interaction_contract", unavailable)
+    with pytest.raises(type(error), match=str(error)):
+        if consumer == "compile":
+            compile_policy(state=state)
+        else:
+            resolve_interaction_contract(
+                owner_id="owner", surface="dev", requested_scene=None, runtime_state=state,
+            )
