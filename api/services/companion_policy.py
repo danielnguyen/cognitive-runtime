@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from json import JSONDecodeError
 
 from models import (
     CompanionPolicyOverlay,
@@ -8,12 +9,14 @@ from models import (
     InteractionContractTrace,
     RuntimeState,
 )
+from pydantic import ValidationError
 from services.companion_contracts import (
     DEFAULT_CONTRACT_WARNING,
     CompanionProfileRecord,
     InteractionContractRecord,
     ScenePolicyRecord,
     companion_contracts_repository,
+    compiled_default_interaction_contract,
 )
 from services.scene_resolution import SceneResolutionResult, resolve_scene_policy
 
@@ -26,6 +29,13 @@ _KNOWN_SURFACES = {
     "alexa",
     "car",
 }
+
+
+_MALFORMED_CONTRACT_WARNING = "malformed_interaction_contract_defaulted"
+
+
+class _InvalidInteractionContract(RuntimeError):
+    """A decoded contract violates the existing required-rule constraints."""
 
 
 def active_profile() -> CompanionProfileRecord:
@@ -111,17 +121,21 @@ def _contract_model(
 
 def _validate_interaction_contract(contract: InteractionContract) -> None:
     if not contract.trust_rules:
-        raise RuntimeError("invalid_interaction_contract_record: trust_rules")
+        raise _InvalidInteractionContract("invalid_interaction_contract_record: trust_rules")
     if not contract.interaction_boundaries:
-        raise RuntimeError("invalid_interaction_contract_record: interaction_boundaries")
+        raise _InvalidInteractionContract(
+            "invalid_interaction_contract_record: interaction_boundaries",
+        )
     if not contract.memory_or_recall_boundaries:
-        raise RuntimeError("invalid_interaction_contract_record: memory_or_recall_boundaries")
+        raise _InvalidInteractionContract(
+            "invalid_interaction_contract_record: memory_or_recall_boundaries",
+        )
     if not contract.autonomy_rules:
-        raise RuntimeError("invalid_interaction_contract_record: autonomy_rules")
+        raise _InvalidInteractionContract("invalid_interaction_contract_record: autonomy_rules")
     if len(contract.repair_rules) < 2:
-        raise RuntimeError("invalid_interaction_contract_record: repair_rules")
+        raise _InvalidInteractionContract("invalid_interaction_contract_record: repair_rules")
     if not contract.tone_constraints:
-        raise RuntimeError("invalid_interaction_contract_record: tone_constraints")
+        raise _InvalidInteractionContract("invalid_interaction_contract_record: tone_constraints")
 
 
 def _contract_overlay_content(contract: InteractionContract) -> str:
@@ -155,20 +169,43 @@ def _contract_warnings(
     return warnings
 
 
-def resolve_interaction_contract(
+def _resolve_interaction_contract(
     *,
+    profile: CompanionProfileRecord,
     owner_id: str,
     surface: str,
     requested_scene: str | None,
     runtime_state: RuntimeState,
-) -> tuple[InteractionContract, InteractionContractTrace]:
-    profile = active_profile()
-    contract_record = companion_contracts_repository().active_interaction_contract(
-        profile_id=profile.profile_id,
-        profile_version=profile.version,
+) -> tuple[InteractionContractRecord, InteractionContract, InteractionContractTrace]:
+    # Only this active contract read can signal malformed JSON content. Profile,
+    # scene, missing-record and storage failures remain operational failures.
+    try:
+        contract_record = companion_contracts_repository().active_interaction_contract(
+            profile_id=profile.profile_id,
+            profile_version=profile.version,
+        )
+    except JSONDecodeError:
+        defaulted = True
+    else:
+        defaulted = False
+        try:
+            contract = _contract_model(owner_id=owner_id, contract=contract_record)
+            _validate_interaction_contract(contract)
+        except (ValidationError, _InvalidInteractionContract):
+            defaulted = True
+    if defaulted:
+        contract_record = compiled_default_interaction_contract(
+            profile_id=profile.profile_id, profile_version=profile.version,
+        )
+        # Canonical construction/validation is outside the fallback catch. If it
+        # fails, do not represent the request as successfully governed.
+        contract = _contract_model(owner_id=owner_id, contract=contract_record)
+        _validate_interaction_contract(contract)
+    warnings = _contract_warnings(
+        surface=surface, requested_scene=requested_scene, runtime_state=runtime_state,
     )
-    contract = _contract_model(owner_id=owner_id, contract=contract_record)
-    _validate_interaction_contract(contract)
+    if defaulted:
+        warnings.append(_MALFORMED_CONTRACT_WARNING)
     trace = InteractionContractTrace(
         contract_id=contract.contract_id,
         contract_version=contract.contract_version,
@@ -187,11 +224,21 @@ def resolve_interaction_contract(
         ],
         selected_boundary_rules=contract.interaction_boundaries,
         selected_repair_rules=contract.repair_rules,
-        warnings=_contract_warnings(
-            surface=surface,
-            requested_scene=requested_scene,
-            runtime_state=runtime_state,
-        ),
+        warnings=warnings,
+    )
+    return contract_record, contract, trace
+
+
+def resolve_interaction_contract(
+    *,
+    owner_id: str,
+    surface: str,
+    requested_scene: str | None,
+    runtime_state: RuntimeState,
+) -> tuple[InteractionContract, InteractionContractTrace]:
+    _, contract, trace = _resolve_interaction_contract(
+        profile=active_profile(), owner_id=owner_id, surface=surface,
+        requested_scene=requested_scene, runtime_state=runtime_state,
     )
     return contract, trace
 
@@ -210,35 +257,9 @@ def compile_policy(
     scene_confidence = scene_resolution.confidence
     scene_source = scene_resolution.source
     scene_warnings = scene_resolution.warnings
-    contract_record = companion_contracts_repository().active_interaction_contract(
-        profile_id=profile.profile_id,
-        profile_version=profile.version,
-    )
-    contract = _contract_model(owner_id=state.owner_id, contract=contract_record)
-    _validate_interaction_contract(contract)
-    contract_trace = InteractionContractTrace(
-        contract_id=contract.contract_id,
-        contract_version=contract.contract_version,
-        source=contract.source,
-        scope=contract.scope,
-        selected_rule_groups=[
-            "trust_rules",
-            "interaction_boundaries",
-            "repair_rules",
-            "memory_or_recall_boundaries",
-            "autonomy_rules",
-            "tone_constraints",
-            "allowed_intervention_styles",
-            "disallowed_intervention_styles",
-            "defer_conditions",
-        ],
-        selected_boundary_rules=contract.interaction_boundaries,
-        selected_repair_rules=contract.repair_rules,
-        warnings=_contract_warnings(
-            surface=state.surface,
-            requested_scene=requested_scene,
-            runtime_state=state,
-        ),
+    contract_record, contract, contract_trace = _resolve_interaction_contract(
+        profile=profile, owner_id=state.owner_id, surface=state.surface,
+        requested_scene=requested_scene, runtime_state=state,
     )
     warnings = list(dict.fromkeys([*scene_warnings, *contract_trace.warnings]))
     overlays = [

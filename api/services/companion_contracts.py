@@ -326,6 +326,23 @@ class InteractionContractRecord:
     defer_conditions: list[str]
 
 
+def compiled_default_interaction_contract(
+    *, profile_id: str, profile_version: int,
+) -> InteractionContractRecord:
+    """Materialize canonical seeded rules without reading or repairing persistence."""
+    return InteractionContractRecord(
+        contract_id=DEFAULT_CONTRACT_ID,
+        profile_id=profile_id,
+        profile_version=profile_version,
+        contract_version=DEFAULT_CONTRACT_VERSION,
+        scope="global_default",
+        source=DEFAULT_CONTRACT_SOURCE,
+        active=True,
+        status="active",
+        **{name: list(rules) for name, rules in CONTRACT_RULES.items()},
+    )
+
+
 @dataclass(frozen=True)
 class PersonaProfileRecord:
     persona_id: str
