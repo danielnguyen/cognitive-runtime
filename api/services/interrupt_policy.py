@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import json
 import re
-from typing import Any
+from datetime import datetime
+from hashlib import sha256
+from typing import Annotated, Any, Literal
 
 from models import (
     InteractionContract,
     InterruptEvaluateRequest,
     InterruptEvaluateResponse,
+    InterruptExecutionRequest,
+    InterruptExecutionResponse,
+    InterruptLifecycle,
+    InterruptLifecycleDebugResponse,
+    InterruptStyle,
+    InterruptTriggerClass,
     RuntimeState,
 )
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from services.companion_contracts import companion_contracts_repository
 from services.companion_policy import resolve_interaction_contract
 
 _STYLE_COMPATIBILITY = {
@@ -380,12 +391,26 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
     if interaction_contract.source == "default_compiled":
         warnings.append("default_contract_source")
 
+    lifecycle = _evaluate_lifecycle(
+        body,
+        interaction_contract,
+        trigger_class,
+        selected_style,
+        round(confidence, 4),
+        advisory_text,
+    )
+    if lifecycle.candidate_suppressed:
+        should_interrupt = False
+        advisory_text = None
+        warnings.append(
+            "interrupt_lifecycle_history_unavailable"
+            if lifecycle.state == "history_unavailable"
+            else "repeat_interrupt_suppressed"
+        )
+
     detector_signals = {
         "winning_trigger_signals": winning_signals,
-        "all_scores": {
-            name: round(float(details["score"]), 4)
-            for name, details in scores.items()
-        },
+        "all_scores": {name: round(float(details["score"]), 4) for name, details in scores.items()},
         "exploration_requested": exploration_requested,
         "casual_or_low_stakes": low_stakes,
         "message_count": len(recent_messages),
@@ -413,10 +438,429 @@ def evaluate_interrupt_policy(body: InterruptEvaluateRequest) -> InterruptEvalua
         },
         contract_constraints_applied=contract_constraints,
         warnings=list(dict.fromkeys(warnings + contract_trace.warnings)),
+        lifecycle=lifecycle,
         debug={
             "detector_signals": detector_signals,
             "advisory_text": advisory_text,
             "user_visible_suppressed": True,
             "degraded": degraded,
         },
+    )
+
+
+# These payloads are persisted evidence, never a copy of policy inputs or prose.
+_Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+_EVENT_TYPES = ("interrupt_evaluation", "interrupt_execution", "interrupt_recovery")
+
+
+class _Evidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: Literal["interrupt-lifecycle.v1"]
+
+
+class _EvaluationEvidence(_Evidence):
+    input_digest: _Digest
+    trigger_class: InterruptTriggerClass | None
+    style_selected: InterruptStyle | None
+    confidence: float = Field(ge=0, le=1)
+    candidate_digest: _Digest | None
+    lifecycle: InterruptLifecycle
+
+
+class _ExecutionEvidence(_Evidence):
+    evaluation_id: int = Field(gt=0)
+    trigger_class: InterruptTriggerClass
+    style_selected: InterruptStyle
+    candidate_digest: _Digest
+
+
+class _RecoveryEvidence(_Evidence):
+    execution_id: int = Field(gt=0)
+    trigger_class: InterruptTriggerClass
+    repeated_trigger_count: int = Field(ge=0, le=2147483647)
+    reason_code: Literal["trigger_not_recurred", "trigger_recurred", "pattern_broken"]
+
+
+class InterruptHistoryInvalid(ValueError):
+    """Stored lifecycle evidence cannot safely be consumed."""
+
+
+def _digest(text: str) -> str:
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
+def _scope(row: dict) -> tuple:
+    return tuple(row[name] for name in ("request_id", "owner_id", "conversation_id", "surface"))
+
+
+def _decode_event(row: dict):
+    try:
+        for name, limit in (
+            ("request_id", 120),
+            ("owner_id", 120),
+            ("conversation_id", 120),
+            ("surface", 64),
+            ("contract_id", 120),
+        ):
+            value = row[name]
+            if not isinstance(value, str) or not value.strip() or len(value) > limit:
+                raise InterruptHistoryInvalid()
+        if (
+            type(row["id"]) is not int
+            or row["id"] <= 0
+            or type(row["contract_version"]) is not int
+            or row["contract_version"] <= 0
+            or row["severity"] != "none"
+            or row["input_summary"] != "interrupt lifecycle"
+            or not isinstance(row["created_at"], str)
+            or len(row["created_at"]) > 40
+            or datetime.fromisoformat(row["created_at"]).utcoffset() is None
+            or not isinstance(row["reason_json"], str)
+            or len(row["reason_json"]) > 4096
+        ):
+            raise InterruptHistoryInvalid()
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise InterruptHistoryInvalid()
+                result[key] = value
+            return result
+
+        raw = json.loads(row["reason_json"], object_pairs_hook=unique_object)
+        model = {
+            "interrupt_evaluation": _EvaluationEvidence,
+            "interrupt_execution": _ExecutionEvidence,
+            "interrupt_recovery": _RecoveryEvidence,
+        }[row["check_type"]]
+        payload = model.model_validate(raw)
+        if isinstance(payload, _EvaluationEvidence):
+            if row["result"] not in {"authorized", "deferred", "repeat_suppressed"}:
+                raise InterruptHistoryInvalid()
+            if (row["result"] == "repeat_suppressed") != payload.lifecycle.candidate_suppressed:
+                raise InterruptHistoryInvalid()
+            if row["result"] == "authorized" and (
+                payload.trigger_class is None
+                or payload.style_selected is None
+                or payload.candidate_digest is None
+                or payload.confidence < 0.72
+            ):
+                raise InterruptHistoryInvalid()
+            if row["result"] == "deferred" and payload.candidate_digest is not None:
+                raise InterruptHistoryInvalid()
+        elif isinstance(payload, _ExecutionEvidence):
+            if row["result"] != "executed":
+                raise InterruptHistoryInvalid()
+        elif row["result"] not in {"accepted", "overridden", "recovered"}:
+            raise InterruptHistoryInvalid()
+        return payload
+    except (KeyError, TypeError, ValueError, ValidationError) as error:
+        raise InterruptHistoryInvalid("interrupt_history_invalid") from error
+
+
+def _projection(active, state: str, count: int = 0) -> InterruptLifecycle:
+    return InterruptLifecycle(
+        state=state,
+        prior_executed_request_id=active["row"]["request_id"],
+        prior_trigger=active["payload"].trigger_class,
+        repeated_trigger_count=count,
+        candidate_suppressed=state in {"overridden", "repeat_suppressed"},
+        reason_code={
+            "awaiting_feedback": "execution_recorded",
+            "accepted": "trigger_not_recurred",
+            "overridden": "trigger_recurred",
+            "repeat_suppressed": "repeat_trigger_suppressed",
+            "recovered": "pattern_broken",
+        }[state],
+    )
+
+
+def _transition(active, trigger):
+    if active is None or active["state"] in {"accepted", "recovered"}:
+        return InterruptLifecycle(), active, None
+    same = trigger == active["payload"].trigger_class
+    if active["state"] == "awaiting_feedback":
+        state, count = ("overridden", 1) if same else ("accepted", 0)
+        recovery = state
+    elif same:
+        state, count, recovery = "repeat_suppressed", active["count"] + 1, None
+    else:
+        state, count, recovery = "recovered", active["count"], "recovered"
+    updated = {**active, "state": state, "count": count}
+    return _projection(updated, state, count), updated, recovery
+
+
+def _history(rows):
+    evaluations, executions, outcomes = {}, {}, {}
+    active, pending = None, None
+    keys = set()
+    for row in rows:
+        payload = _decode_event(row)
+        key = (*_scope(row), row["check_type"])
+        if key in keys:
+            raise InterruptHistoryInvalid("interrupt_history_duplicate")
+        keys.add(key)
+        if isinstance(payload, _RecoveryEvidence):
+            if pending is not None or active is None or payload.execution_id != active["row"]["id"]:
+                raise InterruptHistoryInvalid("interrupt_recovery_unbound")
+            pending = row, payload
+        elif isinstance(payload, _EvaluationEvidence):
+            if payload.lifecycle.state == "history_unavailable":
+                # Conservative diagnostics are never a state transition or authority.
+                if pending is not None:
+                    raise InterruptHistoryInvalid("interrupt_recovery_unbound")
+            else:
+                expected, updated, recovery = _transition(active, payload.trigger_class)
+                if payload.lifecycle != expected or (pending is not None) != (recovery is not None):
+                    raise InterruptHistoryInvalid("interrupt_transition_inconsistent")
+                if pending is not None:
+                    observed, proof = pending
+                    if (
+                        _scope(observed) != _scope(row)
+                        or observed["result"] != recovery
+                        or proof.trigger_class != expected.prior_trigger
+                        or proof.repeated_trigger_count != expected.repeated_trigger_count
+                        or proof.reason_code != expected.reason_code
+                        or (observed["contract_id"], observed["contract_version"])
+                        != (active["row"]["contract_id"], active["row"]["contract_version"])
+                    ):
+                        raise InterruptHistoryInvalid("interrupt_recovery_inconsistent")
+                    pending = None
+                active = updated
+                if expected.prior_executed_request_id is not None:
+                    outcomes[active["row"]["id"]] = expected
+            evaluations[row["id"]] = row, payload
+        else:
+            evaluation = evaluations.get(payload.evaluation_id)
+            if pending is not None or evaluation is None or payload.evaluation_id in executions:
+                raise InterruptHistoryInvalid("interrupt_execution_unbound")
+            evaluated, proof = evaluation
+            if (
+                _scope(evaluated) != _scope(row)
+                or evaluated["result"] != "authorized"
+                or (proof.trigger_class, proof.style_selected, proof.candidate_digest)
+                != (payload.trigger_class, payload.style_selected, payload.candidate_digest)
+                or (evaluated["contract_id"], evaluated["contract_version"])
+                != (row["contract_id"], row["contract_version"])
+            ):
+                raise InterruptHistoryInvalid("interrupt_execution_inconsistent")
+            active = {"row": row, "payload": payload, "state": "awaiting_feedback", "count": 0}
+            executions[payload.evaluation_id] = row, payload
+            outcomes[row["id"]] = _projection(active, "awaiting_feedback")
+    if pending is not None:
+        raise InterruptHistoryInvalid("interrupt_recovery_incomplete")
+    return evaluations, executions, outcomes, active
+
+
+def _append(repository, connection, body, contract_id, contract_version, kind, result, payload):
+    return repository.record_interaction_boundary_event(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        contract_id=contract_id,
+        contract_version=contract_version,
+        check_type=kind,
+        severity="none",
+        input_summary="interrupt lifecycle",
+        result=result,
+        reason_json=payload.model_dump(mode="json"),
+        connection=connection,
+        idempotent=True,
+    )
+
+
+def _evaluate_lifecycle(body, contract, trigger, style, confidence, candidate):
+    repository = companion_contracts_repository()
+    input_digest = _digest(
+        json.dumps(body.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    )
+    candidate_digest = _digest(candidate) if candidate is not None else None
+    with repository.interaction_boundary_transaction() as connection:
+        rows = repository.interaction_boundary_history(
+            connection=connection,
+            owner_id=body.owner_id,
+            conversation_id=body.conversation_id,
+            check_types=_EVENT_TYPES,
+            check_type_prefix="interrupt_",
+        )
+        existing = [
+            row
+            for row in rows
+            if row["check_type"] == "interrupt_evaluation"
+            and row["request_id"] == body.request_id
+            and row["surface"] == body.surface
+        ]
+        try:
+            evaluations, _, _, active = _history(rows)
+        except InterruptHistoryInvalid:
+            lifecycle = InterruptLifecycle(
+                state="history_unavailable",
+                candidate_suppressed=True,
+                reason_code="lifecycle_history_invalid",
+            )
+            # Never overwrite or duplicate a corrupt/previous authority record.
+            if existing:
+                return lifecycle
+            recovery = None
+        else:
+            if existing:
+                row, proof = evaluations[existing[0]["id"]]
+                if proof.input_digest != input_digest or (
+                    proof.trigger_class,
+                    proof.style_selected,
+                    proof.confidence,
+                    proof.candidate_digest,
+                ) != (trigger, style, confidence, candidate_digest):
+                    raise ValueError("interrupt_evaluation_conflict")
+                return proof.lifecycle
+            lifecycle, _, recovery = _transition(active, trigger)
+            if recovery is not None:
+                _append(
+                    repository,
+                    connection,
+                    body,
+                    active["row"]["contract_id"],
+                    active["row"]["contract_version"],
+                    "interrupt_recovery",
+                    recovery,
+                    _RecoveryEvidence(
+                        schema_version="interrupt-lifecycle.v1",
+                        execution_id=active["row"]["id"],
+                        trigger_class=lifecycle.prior_trigger,
+                        repeated_trigger_count=lifecycle.repeated_trigger_count,
+                        reason_code=lifecycle.reason_code,
+                    ),
+                )
+        result = (
+            "repeat_suppressed"
+            if lifecycle.candidate_suppressed
+            else ("authorized" if candidate is not None else "deferred")
+        )
+        _append(
+            repository,
+            connection,
+            body,
+            contract.contract_id,
+            contract.contract_version,
+            "interrupt_evaluation",
+            result,
+            _EvaluationEvidence(
+                schema_version="interrupt-lifecycle.v1",
+                input_digest=input_digest,
+                trigger_class=trigger,
+                style_selected=style,
+                confidence=confidence,
+                candidate_digest=candidate_digest,
+                lifecycle=lifecycle,
+            ),
+        )
+        return lifecycle
+
+
+def execute_interrupt(body: InterruptExecutionRequest) -> InterruptExecutionResponse:
+    repository = companion_contracts_repository()
+    with repository.interaction_boundary_transaction() as connection:
+        rows = repository.interaction_boundary_history(
+            connection=connection,
+            owner_id=body.owner_id,
+            conversation_id=body.conversation_id,
+            check_types=_EVENT_TYPES,
+            check_type_prefix="interrupt_",
+        )
+        if not any(
+            _scope(row) == (body.request_id, body.owner_id, body.conversation_id, body.surface)
+            and row["check_type"] == "interrupt_evaluation"
+            for row in rows
+        ):
+            raise LookupError("interrupt_evaluation_not_found")
+        evaluations, executions, outcomes, _ = _history(rows)
+        found = [
+            (row, proof)
+            for row, proof in evaluations.values()
+            if _scope(row) == (body.request_id, body.owner_id, body.conversation_id, body.surface)
+        ]
+        if len(found) != 1:
+            raise LookupError("interrupt_evaluation_not_found")
+        row, proof = found[0]
+        digest = _digest(body.intervention_text)
+        if row["result"] != "authorized" or (
+            proof.trigger_class,
+            proof.style_selected,
+            proof.candidate_digest,
+        ) != (body.trigger_class, body.style_selected, digest):
+            raise ValueError("interrupt_execution_conflict")
+        replay = row["id"] in executions
+        _append(
+            repository,
+            connection,
+            body,
+            row["contract_id"],
+            row["contract_version"],
+            "interrupt_execution",
+            "executed",
+            _ExecutionEvidence(
+                schema_version="interrupt-lifecycle.v1",
+                evaluation_id=row["id"],
+                trigger_class=body.trigger_class,
+                style_selected=body.style_selected,
+                candidate_digest=digest,
+            ),
+        )
+    active = {"row": row, "payload": proof}
+    lifecycle = (
+        outcomes[executions[row["id"]][0]["id"]]
+        if replay
+        else (_projection(active, "awaiting_feedback"))
+    )
+    return InterruptExecutionResponse(
+        request_id=body.request_id,
+        owner_id=body.owner_id,
+        conversation_id=body.conversation_id,
+        surface=body.surface,
+        execution_recorded=True,
+        idempotent_replay=replay,
+        lifecycle=lifecycle,
+    )
+
+
+def interrupt_debug(*, request_id: str, owner_id: str, conversation_id: str):
+    repository = companion_contracts_repository()
+    with repository.interaction_boundary_transaction() as connection:
+        rows = repository.interaction_boundary_history(
+            connection=connection,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            check_types=_EVENT_TYPES,
+            check_type_prefix="interrupt_",
+        )
+        # Check binding before interpreting any private lifecycle history.
+        if not any(
+            row["request_id"] == request_id and row["check_type"] == "interrupt_evaluation"
+            for row in rows
+        ):
+            raise LookupError("interrupt_request_not_found")
+        evaluations, executions, outcomes, _ = _history(rows)
+        found = [
+            (row, proof) for row, proof in evaluations.values() if row["request_id"] == request_id
+        ]
+        if len(found) != 1:
+            raise LookupError("interrupt_request_not_found")
+        row, proof = found[0]
+        execution = executions.get(row["id"])
+        lifecycle = outcomes[execution[0]["id"]] if execution else proof.lifecycle
+    return InterruptLifecycleDebugResponse(
+        request_id=request_id,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        surface=row["surface"],
+        trigger_class=proof.trigger_class,
+        style_selected=proof.style_selected,
+        evaluation_result=row["result"],
+        execution_state="executed" if execution else "not_executed",
+        recovery_outcome=lifecycle.state
+        if lifecycle.state in {"accepted", "overridden", "recovered"}
+        else ("overridden" if lifecycle.state == "repeat_suppressed" else None),
+        lifecycle=lifecycle,
     )

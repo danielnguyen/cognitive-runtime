@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Path, Query
 from models import (
     ActionAuthorityDecisionRequest,
     ActionAuthorityDecisionResponse,
@@ -43,6 +43,9 @@ from models import (
     InteractionGovernanceEvaluateResponse,
     InterruptEvaluateRequest,
     InterruptEvaluateResponse,
+    InterruptExecutionRequest,
+    InterruptExecutionResponse,
+    InterruptLifecycleDebugResponse,
     MemoryHygieneEvaluateRequest,
     MemoryHygieneEvaluateResponse,
     PersonaContainmentEvaluateRequest,
@@ -142,7 +145,12 @@ from services.interaction_diagnostics import (
     validate_interaction_text,
 )
 from services.interaction_governance import evaluate_interaction_governance
-from services.interrupt_policy import evaluate_interrupt_policy
+from services.interrupt_policy import (
+    InterruptHistoryInvalid,
+    evaluate_interrupt_policy,
+    execute_interrupt,
+    interrupt_debug,
+)
 from services.memory_hygiene import evaluate_memory_hygiene
 from services.persona_containment import evaluate_persona_containment
 from services.privacy_context import evaluate_privacy_context
@@ -1258,7 +1266,41 @@ async def companion_policy_compile(
 
 @app.post("/v1/interrupt/evaluate", response_model=InterruptEvaluateResponse)
 async def interrupt_evaluate(body: InterruptEvaluateRequest) -> InterruptEvaluateResponse:
-    return evaluate_interrupt_policy(body)
+    try:
+        return evaluate_interrupt_policy(body)
+    except ValueError as error:
+        if str(error) in {"interrupt_evaluation_conflict", "interaction_boundary_event_conflict"}:
+            raise HTTPException(status_code=409, detail="interrupt_evaluation_conflict") from None
+        raise
+
+
+@app.post("/v1/interrupt/execute", response_model=InterruptExecutionResponse)
+async def interrupt_execute(body: InterruptExecutionRequest) -> InterruptExecutionResponse:
+    try:
+        return execute_interrupt(body)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="interrupt_evaluation_not_found") from None
+    except ValueError as error:
+        if isinstance(error, InterruptHistoryInvalid) or str(error) in {
+            "interrupt_execution_conflict", "interaction_boundary_event_conflict",
+        }:
+            raise HTTPException(status_code=409, detail="interrupt_execution_conflict") from None
+        raise
+
+
+@app.get("/v1/interrupt/debug/{request_id}", response_model=InterruptLifecycleDebugResponse)
+async def interrupt_lifecycle_debug(
+    request_id: str = Path(min_length=1, max_length=120),
+    owner_id: str = Query(min_length=1, max_length=120),
+    conversation_id: str = Query(min_length=1, max_length=120),
+) -> InterruptLifecycleDebugResponse:
+    try:
+        return interrupt_debug(request_id=request_id, owner_id=owner_id,
+                               conversation_id=conversation_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="interrupt_request_not_found") from None
+    except InterruptHistoryInvalid:
+        raise HTTPException(status_code=409, detail="interrupt_history_unavailable") from None
 
 
 def _scene_policy_detail(scene) -> ScenePolicyDetail:

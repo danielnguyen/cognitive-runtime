@@ -4301,6 +4301,83 @@ class InterruptEvaluateRequest(RuntimeStateResolveRequest):
     contract_trace: InteractionContractTrace | None = None
 
 
+class InterruptLifecycle(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    state: Literal[
+        "none", "awaiting_feedback", "accepted", "overridden", "repeat_suppressed",
+        "recovered", "history_unavailable",
+    ] = "none"
+    prior_executed_request_id: BoundedTraceRef | None = None
+    prior_trigger: InterruptTriggerClass | None = None
+    repeated_trigger_count: int = Field(default=0, ge=0, le=2147483647)
+    candidate_suppressed: bool = False
+    reason_code: Literal[
+        "not_executed", "execution_recorded", "trigger_not_recurred", "trigger_recurred",
+        "repeat_trigger_suppressed", "pattern_broken", "lifecycle_history_invalid",
+    ] = "not_executed"
+
+    @model_validator(mode="after")
+    def coherent(self) -> "InterruptLifecycle":
+        reasons = {
+            "none": "not_executed", "awaiting_feedback": "execution_recorded",
+            "accepted": "trigger_not_recurred", "overridden": "trigger_recurred",
+            "repeat_suppressed": "repeat_trigger_suppressed", "recovered": "pattern_broken",
+            "history_unavailable": "lifecycle_history_invalid",
+        }
+        referenced = self.state not in {"none", "history_unavailable"}
+        suppressed = self.state in {"overridden", "repeat_suppressed", "history_unavailable"}
+        if (self.reason_code != reasons[self.state] or self.candidate_suppressed != suppressed
+                or referenced != (self.prior_executed_request_id is not None)
+                or referenced != (self.prior_trigger is not None)
+                or (self.state in {"none", "awaiting_feedback", "accepted", "history_unavailable"}
+                    and self.repeated_trigger_count != 0)
+                or (self.state in {"overridden", "repeat_suppressed", "recovered"}
+                    and self.repeated_trigger_count < 1)):
+            raise ValueError("interrupt_lifecycle_inconsistent")
+        return self
+
+
+class InterruptExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    request_id: str = Field(min_length=1, max_length=120)
+    owner_id: str = Field(min_length=1, max_length=120)
+    conversation_id: str = Field(min_length=1, max_length=120)
+    surface: str = Field(min_length=1, max_length=64)
+    trigger_class: InterruptTriggerClass
+    style_selected: InterruptStyle
+    intervention_text: str = Field(min_length=1, max_length=240)
+
+    @field_validator("request_id", "owner_id", "conversation_id", "surface", "intervention_text")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("interrupt_execution_invalid")
+        return value
+
+
+class InterruptExecutionResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    execution_recorded: bool
+    idempotent_replay: bool
+    lifecycle: InterruptLifecycle
+
+
+class InterruptLifecycleDebugResponse(BaseModel):
+    request_id: str = Field(max_length=120)
+    owner_id: str = Field(max_length=120)
+    conversation_id: str = Field(max_length=120)
+    surface: str = Field(max_length=64)
+    trigger_class: InterruptTriggerClass | None
+    style_selected: InterruptStyle | None
+    evaluation_result: Literal["authorized", "deferred", "repeat_suppressed"]
+    execution_state: Literal["not_executed", "executed"]
+    recovery_outcome: Literal["accepted", "overridden", "recovered"] | None
+    lifecycle: InterruptLifecycle
+
+
 class InterruptDebug(BaseModel):
     detector_signals: dict[str, Any] = Field(default_factory=dict)
     advisory_text: str | None = Field(default=None, max_length=240)
@@ -4327,9 +4404,14 @@ class InterruptEvaluateResponse(BaseModel):
     contract_constraints_applied: dict[str, Any] = Field(default_factory=dict)
     warnings: list[BoundedLabel] = Field(default_factory=list, max_length=12)
     debug: InterruptDebug
+    lifecycle: InterruptLifecycle = Field(default_factory=InterruptLifecycle)
 
     @model_validator(mode="after")
     def validate_intervention_projection(self) -> "InterruptEvaluateResponse":
+        if self.lifecycle.candidate_suppressed and (
+            self.should_interrupt or not self.should_defer or self.intervention_text is not None
+        ):
+            raise ValueError("interrupt_lifecycle_authority_inconsistent")
         if self.should_interrupt:
             if (
                 self.should_defer
