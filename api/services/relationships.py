@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from models import (
+    PersonaContainmentAuthority,
     RelationshipDiagnosticsResponse,
     RelationshipEdgeConfirmRequest,
     RelationshipEdgeEvidenceInput,
@@ -26,9 +27,11 @@ from models import (
     RelationshipSelectTrace,
     RelationshipStatus,
     RuntimeIdentityResolveRequest,
+    SurfaceBinding,
 )
 from services.companion_contracts import companion_contracts_repository
-from services.runtime_identity import resolve_runtime_identity
+from services.persona_containment import validate_relationship_domain_baseline
+from services.runtime_identity import consume_persona_selection_evidence, resolve_runtime_identity
 from services.runtime_state import runtime_state_db_path
 
 _RELATIONSHIP_REPOSITORY: RelationshipRepository | None = None
@@ -105,6 +108,83 @@ _SURFACE_SCOPE_RESTRICTIONS: dict[str, set[str]] = {
         "system_configuration",
     },
 }
+
+
+def _strict_relationship_authority(body: RelationshipSelectRequest):
+    _, selection, events = consume_persona_selection_evidence(body, include_containment=True)
+    selection_index = next(
+        index for index, event in enumerate(events)
+        if event.event_type == "persona_selection_resolved"
+    )
+    committed = []
+    for index, event in enumerate(events):
+        if event.event_type != "persona_containment_evaluated":
+            continue
+        if index <= selection_index:
+            raise ValueError("relationship_containment_order_invalid")
+        payload = event.event_payload_json
+        try:
+            authority = PersonaContainmentAuthority.model_validate(
+                payload.get("strict_containment"), strict=True,
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError("relationship_containment_invalid") from exc
+        if any(getattr(authority, key) != getattr(selection, key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id", "thread_revision",
+        )) or authority.persona_selection_ref != selection.selection_ref:
+            raise ValueError("relationship_containment_binding_mismatch")
+        result = authority.result
+        if result.active_persona_id != selection.active_persona_id:
+            raise ValueError("relationship_containment_persona_mismatch")
+        if payload.get("persona_selection_ref") != selection.selection_ref:
+            raise ValueError("relationship_containment_binding_mismatch")
+        result_payload = result.model_dump()
+        for key in (
+            "active_persona_id", "capability_domain", "allowed_memory_domains",
+            "blocked_memory_domains", "allowed_tool_domains", "artifact_access_policy",
+            "cross_scope_access_allowed", "cross_scope_reason", "reason_summary",
+        ):
+            if payload.get(key) != result_payload[key]:
+                raise ValueError("relationship_containment_inconsistent")
+        if payload.get("request_id") != selection.request_id:
+            raise ValueError("relationship_containment_binding_mismatch")
+        validate_relationship_domain_baseline(result)
+        committed.append(authority)
+    if not committed:
+        raise ValueError("relationship_containment_missing")
+    if any(authority != committed[0] for authority in committed[1:]):
+        raise ValueError("relationship_containment_conflict")
+    # Unknown/fallback provenance never borrows a recognized surface's restrictions.
+    if selection.selection_source == "conservative_fallback":
+        surface_type = "unknown_surface"
+    else:
+        record = companion_contracts_repository().surface_binding(body.surface)
+        if record is None:
+            raise ValueError("relationship_surface_authority_unavailable")
+        binding = SurfaceBinding.model_validate(record.__dict__, strict=True)
+        surface_type = binding.surface_type
+    if surface_type not in _SURFACE_SCOPE_RESTRICTIONS or (
+        selection.active_persona_id not in _RELATIONSHIP_SCOPE_ALLOWLISTS
+    ):
+        raise ValueError("relationship_scope_authority_unavailable")
+    allowed = _relationship_scope_ceiling(
+        selection.active_persona_id, surface_type, body.requested_scopes,
+    )
+    return selection, committed[0], allowed
+
+
+def _relationship_scope_ceiling(persona_id: str, surface_type: str, requested_scopes):
+    persona_scopes = _RELATIONSHIP_SCOPE_ALLOWLISTS.get(
+        persona_id, _RELATIONSHIP_SCOPE_ALLOWLISTS["general_assistant"],
+    )
+    surface_scopes = _SURFACE_SCOPE_RESTRICTIONS.get(
+        surface_type, _SURFACE_SCOPE_RESTRICTIONS["unknown_surface"],
+    )
+    allowed = set(persona_scopes) & set(surface_scopes)
+    if requested_scopes:
+        allowed &= {scope for scope in requested_scopes if scope}
+    return allowed
 
 
 def _now() -> str:
@@ -537,16 +617,21 @@ class RelationshipRepository:
         )
 
     def select_relationships(self, body: RelationshipSelectRequest) -> RelationshipSelectResponse:
+        authority = None
+        if body.persona_selection_mode == "strict":
+            authority = _strict_relationship_authority(body)
+            persona_id, allowed_scopes = authority[0].active_persona_id, authority[2]
         diagnostics = self.diagnostics(owner_id=body.owner_id, include_restricted_details=False)
-        persona_id, allowed_scopes = resolve_relationship_persona_scope(
-            request_id=body.request_id,
-            owner_id=body.owner_id,
-            conversation_id=body.conversation_id,
-            surface=body.surface,
-            runtime_session_id=body.runtime_session_id,
-            active_persona_id=body.active_persona_id,
-            requested_scopes=body.requested_scopes,
-        )
+        if authority is None:
+            persona_id, allowed_scopes = resolve_relationship_persona_scope(
+                request_id=body.request_id,
+                owner_id=body.owner_id,
+                conversation_id=body.conversation_id,
+                surface=body.surface,
+                runtime_session_id=body.runtime_session_id,
+                active_persona_id=body.active_persona_id,
+                requested_scopes=body.requested_scopes,
+            )
         entity_map = {entity.entity_id: entity for entity in diagnostics.entities}
         relationships = diagnostics.relationships
         conflict_map = self._relationship_conflict_map(relationships)
@@ -657,6 +742,9 @@ class RelationshipRepository:
             active_persona_id=persona_id,
             allowed_relationship_scopes=sorted(allowed_scopes),
         )
+        projection = _retrieval_scope_projection(selected)
+        if authority is not None and _strict_relationship_authority(body) != authority:
+            raise ValueError("relationship_authority_changed")
         return RelationshipSelectResponse(
             selected_entities=selected_entities,
             selected_relationships=selected,
@@ -667,7 +755,9 @@ class RelationshipRepository:
                 else None
             ),
             trace=trace,
-            retrieval_scope_projection=_retrieval_scope_projection(selected),
+            retrieval_scope_projection=projection,
+            selection_contract="strict_turn" if authority is not None else "legacy_unbound",
+            persona_selection_ref=authority[0].selection_ref if authority is not None else None,
         )
 
     def _validate_edge_input(self, edge: RelationshipEdgeInput) -> None:
@@ -1179,17 +1269,7 @@ def resolve_relationship_persona_scope(
     else:
         binding = companion_contracts_repository().surface_binding(surface)
         surface_type = binding.surface_type if binding is not None else "unknown_surface"
-    persona_scopes = _RELATIONSHIP_SCOPE_ALLOWLISTS.get(
-        active_persona_id,
-        _RELATIONSHIP_SCOPE_ALLOWLISTS["general_assistant"],
-    )
-    surface_scopes = _SURFACE_SCOPE_RESTRICTIONS.get(
-        surface_type,
-        _SURFACE_SCOPE_RESTRICTIONS["unknown_surface"],
-    )
-    allowed = set(persona_scopes) & set(surface_scopes)
-    if requested_scopes:
-        allowed &= {scope for scope in requested_scopes if scope}
+    allowed = _relationship_scope_ceiling(active_persona_id, surface_type, requested_scopes)
     return active_persona_id, allowed
 
 

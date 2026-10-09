@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from main import _relationship_domain_http_error, app
-from services.relationships import RelationshipRepository
+from services.relationships import RelationshipRepository, relationship_repository
+from services.runtime_state import clear_states_for_tests, runtime_state_repository
 
 
 def _iso(delta_seconds: int) -> str:
@@ -111,6 +113,476 @@ def _evidence(summary: str = "Configured project-repo binding.") -> dict[str, ob
         "summary": summary,
         "confidence_delta": 0.2,
     }
+
+
+def _strict_relationship_turn(
+    client, *, surface="web", text="I broke the server and prod is failing",
+    containment_text=None, selection=True, containment=True,
+):
+    payload = {**_base(), "surface": surface}
+    started = client.post("/v1/runtime/turns/start", json=payload)
+    assert started.status_code == 200
+    payload.update(
+        runtime_session_id=started.json()["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=started.json()["runtime_turn"]["runtime_turn_id"],
+    )
+    assert client.post("/v1/runtime/interaction-governance/evaluate", json={
+        **payload, "current_user_text": text,
+    }).status_code == 200
+    request = {**payload, "persona_selection_mode": "strict"}
+    decision = None
+    if selection:
+        identity = client.post("/v1/runtime/identity/resolve", json=request)
+        assert identity.status_code == 200
+        decision = identity.json()["persona_selection"]
+    request["persona_selection_ref"] = (
+        decision["selection_ref"] if decision else "psel_00000000000000000000000000000000"
+    )
+    containment_request = {**request, "current_user_text": containment_text or text}
+    if selection and containment:
+        result = client.post("/v1/runtime/persona-containment/evaluate", json=containment_request)
+        assert result.status_code == 200
+    return request, decision, containment_request
+
+
+def _seed_strict_relationships(client):
+    _seed_entities(client)
+    cases = {
+        "rel-project": {},
+        "rel-professional": {"relationship_scope": "professional_context"},
+        "rel-system": {
+            "relationship_scope": "system_configuration", "mentionability": "use_for_routing_only",
+        },
+        "rel-private-hidden": {
+            "relationship_scope": "personal_context",
+            "allowed_persona_scopes_json": ["personal_companion"],
+        },
+        "rel-technical-only": {"allowed_persona_scopes_json": ["technical_architect"]},
+    }
+    for reference, overrides in cases.items():
+        response = client.post("/v1/relationships/edges/upsert", json={
+            **_base(), "edge": _edge(relationship_id=reference, **overrides),
+            "evidence": [_evidence()],
+        })
+        assert response.status_code == 200
+
+
+def _assert_relationship_authority_failure(response):
+    assert response.status_code == 409
+    assert response.json() == {"detail": "relationship_authority_rejected"}
+    assert not any(key in response.json() for key in (
+        "selected_relationships", "prompt_content", "retrieval_scope_projection", "trace",
+    ))
+    assert "rel-private-hidden" not in response.text
+    assert "private_sentinel" not in response.text
+
+
+@pytest.mark.parametrize("surface,persona,selected", [
+    ("web", "general_assistant", {"rel-project", "rel-professional"}),
+    ("dev", "technical_architect", {
+        "rel-project", "rel-professional", "rel-system", "rel-technical-only",
+    }),
+    ("vscode", "technical_architect", {
+        "rel-project", "rel-professional", "rel-system", "rel-technical-only",
+    }),
+    ("unregistered", "general_assistant", {
+        "rel-project", "rel-professional", "rel-system",
+    }),
+])
+def test_strict_relationships_use_selected_persona_and_existing_surface_ceiling(
+    surface, persona, selected,
+):
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    payload, decision, _ = _strict_relationship_turn(client, surface=surface)
+    response = client.post("/v1/relationships/select", json={
+        **payload, "active_persona_id": persona,
+        "expected_thread_revision": decision["thread_revision"],
+    })
+    assert response.status_code == 200
+    result = response.json()
+    assert result["selection_contract"] == "strict_turn"
+    assert result["persona_selection_ref"] == decision["selection_ref"]
+    assert result["trace"]["active_persona_id"] == persona
+    assert decision["contextual_activation"] is False
+    assert {edge["relationship_id"] for edge in result["selected_relationships"]} == selected
+    projection = result["retrieval_scope_projection"]
+    assert set(projection["relationship_ids"]) == selected
+    assert projection["entity_ids"] == ["project:alpha", "repo:alpha"]
+    assert "personal_context" not in projection["relationship_scopes"]
+    assert "system_configuration" not in (result["prompt_content"] or "")
+
+
+@pytest.mark.parametrize("text,proposed", [
+    ("I broke the server and prod is failing", "technical_architect"),
+    ("That was wrong in the report.", "personal_companion"),
+])
+def test_strict_advisory_proposal_cannot_expand_relationships_or_retrieval(text, proposed):
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    payload, decision, _ = _strict_relationship_turn(client, text=text)
+    assert decision["proposed_persona_id"] == proposed
+    response = client.post("/v1/relationships/select", json=payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["trace"]["active_persona_id"] == "general_assistant"
+    assert set(result["retrieval_scope_projection"]["relationship_ids"]) == {
+        "rel-project", "rel-professional",
+    }
+    assert "rel-private-hidden" not in result["retrieval_scope_projection"]["relationship_ids"]
+    assert "rel-technical-only" not in result["retrieval_scope_projection"]["relationship_ids"]
+
+
+@pytest.mark.parametrize("scopes,expected", [
+    (["project_context"], {"rel-project"}),
+    (["personal_context"], set()),
+    (["project_context", "personal_context"], {"rel-project"}),
+    (["unmapped_context"], set()),
+])
+def test_strict_requested_relationship_scopes_only_narrow(scopes, expected):
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    payload, _, _ = _strict_relationship_turn(client)
+    response = client.post("/v1/relationships/select", json={**payload, "requested_scopes": scopes})
+    assert response.status_code == 200
+    result = response.json()
+    assert {edge["relationship_id"] for edge in result["selected_relationships"]} == expected
+    projection = result["retrieval_scope_projection"]
+    if expected:
+        assert projection == {
+            "applied": True, "relationship_ids": ["rel-project"],
+            "entity_ids": ["project:alpha", "repo:alpha"],
+            "relationship_scopes": ["project_context"],
+            "reason_codes": ["eligible_relationship_scope_selected"],
+        }
+    else:
+        assert projection["applied"] is False
+        assert projection["relationship_ids"] == projection["entity_ids"] == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("request_id", "wrong_request"), ("owner_id", "wrong_owner"),
+    ("conversation_id", "wrong_conversation"), ("surface", "vscode"),
+    ("runtime_session_id", "wrong_session"), ("runtime_turn_id", "wrong_turn"),
+    ("expected_thread_revision", 0), ("active_persona_id", "personal_companion"),
+    ("persona_selection_ref", "psel_00000000000000000000000000000000"),
+])
+def test_strict_relationship_mismatch_fails_before_protected_read(field, value, monkeypatch):
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    payload, _, _ = _strict_relationship_turn(client)
+    reads = []
+    monkeypatch.setattr(relationship_repository(), "diagnostics", lambda **kw: reads.append(kw))
+    response = client.post("/v1/relationships/select", json={**payload, field: value})
+    _assert_relationship_authority_failure(response)
+    assert reads == []
+    events = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    assert sum(event.event_type == "persona_selection_resolved" for event in events) == 1
+
+
+@pytest.mark.parametrize("selection,containment", [(False, False), (True, False)])
+def test_strict_relationship_requires_both_predecessors_without_fabrication(
+    selection, containment, monkeypatch,
+):
+    client = TestClient(app)
+    payload, _, _ = _strict_relationship_turn(client, selection=selection, containment=containment)
+    reads = []
+    monkeypatch.setattr(relationship_repository(), "diagnostics", lambda **kw: reads.append(kw))
+    response = client.post("/v1/relationships/select", json=payload)
+    _assert_relationship_authority_failure(response)
+    assert reads == []
+    events = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    assert sum(event.event_type == "persona_selection_resolved" for event in events) == (
+        int(selection)
+    )
+    assert not any(event.event_type == "persona_containment_evaluated" for event in events)
+
+
+@pytest.mark.parametrize("mutation", [
+    {"persona_selection_ref": "malformed"}, {"selection_source": "explicit_user"},
+    {"persona_scope_hint": "supportive_listener"}, {"requested_persona_id": "personal_companion"},
+    {"runtime_turn_id": None}, {"runtime_session_id": None}, {"persona_selection_ref": None},
+    {"expected_thread_revision": True},
+])
+def test_strict_relationship_request_rejects_incomplete_and_spoofed_fields(mutation):
+    client = TestClient(app)
+    payload, _, _ = _strict_relationship_turn(client)
+    response = client.post("/v1/relationships/select", json={**payload, **mutation})
+    assert response.status_code == 422
+    assert "rel-private-hidden" not in response.text
+
+
+@pytest.mark.parametrize("status", ["completed", "abandoned"])
+def test_strict_relationship_rejects_terminal_turn(status, monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_relationship_turn(client)
+    assert client.post("/v1/runtime/turns/complete", json={
+        key: payload[key] for key in ("request_id", "runtime_session_id", "runtime_turn_id")
+    } | {"turn_status": status}).status_code == 200
+    reads = []
+    monkeypatch.setattr(relationship_repository(), "diagnostics", lambda **kw: reads.append(kw))
+    _assert_relationship_authority_failure(client.post("/v1/relationships/select", json=payload))
+    assert reads == []
+
+
+@pytest.mark.parametrize("corruption", [
+    "selection_json", "selection_persona", "governance", "containment_json", "status",
+    "missing_status", "owner", "revision", "persona", "reference", "missing_policy",
+    "domains_string", "confidence_bool", "extra_policy", "session", "contradictory_domains",
+])
+def test_strict_relationship_corrupt_authority_fails_before_read(corruption, monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_relationship_turn(client)
+    repo = runtime_state_repository()
+    with repo._connect() as conn:
+        kind = "persona_containment_evaluated"
+        if corruption.startswith("selection"):
+            kind = "persona_selection_resolved"
+        elif corruption == "governance":
+            kind = "interaction_governance_evaluated"
+        row = conn.execute(
+            "SELECT id, event_payload_json FROM conversation_runtime_events WHERE event_type = ?",
+            (kind,),
+        ).fetchone()
+        changed = json.loads(row["event_payload_json"])
+        if corruption.endswith("json"):
+            value = "private_sentinel invalid_json"
+        else:
+            if corruption == "selection_persona":
+                changed["active_persona_id"] = "personal_companion"
+            elif corruption == "governance":
+                changed["interaction_kind"] = "question"
+            elif corruption == "missing_policy":
+                del changed["strict_containment"]
+            else:
+                authority = changed["strict_containment"]
+                if corruption == "status":
+                    authority["status"] = "failed"
+                elif corruption == "missing_status":
+                    del authority["status"]
+                elif corruption == "owner":
+                    authority["owner_id"] = "other_owner"
+                elif corruption == "revision":
+                    authority["thread_revision"] += 1
+                elif corruption == "persona":
+                    authority["result"]["active_persona_id"] = "personal_companion"
+                elif corruption == "reference":
+                    authority["persona_selection_ref"] = "psel_00000000000000000000000000000000"
+                elif corruption == "domains_string":
+                    authority["result"]["allowed_relationship_domains"] = "general"
+                elif corruption == "confidence_bool":
+                    authority["result"]["confidence"] = True
+                elif corruption == "extra_policy":
+                    authority["result"]["current_user_text"] = "private_sentinel"
+                elif corruption == "session":
+                    authority["runtime_session_id"] = "wrong_session"
+                elif corruption == "contradictory_domains":
+                    authority["result"]["blocked_memory_domains"].append("general")
+                    changed["blocked_memory_domains"].append("general")
+            value = json.dumps(changed)
+        conn.execute(
+            "UPDATE conversation_runtime_events SET event_payload_json = ? WHERE id = ?",
+            (value, row["id"]),
+        )
+    reads = []
+    monkeypatch.setattr(relationship_repository(), "diagnostics", lambda **kw: reads.append(kw))
+    _assert_relationship_authority_failure(client.post("/v1/relationships/select", json=payload))
+    assert reads == []
+
+
+def test_strict_relationship_accepts_only_consistent_multiple_containment_events():
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    payload, _, containment = _strict_relationship_turn(client, surface="dev")
+    assert client.post(
+        "/v1/runtime/persona-containment/evaluate", json=containment,
+    ).status_code == 200
+    assert client.post("/v1/relationships/select", json=payload).status_code == 200
+    assert client.post("/v1/runtime/persona-containment/evaluate", json={
+        **containment, "current_user_text": "What is 2+2?",
+    }).status_code == 200
+    # Same persona/domain envelope, but conflicting independently published policy.
+    _assert_relationship_authority_failure(client.post("/v1/relationships/select", json=payload))
+
+
+def test_strict_narrowed_containment_fails_without_domain_scope_translation(monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_relationship_turn(
+        client, surface="dev", containment_text="Check vehicle maintenance and tire pressure.",
+    )
+    reads = []
+    monkeypatch.setattr(relationship_repository(), "diagnostics", lambda **kw: reads.append(kw))
+    _assert_relationship_authority_failure(client.post("/v1/relationships/select", json=payload))
+    assert reads == []
+
+
+def test_strict_relationship_selection_survives_runtime_repository_replacement():
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    payload, _, _ = _strict_relationship_turn(client)
+    before = client.post("/v1/relationships/select", json=payload)
+    assert before.status_code == 200
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    after = client.post("/v1/relationships/select", json=payload)
+    assert after.status_code == 200
+    assert after.json() == before.json()
+
+
+@pytest.mark.parametrize("change", ["completion", "revision", "containment", "surface"])
+def test_strict_relationship_publication_revalidates_after_protected_read(change, monkeypatch):
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    payload, _, containment = _strict_relationship_turn(client)
+    repo = relationship_repository()
+    original = repo.diagnostics
+
+    def changed_after_read(**kwargs):
+        result = original(**kwargs)
+        state = runtime_state_repository()
+        if change == "completion":
+            state.complete_turn(
+                **{key: payload[key] for key in (
+                    "request_id", "runtime_session_id", "runtime_turn_id",
+                )}, turn_status="completed",
+            )
+        elif change == "revision":
+            with state._connect() as conn:
+                conn.execute("UPDATE conversation_runtime_threads SET revision = revision + 1")
+        elif change == "containment":
+            from models import PersonaContainmentEvaluateRequest
+            from services.persona_containment import evaluate_persona_containment
+
+            evaluate_persona_containment(PersonaContainmentEvaluateRequest(
+                **{**containment, "current_user_text": "What is 2+2?"},
+            ))
+        else:
+            from services.companion_contracts import companion_contracts_repository
+
+            with companion_contracts_repository()._connect() as conn:
+                conn.execute(
+                    "UPDATE surface_bindings SET surface_type = 'ide_extension' "
+                    "WHERE surface_id = 'web'",
+                )
+        return result
+
+    monkeypatch.setattr(repo, "diagnostics", changed_after_read)
+    _assert_relationship_authority_failure(client.post("/v1/relationships/select", json=payload))
+
+
+def test_legacy_relationship_calls_retain_existing_independent_persona_behavior():
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    response = client.post("/v1/relationships/select", json={
+        **_base(), "surface": "web", "active_persona_id": "personal_companion",
+        "requested_scopes": ["personal_context"],
+    })
+    assert response.status_code == 200
+    result = response.json()
+    assert result["selection_contract"] == "legacy_unbound"
+    assert result["persona_selection_ref"] is None
+    assert result["retrieval_scope_projection"]["relationship_ids"] == ["rel-private-hidden"]
+
+
+@pytest.mark.parametrize("edge,reason,confirmation", [
+    ({"sensitivity_level": "restricted"}, "authorization_required", True),
+    ({"mentionability": "suppress_by_default"}, "suppressed_by_default", False),
+    ({"mentionability": "confirm_before_mentioning"}, "authorization_required", True),
+    ({"status": "revoked"}, "status_revoked", False),
+    ({"confidence": 0.5, "source_type": "tool_output"}, "below_confidence_threshold", False),
+    ({"blocked_persona_scopes_json": ["general_assistant"]}, "blocked_persona_scope", False),
+    ({"valid_until": _iso(-100)}, "expired", False),
+])
+def test_strict_relationships_preserve_independent_safety_checks(edge, reason, confirmation):
+    client = TestClient(app)
+    _seed_entities(client)
+    inserted = client.post("/v1/relationships/edges/upsert", json={
+        **_base(), "edge": _edge(relationship_id="rel-safety", **edge),
+    })
+    assert inserted.status_code == 200
+    payload, _, _ = _strict_relationship_turn(client)
+    response = client.post("/v1/relationships/select", json=payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["selected_relationships"] == []
+    assert result["prompt_content"] is None
+    assert result["retrieval_scope_projection"]["relationship_ids"] == []
+    assert result["trace"]["relationship_exclusion_reasons"]["rel-safety"] == reason
+    assert result["trace"]["relationship_confirmation_required"] == confirmation
+
+
+def test_strict_relationship_conflicts_never_choose_a_winner():
+    client = TestClient(app)
+    _seed_entities(client)
+    for reference, target in (("rel-conflict-a", "repo:alpha"), ("rel-conflict-b", "repo:beta")):
+        assert client.post("/v1/relationships/edges/upsert", json={
+            **_base(), "edge": _edge(
+                relationship_id=reference, relationship_type="bound_to", object_entity_id=target,
+            ),
+        }).status_code == 200
+    payload, _, _ = _strict_relationship_turn(client)
+    response = client.post("/v1/relationships/select", json=payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["selected_relationships"] == []
+    assert result["prompt_content"] is None
+    assert result["trace"]["relationship_confirmation_required"] is True
+    assert set(result["trace"]["relationship_conflicts"]) == {"rel-conflict-a", "rel-conflict-b"}
+    assert result["retrieval_scope_projection"]["applied"] is False
+
+
+@pytest.mark.parametrize("corruption", ["missing", "empty", "unsupported"])
+def test_strict_relationship_surface_authority_fails_before_data(corruption, monkeypatch):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    payload, _, _ = _strict_relationship_turn(client)
+    with companion_contracts_repository()._connect() as conn:
+        if corruption == "missing":
+            conn.execute("DELETE FROM surface_bindings WHERE surface_id IN ('web', 'unknown')")
+        elif corruption == "empty":
+            conn.execute("UPDATE surface_bindings SET surface_type = '' WHERE surface_id = 'web'")
+        else:
+            conn.execute(
+                "UPDATE surface_bindings SET surface_type = 'unsupported_surface' "
+                "WHERE surface_id = 'web'",
+            )
+    reads = []
+    monkeypatch.setattr(relationship_repository(), "diagnostics", lambda **kw: reads.append(kw))
+    _assert_relationship_authority_failure(client.post("/v1/relationships/select", json=payload))
+    assert reads == []
+
+
+def test_strict_containment_must_precede_relationship_read_and_projection(monkeypatch):
+    import services.relationships as module
+
+    client = TestClient(app)
+    _seed_strict_relationships(client)
+    payload, _, _ = _strict_relationship_turn(client)
+    events = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    types = [event.event_type for event in events]
+    assert types.index("persona_selection_resolved") < types.index("persona_containment_evaluated")
+    order = []
+    original_authority = module._strict_relationship_authority
+    original_read = relationship_repository().diagnostics
+    original_projection = module._retrieval_scope_projection
+
+    def authority(body):
+        order.append("authority")
+        return original_authority(body)
+
+    def read(**kwargs):
+        order.append("protected_read")
+        return original_read(**kwargs)
+
+    def projection(selected):
+        order.append("projection")
+        return original_projection(selected)
+
+    monkeypatch.setattr(module, "_strict_relationship_authority", authority)
+    monkeypatch.setattr(relationship_repository(), "diagnostics", read)
+    monkeypatch.setattr(module, "_retrieval_scope_projection", projection)
+    assert client.post("/v1/relationships/select", json=payload).status_code == 200
+    assert order == ["authority", "protected_read", "projection", "authority"]
 
 
 def test_entity_create_and_upsert_round_trip_preserves_provenance():

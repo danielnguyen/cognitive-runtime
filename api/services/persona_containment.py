@@ -4,6 +4,7 @@ import re
 
 from models import (
     ArtifactAccessPolicy,
+    PersonaContainmentAuthority,
     PersonaContainmentEvaluateRequest,
     PersonaContainmentEvaluateResponse,
     PersonaContainmentResult,
@@ -419,6 +420,18 @@ def _artifact_access_policy(
     )
 
 
+def validate_relationship_domain_baseline(result: PersonaContainmentResult) -> None:
+    """No translation: narrower broad domains need an explicit relationship contract."""
+    baseline = _PERSONA_BASE_ALLOWED_DOMAINS.get(result.active_persona_id)
+    domains = result.allowed_relationship_domains
+    if set(domains) & set(result.blocked_memory_domains):
+        raise ValueError("relationship_containment_policy_invalid")
+    if baseline is None or len(domains) != len(set(domains)) or set(domains) != baseline:
+        raise ValueError("relationship_containment_scope_unresolved")
+    if result.cross_scope_access_allowed:
+        raise ValueError("relationship_containment_scope_unresolved")
+
+
 def evaluate_persona_containment(
     body: PersonaContainmentEvaluateRequest,
 ) -> PersonaContainmentEvaluateResponse:
@@ -541,6 +554,15 @@ def evaluate_persona_containment(
         **({"persona_selection_ref": selection.selection_ref} if selection else {}),
     }
     if selection is not None:
+        authority = PersonaContainmentAuthority(
+            selection_contract="strict_turn", status="validated",
+            **{key: getattr(selection, key) for key in (
+                "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+                "runtime_turn_id", "thread_revision",
+            )},
+            persona_selection_ref=selection.selection_ref, result=result,
+        )
+        event_payload["strict_containment"] = authority.model_dump()
         runtime_state_repository().persona_selection_events(
             **{key: getattr(body, key) for key in (
                 "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",

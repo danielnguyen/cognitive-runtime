@@ -2921,6 +2921,34 @@ class PersonaContainmentResult(BaseModel):
     artifact_access_policy: ArtifactAccessPolicy
 
 
+class PersonaContainmentAuthority(BaseModel):
+    """Committed strict policy binding; broad domains are not relationship scopes."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    selection_contract: Literal["strict_turn"]
+    status: Literal["validated"]
+    request_id: BoundedTraceRef
+    owner_id: BoundedTraceRef
+    conversation_id: BoundedTraceRef
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: BoundedTraceRef
+    runtime_turn_id: BoundedTraceRef
+    thread_revision: int = Field(ge=0)
+    persona_selection_ref: str = Field(pattern=r"^psel_[0-9a-f]{32}$")
+    result: PersonaContainmentResult
+
+    @model_validator(mode="before")
+    @classmethod
+    def complete_policy_snapshot(cls, value):
+        if isinstance(value, dict):
+            result = value.get("result")
+            if isinstance(result, dict) and set(result) != (
+                PersonaContainmentResult.model_fields.keys()
+            ):
+                raise ValueError("persona_containment_policy_incomplete")
+        return value
+
+
 class PersonaContainmentEvaluateResponse(BaseModel):
     request_id: str = Field(max_length=120)
     owner_id: str = Field(max_length=120)
@@ -4194,6 +4222,27 @@ class RelationshipSelectRequest(RuntimeStateResolveRequest):
     requested_scopes: list[BoundedLabel] = Field(default_factory=list, max_length=16)
     entity_ids: list[str] = Field(default_factory=list, max_length=16)
     relationship_types: list[RelationshipType] = Field(default_factory=list, max_length=16)
+    persona_selection_mode: Literal["legacy", "strict"] = "legacy"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
+    runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
+    expected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def strict_selection_fields(cls, value):
+        if isinstance(value, dict) and (
+            value.get("persona_selection_mode") == "strict" or value.get("persona_selection_ref")
+        ):
+            if value.get("persona_selection_mode") != "strict":
+                raise ValueError("persona_selection_requires_strict_mode")
+            if not all(value.get(key) for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id", "persona_selection_ref",
+            )):
+                raise ValueError("persona_selection_binding_required")
+            if set(value) - cls.model_fields.keys():
+                raise ValueError("persona_selection_unknown_fields")
+        return value
 
 
 class RelationshipSelectTrace(BaseModel):
@@ -4224,6 +4273,8 @@ class RelationshipSelectResponse(BaseModel):
     prompt_content: str | None = None
     trace: RelationshipSelectTrace
     retrieval_scope_projection: RelationshipRetrievalScopeProjection
+    selection_contract: Literal["legacy_unbound", "strict_turn"] = "legacy_unbound"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
 
 
 class SocialContextItemInput(BaseModel):
