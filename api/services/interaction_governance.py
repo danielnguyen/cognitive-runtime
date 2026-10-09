@@ -306,7 +306,7 @@ def _reason_summary(kind: InteractionGovernanceKind, text: str, raw_text: str) -
     return reasons[:8]
 
 
-def _persona_scope_hint(kind: InteractionGovernanceKind) -> str | None:
+def persona_scope_hint_for_kind(kind: InteractionGovernanceKind) -> str | None:
     if kind == "tense_debugging":
         return "technical_operator"
     if kind == "mistake_or_failure_report":
@@ -600,7 +600,7 @@ def _classify(body: InteractionGovernanceEvaluateRequest) -> InteractionGovernan
         clarifying_question_allowed=clarifying_question_allowed,
         action_allowed=action_allowed,
         requires_confirmation=requires_confirmation,
-        persona_scope_hint=_persona_scope_hint(kind),
+        persona_scope_hint=persona_scope_hint_for_kind(kind),
         privacy_sensitivity_hint=privacy_sensitivity_hint,
         response_posture=posture,
         confidence=confidence,

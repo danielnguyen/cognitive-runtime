@@ -132,6 +132,7 @@ RuntimeEventType = Literal[
     "turn_updated",
     "turn_completed",
     "identity_resolved",
+    "persona_selection_resolved",
     "interaction_governance_evaluated",
     "persona_containment_evaluated",
     "restraint_evaluated",
@@ -2791,6 +2792,62 @@ class InteractionGovernanceEvaluateResponse(BaseModel):
     result: InteractionGovernanceResult
 
 
+class PersonaSelectionDecision(BaseModel):
+    """Turn-bound selection provenance, not a permission or consent grant."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    selection_ref: str = Field(pattern=r"^psel_[0-9a-f]{32}$")
+    request_id: BoundedTraceRef
+    owner_id: BoundedTraceRef
+    conversation_id: BoundedTraceRef
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: BoundedTraceRef
+    runtime_turn_id: BoundedTraceRef
+    thread_revision: int = Field(ge=0)
+    governance_event_ref: BoundedTraceRef
+    active_persona_id: BoundedTraceRef
+    selection_source: Literal["surface_binding", "conservative_fallback"]
+    selection_reason: Literal[
+        "surface_default", "unknown_surface_default", "bound_persona_unavailable",
+    ]
+    proposed_persona_id: BoundedTraceRef | None = None
+    proposal_source: Literal["interaction_governance", "none"]
+    proposal_status: Literal["none", "advisory", "rejected"]
+    proposal_reason: Literal[
+        "no_contextual_proposal", "contextual_activation_not_enabled", "proposal_unmapped",
+    ]
+    requested_selection_status: Literal["not_requested", "unverified_rejected"]
+    contextual_activation: Literal[False] = False
+    explicit_selection_verified: Literal[False] = False
+
+    @field_validator("contextual_activation", "explicit_selection_verified", mode="before")
+    @classmethod
+    def no_activation_or_consent(cls, value):
+        if type(value) is not bool or value is not False:
+            raise ValueError("persona_selection_authority_upgrade")
+        return value
+
+    @model_validator(mode="after")
+    def coherent_proposal(self):
+        if self.proposal_status == "none":
+            if (
+                self.proposed_persona_id is not None or self.proposal_source != "none"
+                or self.proposal_reason != "no_contextual_proposal"
+            ):
+                raise ValueError("persona_proposal_incoherent")
+        elif self.proposal_source != "interaction_governance":
+            raise ValueError("persona_proposal_incoherent")
+        elif self.proposal_status == "advisory":
+            if (
+                self.proposed_persona_id is None
+                or self.proposal_reason != "contextual_activation_not_enabled"
+            ):
+                raise ValueError("persona_proposal_incoherent")
+        elif self.proposal_reason != "proposal_unmapped":
+            raise ValueError("persona_proposal_incoherent")
+        return self
+
+
 class PersonaContainmentEvaluateRequest(BaseModel):
     request_id: str = Field(max_length=120)
     owner_id: str = Field(max_length=120)
@@ -2805,6 +2862,25 @@ class PersonaContainmentEvaluateRequest(BaseModel):
     current_user_text: BoundedText | None = None
     recent_messages: list["InterruptMessage"] = Field(default_factory=list, max_length=12)
     surface_metadata_json: dict[str, Any] = Field(default_factory=dict)
+    persona_selection_mode: Literal["legacy", "strict"] = "legacy"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
+    expected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def strict_selection_fields(cls, value):
+        if isinstance(value, dict) and (
+            value.get("persona_selection_mode") == "strict" or value.get("persona_selection_ref")
+        ):
+            if value.get("persona_selection_mode") != "strict":
+                raise ValueError("persona_selection_requires_strict_mode")
+            if not all(value.get(key) for key in (
+                "runtime_session_id", "runtime_turn_id", "persona_selection_ref",
+            )):
+                raise ValueError("persona_selection_binding_required")
+            if set(value) - cls.model_fields.keys():
+                raise ValueError("persona_selection_unknown_fields")
+        return value
 
 
 ArtifactContentClass = Literal[
@@ -2853,6 +2929,8 @@ class PersonaContainmentEvaluateResponse(BaseModel):
     runtime_session_id: str = Field(max_length=120)
     runtime_turn_id: str | None = Field(default=None, max_length=120)
     result: PersonaContainmentResult
+    selection_contract: Literal["legacy_unbound", "strict_turn"] = "legacy_unbound"
+    persona_selection: PersonaSelectionDecision | None = None
 
 
 RestraintPolicy = Literal[
@@ -3159,6 +3237,23 @@ class RuntimeIdentityResolveRequest(RuntimeSessionResolveRequest):
     runtime_session_id: str | None = Field(default=None, max_length=120)
     requested_persona_id: str | None = Field(default=None, max_length=120)
     allow_requested_persona_bypass: bool = False
+    persona_selection_mode: Literal["legacy", "strict"] = "legacy"
+    runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
+    expected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def strict_selection_fields(cls, value):
+        if isinstance(value, dict) and value.get("persona_selection_mode") == "strict":
+            if not value.get("runtime_session_id") or not value.get("runtime_turn_id"):
+                raise ValueError("persona_selection_binding_required")
+            if set(value) - cls.model_fields.keys():
+                raise ValueError("persona_selection_unknown_fields")
+            if value.get("allow_requested_persona_bypass") is not False and (
+                "allow_requested_persona_bypass" in value
+            ):
+                raise ValueError("persona_selection_test_bypass_forbidden")
+        return value
 
 
 class RuntimeIdentityResolveResponse(BaseModel):
@@ -3167,6 +3262,8 @@ class RuntimeIdentityResolveResponse(BaseModel):
     persona: PersonaProfile
     runtime_identity: RuntimeIdentityContext
     trace: RuntimeIdentityTrace
+    selection_contract: Literal["legacy_unbound", "strict_turn"] = "legacy_unbound"
+    persona_selection: PersonaSelectionDecision | None = None
 
 
 WorldStateFreshnessState = Literal[

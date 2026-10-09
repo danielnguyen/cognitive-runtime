@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 from main import app
+from services.runtime_state import clear_states_for_tests, runtime_state_repository
 
 
 def _base(**overrides):
@@ -14,6 +16,198 @@ def _base(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def _strict_selection(client, *, surface="web", text="I broke the server and prod is failing"):
+    payload = _base(surface=surface)
+    started = client.post("/v1/runtime/turns/start", json={
+        key: value for key, value in payload.items() if key != "recent_messages"
+    })
+    assert started.status_code == 200
+    payload.update(
+        runtime_session_id=started.json()["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=started.json()["runtime_turn"]["runtime_turn_id"],
+    )
+    assert client.post("/v1/runtime/interaction-governance/evaluate", json={
+        **payload, "current_user_text": text,
+    }).status_code == 200
+    identity = client.post("/v1/runtime/identity/resolve", json={
+        key: value for key, value in {
+            **payload, "persona_selection_mode": "strict",
+        }.items() if key != "recent_messages"
+    })
+    assert identity.status_code == 200
+    selection = identity.json()["persona_selection"]
+    return {
+        **payload, "current_user_text": text, "persona_selection_mode": "strict",
+        "persona_selection_ref": selection["selection_ref"],
+    }, selection
+
+
+@pytest.mark.parametrize("surface,persona,domains", [
+    ("web", "general_assistant", {"general"}),
+    ("vscode", "technical_architect", {"general", "technical", "project", "infrastructure"}),
+    ("unregistered", "general_assistant", {"general"}),
+])
+def test_strict_containment_uses_same_persona_and_never_unions_proposed_scope(
+    surface, persona, domains,
+):
+    client = TestClient(app)
+    payload, selection = _strict_selection(client, surface=surface)
+    response = client.post("/v1/runtime/persona-containment/evaluate", json={
+        **payload, "active_persona_id": persona, "persona_scope_hint": "technical_operator",
+    })
+    assert response.status_code == 200
+    result = response.json()
+    assert result["selection_contract"] == "strict_turn"
+    assert result["persona_selection"] == selection
+    assert result["result"]["active_persona_id"] == persona
+    assert selection["contextual_activation"] is False
+    for key in (
+        "allowed_memory_domains", "allowed_world_state_domains",
+        "allowed_relationship_domains", "allowed_tool_domains",
+    ):
+        assert set(result["result"][key]) <= domains
+    assert set(result["result"]["artifact_access_policy"]["allowed_domains"]) <= domains
+    assert result["result"]["cross_scope_access_allowed"] is False
+
+
+@pytest.mark.parametrize("field,value", [
+    ("active_persona_id", "personal_companion"),
+    ("requested_persona_id", "personal_companion"),
+    ("persona_scope_hint", "supportive_listener"),
+    ("request_id", "wrong_request"), ("owner_id", "wrong_owner"),
+    ("conversation_id", "wrong_conversation"), ("surface", "vscode"),
+    ("runtime_session_id", "wrong_session"), ("runtime_turn_id", "wrong_turn"),
+    ("persona_selection_ref", "psel_00000000000000000000000000000000"),
+    ("expected_thread_revision", 0),
+])
+def test_strict_containment_rejects_conflicts_and_cross_bound_selections(field, value):
+    client = TestClient(app)
+    payload, _ = _strict_selection(client)
+    response = client.post(
+        "/v1/runtime/persona-containment/evaluate", json={**payload, field: value},
+    )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "persona_selection_rejected"}
+    events = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    assert not any(event.event_type == "persona_containment_evaluated" for event in events)
+
+
+def test_strict_containment_supportive_proposal_and_textual_bridge_cannot_open_personal_scope():
+    client = TestClient(app)
+    payload, selection = _strict_selection(client, text="That was wrong in the report.")
+    assert selection["proposed_persona_id"] == "personal_companion"
+    response = client.post("/v1/runtime/persona-containment/evaluate", json={
+        **payload, "persona_scope_hint": "supportive_listener",
+        "current_user_text": "Connect this with my personal context and finance history.",
+    })
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["active_persona_id"] == "general_assistant"
+    assert set(result["allowed_memory_domains"]) <= {"general"}
+    assert result["cross_scope_access_allowed"] is False
+    assert "personal" in result["blocked_memory_domains"]
+    assert "finance" in result["blocked_memory_domains"]
+
+
+@pytest.mark.parametrize("corruption", ["raw_json", "persona", "revision", "governance"])
+def test_strict_containment_rejects_corrupted_selection_or_changed_governance(corruption):
+    import json
+
+    client = TestClient(app)
+    payload, selection = _strict_selection(client)
+    repo = runtime_state_repository()
+    with repo._connect() as conn:
+        if corruption == "governance":
+            conn.execute(
+                "UPDATE conversation_runtime_events SET event_payload_json = ? "
+                "WHERE event_type = 'interaction_governance_evaluated'",
+                (json.dumps({
+                    "request_id": payload["request_id"], "interaction_kind": "question",
+                }),),
+            )
+        else:
+            changed = dict(selection)
+            if corruption == "persona":
+                changed["active_persona_id"] = "personal_companion"
+            if corruption == "revision":
+                changed["thread_revision"] += 1
+            value = (
+                "private_invalid_json_sentinel" if corruption == "raw_json" else json.dumps(changed)
+            )
+            conn.execute(
+                "UPDATE conversation_runtime_events SET event_payload_json = ? "
+                "WHERE event_type = 'persona_selection_resolved'", (value,),
+            )
+    response = client.post("/v1/runtime/persona-containment/evaluate", json=payload)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "persona_selection_rejected"}
+
+
+def test_strict_selection_survives_repository_replacement_but_not_turn_completion():
+    client = TestClient(app)
+    payload, selection = _strict_selection(client)
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    response = client.post("/v1/runtime/persona-containment/evaluate", json=payload)
+    assert response.status_code == 200
+    assert response.json()["persona_selection"] == selection
+    assert client.post("/v1/runtime/turns/complete", json={
+        "request_id": payload["request_id"], "runtime_session_id": payload["runtime_session_id"],
+        "runtime_turn_id": payload["runtime_turn_id"], "turn_status": "completed",
+    }).status_code == 200
+    assert client.post("/v1/runtime/persona-containment/evaluate", json=payload).status_code == 409
+
+
+def test_strict_mode_requires_selection_and_does_not_accept_legacy_identity_as_authority():
+    client = TestClient(app)
+    assert client.post("/v1/runtime/persona-containment/evaluate", json={
+        **_base(), "persona_selection_mode": "strict",
+    }).status_code == 422
+    legacy = client.post("/v1/runtime/persona-containment/evaluate", json={
+        **_base(surface="web"), "persona_scope_hint": "technical_operator",
+    })
+    assert legacy.status_code == 200
+    assert legacy.json()["selection_contract"] == "legacy_unbound"
+    assert legacy.json()["persona_selection"] is None
+    assert legacy.json()["result"]["active_persona_id"] == "technical_architect"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("contextual_activation", True), ("contextual_activation", 0),
+    ("explicit_selection_verified", True), ("explicit_selection_verified", 0),
+    ("thread_revision", True), ("proposal_source", "explicit_user"),
+])
+def test_selection_model_rejects_fabricated_activation_or_consent(field, value):
+    from models import PersonaSelectionDecision
+    from pydantic import ValidationError
+
+    client = TestClient(app)
+    _, selection = _strict_selection(client)
+    with pytest.raises(ValidationError):
+        PersonaSelectionDecision.model_validate({**selection, field: value})
+
+
+def test_containment_commit_rechecks_turn_before_publishing_policy(monkeypatch):
+    client = TestClient(app)
+    payload, _ = _strict_selection(client)
+    repo = runtime_state_repository()
+    original = repo.persona_selection_events
+
+    def complete_before_publication(**kwargs):
+        if kwargs.get("containment_payload") is not None:
+            repo.complete_turn(
+                request_id=payload["request_id"], runtime_session_id=payload["runtime_session_id"],
+                runtime_turn_id=payload["runtime_turn_id"], turn_status="completed",
+            )
+        return original(**kwargs)
+
+    monkeypatch.setattr(repo, "persona_selection_events", complete_before_publication)
+    response = client.post("/v1/runtime/persona-containment/evaluate", json=payload)
+    assert response.status_code == 409
+    assert not any(event.event_type == "persona_containment_evaluated" for event in (
+        repo.list_events_for_tests(payload["runtime_session_id"])
+    ))
 
 
 def test_technical_request_uses_technical_persona_and_keeps_domains_narrow():

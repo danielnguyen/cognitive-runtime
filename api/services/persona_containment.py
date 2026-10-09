@@ -9,10 +9,12 @@ from models import (
     PersonaContainmentResult,
 )
 from services.companion_contracts import companion_contracts_repository
+from services.runtime_identity import consume_persona_selection, persona_from_scope_hint
 from services.runtime_state import (
     record_runtime_event,
     resolve_runtime_session,
     runtime_session_by_id,
+    runtime_state_repository,
 )
 
 _SEEDED_DOMAINS = (
@@ -31,12 +33,6 @@ _CANONICAL_PERSONAS = {
     "technical_architect",
     "operations_assistant",
     "personal_companion",
-}
-_PERSONA_SCOPE_HINTS = {
-    "general_assistant": "general_assistant",
-    "technical_operator": "technical_architect",
-    "supportive_listener": "personal_companion",
-    "careful_decider": "general_assistant",
 }
 _PERSONA_DEFAULT_DOMAIN = {
     "general_assistant": "general",
@@ -235,7 +231,7 @@ def _resolve_persona(body: PersonaContainmentEvaluateRequest) -> tuple[str, list
         reasons.append("active_persona_not_canonical")
 
     if body.persona_scope_hint:
-        mapped = _PERSONA_SCOPE_HINTS.get(body.persona_scope_hint)
+        mapped = persona_from_scope_hint(body.persona_scope_hint)
         if mapped and repository.persona_profile(mapped):
             return mapped, ["persona_scope_hint"]
         reasons.append("persona_scope_hint_unmapped")
@@ -427,7 +423,11 @@ def evaluate_persona_containment(
     body: PersonaContainmentEvaluateRequest,
 ) -> PersonaContainmentEvaluateResponse:
     runtime_session_id = body.runtime_session_id
-    if runtime_session_id:
+    selection = None
+    if body.persona_selection_mode == "strict":
+        session, selection = consume_persona_selection(body)
+        runtime_session_id = session.runtime_session_id
+    elif runtime_session_id:
         session = runtime_session_by_id(runtime_session_id)
         if session is None:
             raise ValueError("runtime_session_not_found")
@@ -448,7 +448,10 @@ def evaluate_persona_containment(
 
     raw_text = _latest_user_text(body)
     text = _normalize_text(raw_text)
-    persona_id, persona_reasons = _resolve_persona(body)
+    if selection is not None:
+        persona_id, persona_reasons = selection.active_persona_id, ["strict_persona_selection"]
+    else:
+        persona_id, persona_reasons = _resolve_persona(body)
     capability_domain, capability_reasons = _capability_domain(text, persona_id)
     matched_domains = _matched_domains(text)
     allowed_domains = _base_allowed_domains(persona_id, capability_domain)
@@ -472,7 +475,7 @@ def evaluate_persona_containment(
         allowed_domains &= {"general", capability_domain}
         reason_summary.append("multi_domain_signal_conservative_scope")
 
-    if bridge_target:
+    if bridge_target and selection is None:
         mapped_domain = _map_domain_term(bridge_target)
         if mapped_domain is None:
             normalized_label = _normalize_domain_label(bridge_target)
@@ -485,6 +488,16 @@ def evaluate_persona_containment(
             cross_scope_access_allowed = True
             cross_scope_reason = "explicit_bridge_request_detected"
             reason_summary.append("explicit_bridge_request_detected")
+
+    if selection is not None:
+        # No contextual domain or textual bridge can increase strict selection scope.
+        allowed_domains &= _PERSONA_BASE_ALLOWED_DOMAINS.get(persona_id, {"general"})
+        if capability_domain not in allowed_domains:
+            capability_domain = _PERSONA_DEFAULT_DOMAIN.get(persona_id, "general")
+            reason_summary.append("domain_proposal_advisory")
+        if bridge_target:
+            cross_scope_reason = "strict_selection_no_bridge_authority"
+            reason_summary.append("strict_selection_no_bridge_authority")
 
     if capability_domain not in _SEEDED_DOMAINS:
         capability_domain = "general"
@@ -514,23 +527,32 @@ def evaluate_persona_containment(
         artifact_access_policy=artifact_access_policy,
     )
 
-    record_runtime_event(
-        runtime_session_id=runtime_session_id,
-        runtime_turn_id=body.runtime_turn_id,
-        event_type="persona_containment_evaluated",
-        event_payload_json={
-            "request_id": body.request_id,
-            "active_persona_id": result.active_persona_id,
-            "capability_domain": result.capability_domain,
-            "allowed_memory_domains": result.allowed_memory_domains,
-            "blocked_memory_domains": result.blocked_memory_domains,
-            "allowed_tool_domains": result.allowed_tool_domains,
-            "artifact_access_policy": result.artifact_access_policy.model_dump(),
-            "cross_scope_access_allowed": result.cross_scope_access_allowed,
-            "cross_scope_reason": result.cross_scope_reason,
-            "reason_summary": result.reason_summary,
-        },
-    )
+    event_payload = {
+        "request_id": body.request_id,
+        "active_persona_id": result.active_persona_id,
+        "capability_domain": result.capability_domain,
+        "allowed_memory_domains": result.allowed_memory_domains,
+        "blocked_memory_domains": result.blocked_memory_domains,
+        "allowed_tool_domains": result.allowed_tool_domains,
+        "artifact_access_policy": result.artifact_access_policy.model_dump(),
+        "cross_scope_access_allowed": result.cross_scope_access_allowed,
+        "cross_scope_reason": result.cross_scope_reason,
+        "reason_summary": result.reason_summary,
+        **({"persona_selection_ref": selection.selection_ref} if selection else {}),
+    }
+    if selection is not None:
+        runtime_state_repository().persona_selection_events(
+            **{key: getattr(body, key) for key in (
+                "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+                "runtime_turn_id", "expected_thread_revision",
+            )},
+            selection=selection, containment_payload=event_payload,
+        )
+    else:
+        record_runtime_event(
+            runtime_session_id=runtime_session_id, runtime_turn_id=body.runtime_turn_id,
+            event_type="persona_containment_evaluated", event_payload_json=event_payload,
+        )
 
     return PersonaContainmentEvaluateResponse(
         request_id=body.request_id,
@@ -540,4 +562,6 @@ def evaluate_persona_containment(
         runtime_session_id=runtime_session_id,
         runtime_turn_id=body.runtime_turn_id,
         result=result,
+        selection_contract="strict_turn" if selection else "legacy_unbound",
+        persona_selection=selection,
     )
