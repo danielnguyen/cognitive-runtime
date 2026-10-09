@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from main import app
+from services.runtime_state import clear_states_for_tests, runtime_state_repository
 from services.world_state import (
     TrustedWorldStateVerifier,
     WorldStateRepository,
@@ -107,6 +109,634 @@ def _claim(**overrides) -> dict[str, object]:
     }
     claim.update(overrides)
     return claim
+
+
+def _strict_world_turn(
+    client, *, surface="web", text="I broke the server and prod is failing",
+    containment_text=None, selection=True, containment=True,
+):
+    payload = {**_base(), "surface": surface}
+    started = client.post("/v1/runtime/turns/start", json=payload)
+    assert started.status_code == 200
+    payload.update(
+        runtime_session_id=started.json()["runtime_session"]["runtime_session_id"],
+        runtime_turn_id=started.json()["runtime_turn"]["runtime_turn_id"],
+    )
+    assert client.post("/v1/runtime/interaction-governance/evaluate", json={
+        **payload, "current_user_text": text,
+    }).status_code == 200
+    payload["persona_selection_mode"] = "strict"
+    decision = None
+    if selection:
+        resolved = client.post("/v1/runtime/identity/resolve", json=payload)
+        assert resolved.status_code == 200
+        decision = resolved.json()["persona_selection"]
+    payload["persona_selection_ref"] = (
+        decision["selection_ref"] if decision else "psel_00000000000000000000000000000000"
+    )
+    containment_request = {**payload, "current_user_text": containment_text or text}
+    if selection and containment:
+        assert client.post(
+            "/v1/runtime/persona-containment/evaluate", json=containment_request,
+        ).status_code == 200
+    return payload, decision, containment_request
+
+
+def _seed_strict_world_claims(client):
+    claims = {}
+    for domain in (
+        "active_task", "active_project", "active_repository", "active_tool_session",
+        "active_health_observation", "pending_action", "runtime_surface",
+    ):
+        response = client.post("/v1/world-state/claims/upsert", json={
+            **_base(), "claim": _claim(
+                entity_id=f"entity:{domain}", domain=domain, attribute="status",
+                value_json={"value": f"private_value_{domain}"},
+            ),
+        })
+        assert response.status_code == 200
+        claims[domain] = response.json()["claim"]["world_state_claim_id"]
+    return claims
+
+
+def _assert_strict_world_failure(response, identifiers=()):
+    assert response.status_code == 409
+    assert response.json() == {"detail": "world_state_authority_rejected"}
+    assert not any(key in response.json() for key in (
+        "included_claims", "excluded_claim_summaries", "prompt_content", "trace",
+    ))
+    assert "private_value" not in response.text
+    assert "private_sentinel" not in response.text
+    assert all(reference not in response.text for reference in identifiers)
+
+
+@pytest.mark.parametrize("surface,persona,allowed", [
+    ("web", "general_assistant", {
+        "active_task", "active_project", "pending_action", "runtime_surface",
+    }),
+    ("dev", "technical_architect", {
+        "active_project", "active_repository", "active_artifact", "active_tool_session",
+        "active_external_system", "pending_action", "runtime_surface",
+    }),
+    ("vscode", "technical_architect", {
+        "active_project", "active_repository", "active_artifact", "active_tool_session",
+        "active_external_system", "pending_action", "runtime_surface",
+    }),
+    ("unregistered", "general_assistant", {"active_task", "pending_action", "runtime_surface"}),
+    ("unknown", "general_assistant", {"active_task", "pending_action", "runtime_surface"}),
+])
+def test_strict_world_state_uses_authorized_persona_surface_and_bounded_provenance(
+    surface, persona, allowed,
+):
+    client = TestClient(app)
+    claims = _seed_strict_world_claims(client)
+    payload, decision, _ = _strict_world_turn(client, surface=surface)
+    response = client.post("/v1/world-state/resolve", json={
+        **payload, "active_persona_id": persona,
+        "expected_thread_revision": decision["thread_revision"],
+    })
+    assert response.status_code == 200
+    result = response.json()
+    assert result["selection_contract"] == "strict_turn"
+    assert result["persona_selection_ref"] == decision["selection_ref"]
+    assert result["trace"]["active_persona_id"] == persona
+    assert set(result["trace"]["allowed_domains"]) == allowed
+    assert {claim["world_state_claim_id"] for claim in result["included_claims"]} == {
+        reference for domain, reference in claims.items() if domain in allowed
+    }
+    assert all(claim["effective_freshness_state"] == "fresh" for claim in result["included_claims"])
+    assert decision["contextual_activation"] is False
+    assert "private_value_active_health_observation" not in (result["prompt_content"] or "")
+
+
+@pytest.mark.parametrize("text,proposed", [
+    ("I broke the server and prod is failing", "technical_architect"),
+    ("That was wrong in the report.", "personal_companion"),
+])
+def test_strict_world_advisory_proposal_never_opens_additional_domains(text, proposed):
+    client = TestClient(app)
+    _seed_strict_world_claims(client)
+    payload, decision, _ = _strict_world_turn(client, text=text)
+    assert decision["proposed_persona_id"] == proposed
+    response = client.post("/v1/world-state/resolve", json=payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["trace"]["active_persona_id"] == "general_assistant"
+    assert {claim["domain"] for claim in result["included_claims"]} == {
+        "active_task", "active_project", "pending_action", "runtime_surface",
+    }
+    assert "private_value_active_repository" not in result["prompt_content"]
+    assert "private_value_active_health_observation" not in result["prompt_content"]
+
+
+@pytest.mark.parametrize("requested,expected", [
+    (["active_project"], {"active_project"}),
+    (["active_repository", "active_project"], {"active_project"}),
+    (["active_health_observation"], set()),
+    (["technical", "personal", "unmapped"], set()),
+])
+def test_strict_world_requested_domains_only_narrow_without_vocabulary_mapping(requested, expected):
+    client = TestClient(app)
+    _seed_strict_world_claims(client)
+    payload, _, _ = _strict_world_turn(client)
+    response = client.post(
+        "/v1/world-state/resolve", json={**payload, "requested_domains": requested},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert set(result["trace"]["allowed_domains"]) == expected
+    assert {claim["domain"] for claim in result["included_claims"]} == expected
+    if not expected:
+        assert result["prompt_content"] is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("request_id", "other_request"), ("owner_id", "other_owner"),
+    ("conversation_id", "other_conversation"), ("surface", "vscode"),
+    ("runtime_session_id", "other_session"), ("runtime_turn_id", "other_turn"),
+    ("expected_thread_revision", 0), ("active_persona_id", "technical_architect"),
+    ("persona_selection_ref", "psel_00000000000000000000000000000000"),
+])
+def test_strict_world_scope_mismatch_fails_before_protected_read(field, value, monkeypatch):
+    import services.world_state as module
+
+    client = TestClient(app)
+    claims = _seed_strict_world_claims(client)
+    payload, _, _ = _strict_world_turn(client)
+    reads = []
+    monkeypatch.setattr(module, "get_world_state_diagnostics", lambda **kw: reads.append(kw))
+    _assert_strict_world_failure(
+        client.post("/v1/world-state/resolve", json={**payload, field: value}), claims.values(),
+    )
+    assert reads == []
+    events = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    assert sum(event.event_type == "persona_selection_resolved" for event in events) == 1
+    assert sum(event.event_type == "persona_containment_evaluated" for event in events) == 1
+
+
+@pytest.mark.parametrize("selection,containment", [(False, False), (True, False)])
+def test_strict_world_requires_both_predecessors_without_manufacturing_them(
+    selection, containment, monkeypatch,
+):
+    import services.world_state as module
+
+    client = TestClient(app)
+    payload, _, _ = _strict_world_turn(client, selection=selection, containment=containment)
+    reads = []
+    monkeypatch.setattr(module, "get_world_state_diagnostics", lambda **kw: reads.append(kw))
+    _assert_strict_world_failure(client.post("/v1/world-state/resolve", json=payload))
+    assert reads == []
+    events = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    assert sum(event.event_type == "persona_selection_resolved" for event in events) == (
+        int(selection)
+    )
+    assert not any(event.event_type == "persona_containment_evaluated" for event in events)
+
+
+@pytest.mark.parametrize("mutation", [
+    {"persona_selection_ref": "malformed"}, {"persona_selection_ref": None},
+    {"runtime_session_id": None}, {"runtime_turn_id": None}, {"owner_id": ""},
+    {"selection_source": "explicit_user"}, {"persona_scope_hint": "technical_operator"},
+    {"requested_persona_id": "technical_architect"}, {"expected_thread_revision": True},
+    {"persona_selection_mode": "unsupported"},
+])
+def test_strict_world_rejects_incomplete_or_spoofed_request_contract(mutation):
+    client = TestClient(app)
+    payload, _, _ = _strict_world_turn(client)
+    response = client.post("/v1/world-state/resolve", json={**payload, **mutation})
+    assert response.status_code == 422
+    assert "private_value" not in response.text
+
+
+@pytest.mark.parametrize("status", ["completed", "abandoned"])
+def test_strict_world_terminal_turn_cannot_publish_state(status, monkeypatch):
+    import services.world_state as module
+
+    client = TestClient(app)
+    payload, _, _ = _strict_world_turn(client)
+    assert client.post("/v1/runtime/turns/complete", json={
+        key: payload[key] for key in ("request_id", "runtime_session_id", "runtime_turn_id")
+    } | {"turn_status": status}).status_code == 200
+    reads = []
+    monkeypatch.setattr(module, "get_world_state_diagnostics", lambda **kw: reads.append(kw))
+    _assert_strict_world_failure(client.post("/v1/world-state/resolve", json=payload))
+    assert reads == []
+
+
+@pytest.mark.parametrize("corruption", [
+    "selection_json", "selection_persona", "governance", "containment_json", "missing_policy",
+    "status", "missing_status", "owner", "revision", "persona", "reference", "domains",
+    "extra_policy", "contradiction", "legacy", "before_selection",
+])
+def test_strict_world_corrupted_authority_fails_before_data(corruption, monkeypatch):
+    import services.world_state as module
+
+    client = TestClient(app)
+    payload, _, _ = _strict_world_turn(client)
+    repo = runtime_state_repository()
+    with repo._connect() as conn:
+        kind = "persona_containment_evaluated"
+        if corruption.startswith("selection"):
+            kind = "persona_selection_resolved"
+        elif corruption == "governance":
+            kind = "interaction_governance_evaluated"
+        row = conn.execute(
+            "SELECT id, event_payload_json FROM conversation_runtime_events WHERE event_type = ?",
+            (kind,),
+        ).fetchone()
+        changed = json.loads(row["event_payload_json"])
+        if corruption.endswith("json"):
+            value = "private_sentinel invalid_json"
+        else:
+            if corruption == "selection_persona":
+                changed["active_persona_id"] = "personal_companion"
+            elif corruption == "governance":
+                changed["interaction_kind"] = "question"
+            elif corruption in {"missing_policy", "legacy"}:
+                del changed["strict_containment"]
+                if corruption == "legacy":
+                    del changed["persona_selection_ref"]
+            elif corruption == "before_selection":
+                conn.execute(
+                    "UPDATE conversation_runtime_events SET id = 0 WHERE id = ?", (row["id"],),
+                )
+            else:
+                authority = changed["strict_containment"]
+                if corruption == "status":
+                    authority["status"] = "failed"
+                elif corruption == "missing_status":
+                    del authority["status"]
+                elif corruption == "owner":
+                    authority["owner_id"] = "other_owner"
+                elif corruption == "revision":
+                    authority["thread_revision"] += 1
+                elif corruption == "persona":
+                    authority["result"]["active_persona_id"] = "personal_companion"
+                elif corruption == "reference":
+                    authority["persona_selection_ref"] = "psel_00000000000000000000000000000000"
+                elif corruption == "domains":
+                    authority["result"]["allowed_world_state_domains"] = ["general", "technical"]
+                elif corruption == "extra_policy":
+                    authority["result"]["current_user_text"] = "private_sentinel"
+                elif corruption == "contradiction":
+                    authority["result"]["blocked_memory_domains"].append("general")
+                    changed["blocked_memory_domains"].append("general")
+            value = json.dumps(changed)
+        if corruption != "before_selection":
+            conn.execute(
+                "UPDATE conversation_runtime_events SET event_payload_json = ? WHERE id = ?",
+                (value, row["id"]),
+            )
+    reads = []
+    monkeypatch.setattr(module, "get_world_state_diagnostics", lambda **kw: reads.append(kw))
+    _assert_strict_world_failure(client.post("/v1/world-state/resolve", json=payload))
+    assert reads == []
+
+
+def test_strict_world_requires_consistent_multiple_containment_publications():
+    client = TestClient(app)
+    payload, _, containment = _strict_world_turn(client, surface="dev")
+    assert client.post(
+        "/v1/runtime/persona-containment/evaluate", json=containment,
+    ).status_code == 200
+    assert client.post("/v1/world-state/resolve", json=payload).status_code == 200
+    assert client.post("/v1/runtime/persona-containment/evaluate", json={
+        **containment, "current_user_text": "What is 2+2?",
+    }).status_code == 200
+    _assert_strict_world_failure(client.post("/v1/world-state/resolve", json=payload))
+
+
+def test_strict_world_unrepresentable_narrowed_containment_never_becomes_broader_state(monkeypatch):
+    import services.world_state as module
+
+    client = TestClient(app)
+    payload, _, _ = _strict_world_turn(
+        client, surface="dev", containment_text="Check tire pressure and vehicle maintenance.",
+    )
+    reads = []
+    monkeypatch.setattr(module, "get_world_state_diagnostics", lambda **kw: reads.append(kw))
+    _assert_strict_world_failure(client.post("/v1/world-state/resolve", json=payload))
+    assert reads == []
+
+
+@pytest.mark.parametrize("corruption", [
+    "missing_binding", "malformed_binding", "unsupported", "missing_persona", "invalid_persona",
+])
+def test_strict_world_invalid_authority_never_defaults_to_permission(corruption, monkeypatch):
+    import services.world_state as module
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    payload, _, _ = _strict_world_turn(client)
+    with companion_contracts_repository()._connect() as conn:
+        if corruption == "missing_binding":
+            conn.execute("DELETE FROM surface_bindings WHERE surface_id IN ('web', 'unknown')")
+        elif corruption == "malformed_binding":
+            conn.execute(
+                "UPDATE surface_bindings SET default_persona_id = '' WHERE surface_id = 'web'",
+            )
+        elif corruption == "unsupported":
+            conn.execute(
+                "UPDATE surface_bindings SET surface_type = 'unsupported' WHERE surface_id = 'web'",
+            )
+        elif corruption == "missing_persona":
+            conn.execute("DELETE FROM persona_profiles WHERE persona_id = 'general_assistant'")
+        else:
+            conn.execute(
+                "UPDATE persona_profiles SET communication_policy_summary_json = '[7]' "
+                "WHERE persona_id = 'general_assistant'",
+            )
+    reads = []
+    monkeypatch.setattr(module, "get_world_state_diagnostics", lambda **kw: reads.append(kw))
+    _assert_strict_world_failure(client.post("/v1/world-state/resolve", json=payload))
+    assert reads == []
+
+
+@pytest.mark.parametrize("change", [
+    "completion", "revision", "containment", "surface", "governance",
+])
+def test_strict_world_revalidates_authority_after_protected_read(change, monkeypatch):
+    import services.world_state as module
+
+    client = TestClient(app)
+    identifiers = _seed_strict_world_claims(client)
+    payload, _, containment = _strict_world_turn(client)
+    original = module.get_world_state_diagnostics
+
+    def change_after_read(**kwargs):
+        result = original(**kwargs)
+        repo = runtime_state_repository()
+        if change == "completion":
+            repo.complete_turn(
+                **{key: payload[key] for key in (
+                    "request_id", "runtime_session_id", "runtime_turn_id",
+                )},
+                turn_status="completed",
+            )
+        elif change == "revision":
+            with repo._connect() as conn:
+                conn.execute("UPDATE conversation_runtime_threads SET revision = revision + 1")
+        elif change == "containment":
+            from models import PersonaContainmentEvaluateRequest
+            from services.persona_containment import evaluate_persona_containment
+
+            evaluate_persona_containment(PersonaContainmentEvaluateRequest(
+                **{**containment, "current_user_text": "What is 2+2?"},
+            ))
+        elif change == "governance":
+            with repo._connect() as conn:
+                row = conn.execute(
+                    "SELECT id, event_payload_json FROM conversation_runtime_events "
+                    "WHERE event_type = 'interaction_governance_evaluated'",
+                ).fetchone()
+                changed = json.loads(row["event_payload_json"])
+                changed["interaction_kind"] = "question"
+                conn.execute(
+                    "UPDATE conversation_runtime_events SET event_payload_json = ? WHERE id = ?",
+                    (json.dumps(changed), row["id"]),
+                )
+        else:
+            from services.companion_contracts import companion_contracts_repository
+
+            with companion_contracts_repository()._connect() as conn:
+                conn.execute(
+                    "UPDATE surface_bindings SET surface_type = 'ide_extension' "
+                    "WHERE surface_id = 'web'",
+                )
+        return result
+
+    monkeypatch.setattr(module, "get_world_state_diagnostics", change_after_read)
+    _assert_strict_world_failure(
+        client.post("/v1/world-state/resolve", json=payload), identifiers.values(),
+    )
+
+
+def test_strict_world_selection_and_containment_survive_repository_replacement():
+    client = TestClient(app)
+    _seed_strict_world_claims(client)
+    payload, _, _ = _strict_world_turn(client)
+    before = client.post("/v1/world-state/resolve", json=payload)
+    assert before.status_code == 200
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    after = client.post("/v1/world-state/resolve", json=payload)
+    assert after.status_code == 200
+    assert after.json() == before.json()
+
+
+def test_legacy_world_request_preserves_independent_persona_and_read_order(monkeypatch):
+    import services.world_state as module
+
+    client = TestClient(app)
+    _seed_strict_world_claims(client)
+    order = []
+    read, scope = module.get_world_state_diagnostics, module.resolve_world_state_persona_scope
+
+    def observed_read(**kwargs):
+        order.append("read")
+        return read(**kwargs)
+
+    def observed_scope(**kwargs):
+        order.append("scope")
+        return scope(**kwargs)
+
+    monkeypatch.setattr(module, "get_world_state_diagnostics", observed_read)
+    monkeypatch.setattr(module, "resolve_world_state_persona_scope", observed_scope)
+    response = client.post("/v1/world-state/resolve", json={
+        **_base(), "active_persona_id": "technical_architect",
+    })
+    assert response.status_code == 200
+    assert response.json()["selection_contract"] == "legacy_unbound"
+    assert response.json()["persona_selection_ref"] is None
+    assert "active_repository" in response.json()["trace"]["allowed_domains"]
+    assert order == ["read", "scope"]
+
+
+@pytest.mark.parametrize("overrides,expected,confirmation", [
+    ({"observed_at": _iso(-500)}, "aging", False),
+    ({"observed_at": _iso(-900), "confirmation_policy": "confirm_before_action"}, "stale", True),
+    ({"confirmation_policy": "confirm_before_action"}, "fresh", True),
+])
+def test_strict_world_preserves_freshness_qualification_and_confirmation(
+    overrides, expected, confirmation,
+):
+    client = TestClient(app)
+    assert client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(**overrides),
+    }).status_code == 200
+    payload, _, _ = _strict_world_turn(client, surface="dev")
+    response = client.post("/v1/world-state/resolve", json=payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["included_claims"][0]["effective_freshness_state"] == expected
+    assert result["trace"]["confirmation_required"] == confirmation
+    if expected != "fresh":
+        assert "last_known" in result["prompt_content"]
+        assert f"{expected};" in result["prompt_content"]
+
+
+@pytest.mark.parametrize("sensitivity", ["high", "restricted"])
+def test_strict_world_sensitive_values_remain_redacted(sensitivity):
+    client = TestClient(app)
+    assert client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(
+            sensitivity=sensitivity, value_json={"secret": "private_sentinel"},
+        ),
+    }).status_code == 200
+    payload, _, _ = _strict_world_turn(client, surface="dev")
+    response = client.post("/v1/world-state/resolve", json=payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["included_claims"][0]["value_json"] is None
+    assert result["included_claims"][0]["value_redacted"] is True
+    assert "[REDACTED]" in result["prompt_content"]
+    assert "private_sentinel" not in response.text
+
+
+@pytest.mark.parametrize("outcome", ["expired", "conflicted", "superseded"])
+def test_strict_world_excludes_expired_conflicted_and_superseded_claims(outcome):
+    client = TestClient(app)
+    first = client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(
+            value_json={"state": "old_private_sentinel"},
+            **({"expires_at": _iso(-10)} if outcome == "expired" else {}),
+        ),
+    })
+    assert first.status_code == 200
+    old_ref = first.json()["claim"]["world_state_claim_id"]
+    if outcome != "expired":
+        response = client.post("/v1/world-state/claims/upsert", json={
+            **_base(), "claim": _claim(
+                value_json={"state": "replacement"},
+                supersede_existing_claim_id=old_ref if outcome == "superseded" else None,
+            ),
+        })
+        assert response.status_code == 200
+    payload, _, _ = _strict_world_turn(client, surface="dev")
+    response = client.post("/v1/world-state/resolve", json=payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert all(claim["world_state_claim_id"] != old_ref for claim in result["included_claims"])
+    assert any(
+        item["effective_freshness_state"] == outcome for item in result["excluded_claim_summaries"]
+    )
+    assert "old_private_sentinel" not in (result["prompt_content"] or "")
+    if outcome != "superseded":
+        assert result["included_claims"] == []
+        assert result["prompt_content"] is None
+
+
+def test_strict_world_barriers_surround_only_one_protected_read(monkeypatch):
+    import services.world_state as module
+
+    client = TestClient(app)
+    _seed_strict_world_claims(client)
+    payload, _, _ = _strict_world_turn(client)
+    order = []
+    original_authority = module._strict_world_state_authority
+    original_read = module.get_world_state_diagnostics
+
+    def authority(body):
+        order.append("authority")
+        return original_authority(body)
+
+    def read(**kwargs):
+        order.append("read")
+        return original_read(**kwargs)
+
+    monkeypatch.setattr(module, "_strict_world_state_authority", authority)
+    monkeypatch.setattr(module, "get_world_state_diagnostics", read)
+    assert client.post("/v1/world-state/resolve", json=payload).status_code == 200
+    assert order == ["authority", "read", "authority"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["authority", "protected_read"])
+async def test_strict_world_storage_errors_never_become_success_or_disclose_private_errors(
+    failure, monkeypatch,
+):
+    import httpx
+    import services.world_state as module
+    from models import PersonaContainmentEvaluateRequest, RuntimeIdentityResolveRequest
+    from services.persona_containment import evaluate_persona_containment
+    from services.runtime_identity import resolve_runtime_identity
+
+    # Set up real repositories without nesting the synchronous TestClient event loop.
+    repo = runtime_state_repository()
+    session, turn, _ = repo.start_turn(**_base())
+    from models import InteractionGovernanceEvaluateRequest
+    from services.interaction_governance import evaluate_interaction_governance
+
+    payload = {
+        **_base(), "runtime_session_id": session.runtime_session_id,
+        "runtime_turn_id": turn.runtime_turn_id,
+    }
+    evaluate_interaction_governance(InteractionGovernanceEvaluateRequest(
+        **payload, current_user_text="I broke the server and prod is failing",
+    ))
+    payload["persona_selection_mode"] = "strict"
+    identity = resolve_runtime_identity(RuntimeIdentityResolveRequest(**payload))
+    payload["persona_selection_ref"] = identity.persona_selection.selection_ref
+    evaluate_persona_containment(PersonaContainmentEvaluateRequest(
+        **payload, current_user_text="I broke the server and prod is failing",
+    ))
+    reads = []
+
+    def fail(**kwargs):
+        raise sqlite3.OperationalError("private_sentinel storage failure")
+
+    if failure == "authority":
+        monkeypatch.setattr(repo, "persona_selection_events", fail)
+        monkeypatch.setattr(module, "get_world_state_diagnostics", lambda **kw: reads.append(kw))
+    else:
+        monkeypatch.setattr(module, "get_world_state_diagnostics", fail)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test",
+    ) as client:
+        response = await client.post("/v1/world-state/resolve", json=payload)
+    assert response.status_code == 500
+    assert "private_sentinel" not in response.text
+    assert "included_claims" not in response.text
+    assert reads == []
+
+
+@pytest.mark.parametrize("state", ["contended", "unavailable", "wrong_pointer"])
+def test_strict_world_noncurrent_runtime_authority_blocks_read(state, monkeypatch):
+    import services.world_state as module
+
+    client = TestClient(app)
+    payload, _, _ = _strict_world_turn(client)
+    with runtime_state_repository()._connect() as conn:
+        if state == "wrong_pointer":
+            conn.execute("UPDATE conversation_runtime_threads SET active_runtime_turn_id = NULL")
+        else:
+            conn.execute("UPDATE conversation_runtime_threads SET state = ?", (state,))
+    reads = []
+    monkeypatch.setattr(module, "get_world_state_diagnostics", lambda **kw: reads.append(kw))
+    _assert_strict_world_failure(client.post("/v1/world-state/resolve", json=payload))
+    assert reads == []
+
+
+@pytest.mark.parametrize("binding_type", ["ide_extension", "unsupported"])
+def test_unknown_world_surface_never_inherits_configured_fallback_type_privileges(binding_type):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    _seed_strict_world_claims(client)
+    with companion_contracts_repository()._connect() as conn:
+        conn.execute(
+            "UPDATE surface_bindings SET surface_type = ? WHERE surface_id = 'unknown'",
+            (binding_type,),
+        )
+    payload, _, _ = _strict_world_turn(client, surface="unregistered")
+    response = client.post("/v1/world-state/resolve", json=payload)
+    if binding_type == "unsupported":
+        _assert_strict_world_failure(response)
+    else:
+        assert response.status_code == 200
+        assert response.json()["trace"]["allowed_domains"] == [
+            "active_task", "pending_action", "runtime_surface",
+        ]
+        assert "private_value_active_project" not in response.json()["prompt_content"]
 
 
 def test_world_state_claim_create_and_metadata_round_trip():

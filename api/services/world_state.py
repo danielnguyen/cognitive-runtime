@@ -12,17 +12,23 @@ from typing import Any
 import yaml
 from models import (
     RuntimeIdentityResolveRequest,
+    SurfaceBinding,
     WorldStateClaimInput,
     WorldStateClaimSummary,
     WorldStateClaimVerifyRequest,
     WorldStateClaimView,
     WorldStateDiagnosticsResponse,
     WorldStateFreshnessState,
+    WorldStateResolveRequest,
     WorldStateResolveResponse,
     WorldStateResolveTrace,
     WorldStateTransition,
 )
 from services.companion_contracts import companion_contracts_repository
+from services.persona_containment import (
+    consume_strict_persona_containment,
+    validate_world_state_domain_baseline,
+)
 from services.runtime_identity import resolve_runtime_identity
 from services.runtime_state import (
     record_runtime_event,
@@ -1336,6 +1342,47 @@ def resolve_world_state_persona_scope(
     return active_persona_id, allowed
 
 
+def _strict_world_state_authority(body: WorldStateResolveRequest):
+    try:
+        selection, containment = consume_strict_persona_containment(body)
+    except RuntimeError as exc:
+        if str(exc) == "default_persona_profile_missing":
+            raise ValueError("world_state_persona_authority_unavailable") from exc
+        raise
+    validate_world_state_domain_baseline(containment.result)
+    if selection.selection_reason == "bound_persona_unavailable":
+        raise ValueError("world_state_persona_authority_unavailable")
+    repository = companion_contracts_repository()
+    record = repository.surface_binding(body.surface)
+    if record is None:
+        record = repository.surface_binding("unknown")
+    if record is None:
+        raise ValueError("world_state_surface_authority_unavailable")
+    binding = SurfaceBinding.model_validate(record.__dict__, strict=True)
+    if binding.surface_type not in _SURFACE_DOMAIN_RESTRICTIONS:
+        raise ValueError("world_state_scope_authority_unavailable")
+    if binding.default_persona_id != selection.active_persona_id:
+        raise ValueError("world_state_surface_authority_changed")
+    if selection.selection_source == "conservative_fallback":
+        if binding.surface_id != "unknown":
+            raise ValueError("world_state_surface_authority_changed")
+        surface_type = "unknown_surface"
+    else:
+        if binding.surface_id != body.surface:
+            raise ValueError("world_state_surface_authority_changed")
+        surface_type = binding.surface_type
+    if selection.active_persona_id not in _DOMAIN_ALLOWLISTS or (
+        surface_type not in _SURFACE_DOMAIN_RESTRICTIONS
+    ):
+        raise ValueError("world_state_scope_authority_unavailable")
+    allowed = _DOMAIN_ALLOWLISTS[selection.active_persona_id] & (
+        _SURFACE_DOMAIN_RESTRICTIONS[surface_type]
+    )
+    if body.requested_domains:
+        allowed &= set(body.requested_domains)
+    return selection, containment, binding, allowed
+
+
 def resolve_world_state(
     *,
     request_id: str,
@@ -1345,17 +1392,36 @@ def resolve_world_state(
     runtime_session_id: str | None,
     active_persona_id: str | None = None,
     requested_domains: list[str] | None = None,
+    persona_selection_mode: str = "legacy",
+    persona_selection_ref: str | None = None,
+    runtime_turn_id: str | None = None,
+    expected_thread_revision: int | None = None,
 ) -> WorldStateResolveResponse:
+    authority = None
+    strict_request = None
+    if persona_selection_mode == "strict":
+        strict_request = WorldStateResolveRequest(
+            request_id=request_id, owner_id=owner_id, conversation_id=conversation_id,
+            surface=surface, runtime_session_id=runtime_session_id,
+            active_persona_id=active_persona_id, requested_domains=requested_domains or [],
+            persona_selection_mode="strict", persona_selection_ref=persona_selection_ref,
+            runtime_turn_id=runtime_turn_id, expected_thread_revision=expected_thread_revision,
+        )
+        authority = _strict_world_state_authority(strict_request)
+        persona_id, allowed_domains = authority[0].active_persona_id, authority[3]
+    elif persona_selection_mode != "legacy":
+        raise ValueError("world_state_selection_mode_invalid")
     diagnostics = get_world_state_diagnostics(owner_id=owner_id, include_sensitive_values=False)
-    persona_id, allowed_domains = resolve_world_state_persona_scope(
-        request_id=request_id,
-        owner_id=owner_id,
-        conversation_id=conversation_id,
-        surface=surface,
-        runtime_session_id=runtime_session_id,
-        active_persona_id=active_persona_id,
-        requested_domains=requested_domains,
-    )
+    if authority is None:
+        persona_id, allowed_domains = resolve_world_state_persona_scope(
+            request_id=request_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            surface=surface,
+            runtime_session_id=runtime_session_id,
+            active_persona_id=active_persona_id,
+            requested_domains=requested_domains,
+        )
 
     included_claims: list[WorldStateClaimView] = []
     excluded_claims = list(diagnostics.excluded_claims)
@@ -1435,9 +1501,13 @@ def resolve_world_state(
         ),
         confirmation_required=confirmation_required,
     )
+    if authority is not None and _strict_world_state_authority(strict_request) != authority:
+        raise ValueError("world_state_authority_changed")
     return WorldStateResolveResponse(
         included_claims=included_claims,
         excluded_claim_summaries=excluded_claims,
         prompt_content="World state:\n" + "\n".join(prompt_lines) if prompt_lines else None,
         trace=trace,
+        selection_contract="strict_turn" if authority is not None else "legacy_unbound",
+        persona_selection_ref=authority[0].selection_ref if authority is not None else None,
     )
