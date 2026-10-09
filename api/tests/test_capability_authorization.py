@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from services.capability_authorization import (
     capability_authorization_repository,
     configure_capability_registry_for_tests,
 )
+from services.runtime_state import runtime_state_repository
 from services.world_state import (
     TrustedWorldStateVerifier,
     configure_trusted_world_state_verifiers_for_tests,
@@ -431,6 +434,532 @@ def _discovery_request(*, surface: str = "desktop", persona: str = "home_operato
         "request_id": "capability-discovery",
         "active_persona_id": persona,
     }
+
+
+def _strict_exposure_turn(
+    client, *, surface="dev", text="I broke the server and prod is failing",
+    containment_text=None, selection=True, containment=True,
+):
+    started = _start_turn(client, request_id="strict-exposure", surface=surface)
+    payload = {
+        **_base(surface=surface), "request_id": "strict-exposure",
+        "runtime_session_id": started["runtime_session"]["runtime_session_id"],
+        "runtime_turn_id": started["runtime_turn"]["runtime_turn_id"],
+    }
+    assert client.post("/v1/runtime/interaction-governance/evaluate", json={
+        **payload, "current_user_text": text,
+    }).status_code == 200
+    payload["persona_selection_mode"] = "strict"
+    decision = None
+    if selection:
+        resolved = client.post("/v1/runtime/identity/resolve", json=payload)
+        assert resolved.status_code == 200
+        decision = resolved.json()["persona_selection"]
+    payload["persona_selection_ref"] = (
+        decision["selection_ref"] if decision else "psel_00000000000000000000000000000000"
+    )
+    containment_request = {**payload, "current_user_text": containment_text or text}
+    if selection and containment:
+        assert client.post(
+            "/v1/runtime/persona-containment/evaluate", json=containment_request,
+        ).status_code == 200
+    return payload, decision, containment_request
+
+
+def _strict_exposure_post(client, operation, payload):
+    request = dict(payload)
+    if operation == "match":
+        request.setdefault("current_user_text", "Please run a service health check.")
+    return client.post(f"/v1/capabilities/{operation}", json=request)
+
+
+def _assert_exposure_failure(response):
+    assert response.status_code == 409
+    assert response.json() == {"detail": "capability_exposure_authority_rejected"}
+    assert "service_health_check" not in response.text
+    assert "runtime.world_state.read" not in response.text
+    assert "private_sentinel" not in response.text
+    assert "result" not in response.json()
+
+
+def _observe_registry(monkeypatch):
+    original = capability_authorization_service._CAPABILITY_REGISTRY
+    reads = []
+
+    class ObservedRegistry:
+        def __iter__(self):
+            reads.append("registry")
+            return iter(original)
+
+    monkeypatch.setattr(
+        capability_authorization_service, "_CAPABILITY_REGISTRY", ObservedRegistry(),
+    )
+    return reads
+
+
+@pytest.mark.parametrize("surface,persona,expected", [
+    ("dev", "technical_architect", {
+        "service_health_check", "runtime.world_state.read", "jellyfin_restart",
+        "draft_notification",
+    }),
+    ("vscode", "technical_architect", {"runtime.world_state.read"}),
+    ("web", "general_assistant", set()),
+    ("unregistered", "general_assistant", set()),
+    ("unknown", "general_assistant", set()),
+])
+def test_strict_discovery_uses_only_registry_persona_surface_permissions(
+    surface, persona, expected,
+):
+    client = TestClient(app)
+    payload, decision, _ = _strict_exposure_turn(client, surface=surface)
+    response = _strict_exposure_post(client, "discover", {
+        **payload, "expected_thread_revision": decision["thread_revision"],
+    })
+    assert response.status_code == 200
+    result = response.json()
+    assert result["active_persona_id"] == persona
+    assert result["selection_contract"] == "strict_turn"
+    assert result["persona_selection_ref"] == decision["selection_ref"]
+    assert result["result"]["action_taken"] is False
+    assert result["result"]["registry_available"] is True
+    assert {example["capability_id"] for example in result["result"]["allowed_examples"]} == (
+        expected
+    )
+    assert result["result"]["blocked_examples"] == []
+    registry = {
+        item.record.capability_id: item.record
+        for item in capability_authorization_service._CAPABILITY_REGISTRY
+    }
+    for example in result["result"]["allowed_examples"]:
+        record = registry[example["capability_id"]]
+        assert persona in record.allowed_personas
+        assert surface in record.allowed_surfaces
+        assert example["operation_kind"] == record.operation_kind
+        assert example["risk_level"] == record.risk_level
+    assert decision["contextual_activation"] is False
+
+
+@pytest.mark.parametrize("surface,text,capability_id", [
+    ("dev", "Please run a service health check.", "service_health_check"),
+    ("dev", "Restart Jellyfin please.", "jellyfin_restart"),
+    ("dev", "Please draft notification.", "draft_notification"),
+    ("vscode", "Show runtime world state.", "runtime.world_state.read"),
+])
+def test_strict_matching_returns_exact_eligible_registry_descriptor_without_authorization(
+    surface, text, capability_id,
+):
+    client = TestClient(app)
+    payload, decision, _ = _strict_exposure_turn(client, surface=surface)
+    response = _strict_exposure_post(client, "match", {
+        **payload, "current_user_text": text, "active_persona_id": "technical_architect",
+    })
+    assert response.status_code == 200
+    result = response.json()
+    assert result["active_persona_id"] == decision["active_persona_id"]
+    assert result["result"]["capability_matched"] is True
+    assert result["result"]["action_taken"] is False
+    registry = capability_authorization_service._registered_capability_by_id(capability_id)
+    assert result["result"]["capability"] == registry.record.model_dump()
+    assert result["selection_contract"] == "strict_turn"
+    assert "authorization_decision" not in result
+    assert "confirmation_challenge_ref" not in result
+
+
+@pytest.mark.parametrize("surface,text,reason", [
+    ("web", "Run a service health check.", "surface_not_allowed"),
+    ("vscode", "Restart Jellyfin.", "surface_not_allowed"),
+    ("dev", "Turn on office lights.", "surface_not_allowed"),
+    ("unregistered", "Run a service health check.", "surface_not_allowed"),
+    ("dev", "service_health_check", "raw_capability_name_ignored"),
+    ("dev", "Archive some unregistered records.", "no_registered_capability"),
+])
+def test_strict_matching_denial_never_exposes_executable_descriptor(surface, text, reason):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client, surface=surface)
+    response = _strict_exposure_post(client, "match", {**payload, "current_user_text": text})
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["capability_matched"] is False
+    assert result["capability"] is None
+    assert result["reason_codes"] == [reason]
+    assert result["action_taken"] is False
+
+
+@pytest.mark.parametrize("text,proposal", [
+    ("I broke the server and prod is failing", "technical_architect"),
+    ("That was wrong in the report.", "personal_companion"),
+])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_advisory_proposals_do_not_offer_tools_to_web_role(text, proposal, operation):
+    client = TestClient(app)
+    payload, decision, _ = _strict_exposure_turn(client, surface="web", text=text)
+    assert decision["proposed_persona_id"] == proposal
+    response = _strict_exposure_post(client, operation, payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["active_persona_id"] == "general_assistant"
+    assert result["result"]["action_taken"] is False
+    if operation == "match":
+        assert result["result"]["capability_matched"] is False
+        assert result["result"]["capability"] is None
+    else:
+        assert result["result"]["allowed_examples"] == result["result"]["blocked_examples"] == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("request_id", "other_request"), ("owner_id", "other_owner"),
+    ("conversation_id", "other_conversation"), ("surface", "vscode"),
+    ("runtime_session_id", "other_session"), ("runtime_turn_id", "other_turn"),
+    ("expected_thread_revision", 0), ("active_persona_id", "home_operator"),
+    ("persona_selection_ref", "psel_00000000000000000000000000000000"),
+])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_scope_mismatch_prevents_registry_access(
+    field, value, operation, monkeypatch,
+):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    reads = _observe_registry(monkeypatch)
+    _assert_exposure_failure(_strict_exposure_post(client, operation, {**payload, field: value}))
+    assert reads == []
+
+
+@pytest.mark.parametrize("selection,containment", [(False, False), (True, False)])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_requires_existing_selection_and_containment(
+    selection, containment, operation, monkeypatch,
+):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client, selection=selection, containment=containment)
+    reads = _observe_registry(monkeypatch)
+    _assert_exposure_failure(_strict_exposure_post(client, operation, payload))
+    assert reads == []
+    events = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    assert sum(event.event_type == "persona_selection_resolved" for event in events) == (
+        int(selection)
+    )
+    assert not any(event.event_type == "persona_containment_evaluated" for event in events)
+
+
+@pytest.mark.parametrize("mutation", [
+    {"persona_selection_ref": "malformed"}, {"persona_selection_ref": None},
+    {"runtime_session_id": None}, {"runtime_turn_id": None},
+    {"selection_source": "explicit_user"}, {"persona_scope_hint": "technical_operator"},
+    {"requested_persona_id": "technical_architect"}, {"expected_thread_revision": True},
+    {"persona_selection_mode": "unsupported"},
+])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_rejects_spoofed_or_incomplete_request_fields(mutation, operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_exposure_post(client, operation, {**payload, **mutation})
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("status", ["completed", "abandoned"])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_rejects_terminal_turn_before_registry(status, operation, monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    runtime_state_repository().complete_turn(
+        **{key: payload[key] for key in ("request_id", "runtime_session_id", "runtime_turn_id")},
+        turn_status=status,
+    )
+    reads = _observe_registry(monkeypatch)
+    _assert_exposure_failure(_strict_exposure_post(client, operation, payload))
+    assert reads == []
+
+
+@pytest.mark.parametrize("corruption", [
+    "selection", "governance", "containment", "tool_domains", "unmapped_tools", "extra_policy",
+])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_corrupted_policy_never_enumerates(corruption, operation, monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    repo = runtime_state_repository()
+    kind = {
+        "selection": "persona_selection_resolved", "governance": "interaction_governance_evaluated",
+    }.get(corruption, "persona_containment_evaluated")
+    with repo._connect() as conn:
+        row = conn.execute(
+            "SELECT id, event_payload_json FROM conversation_runtime_events WHERE event_type = ?",
+            (kind,),
+        ).fetchone()
+        changed = json.loads(row["event_payload_json"])
+        if corruption == "selection":
+            value = "private_sentinel invalid_json"
+        else:
+            if corruption == "governance":
+                changed["interaction_kind"] = "question"
+            elif corruption == "containment":
+                changed["strict_containment"]["status"] = "failed"
+            elif corruption in {"tool_domains", "unmapped_tools"}:
+                domains = ["general"] if corruption == "tool_domains" else ["software_architecture"]
+                changed["strict_containment"]["result"]["allowed_tool_domains"] = domains
+                changed["allowed_tool_domains"] = domains
+            else:
+                changed["strict_containment"]["result"]["private_data"] = "private_sentinel"
+            value = json.dumps(changed)
+        conn.execute(
+            "UPDATE conversation_runtime_events SET event_payload_json = ? WHERE id = ?",
+            (value, row["id"]),
+        )
+    reads = _observe_registry(monkeypatch)
+    _assert_exposure_failure(_strict_exposure_post(client, operation, payload))
+    assert reads == []
+
+
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_narrowed_tool_scope_fails_without_registry_domain_mapping(
+    operation, monkeypatch,
+):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(
+        client, containment_text="Check tire pressure and vehicle maintenance.",
+    )
+    reads = _observe_registry(monkeypatch)
+    _assert_exposure_failure(_strict_exposure_post(client, operation, payload))
+    assert reads == []
+
+
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_conflicting_containment_cannot_pick_convenient_policy(operation):
+    client = TestClient(app)
+    payload, _, containment = _strict_exposure_turn(client)
+    assert client.post(
+        "/v1/runtime/persona-containment/evaluate", json=containment,
+    ).status_code == 200
+    assert _strict_exposure_post(client, operation, payload).status_code == 200
+    assert client.post("/v1/runtime/persona-containment/evaluate", json={
+        **containment, "current_user_text": "What is 2+2?",
+    }).status_code == 200
+    _assert_exposure_failure(_strict_exposure_post(client, operation, payload))
+
+
+@pytest.mark.parametrize("disabled", ["request", "registry"])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_preserves_disabled_registry_without_lookup(
+    disabled, operation, monkeypatch,
+):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    if disabled == "request":
+        payload["registry_enabled"] = False
+    else:
+        configure_capability_registry_for_tests(available=False)
+    reads = _observe_registry(monkeypatch)
+    response = _strict_exposure_post(client, operation, payload)
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert reads == []
+    assert result["action_taken"] is False
+    if operation == "match":
+        assert result["capability"] is None
+        assert result["capability_matched"] is False
+        assert result["reason_codes"] == ["registry_unavailable"]
+    else:
+        assert result["registry_available"] is False
+        assert result["allowed_examples"] == result["blocked_examples"] == []
+
+
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_disabled_registry_cannot_hide_missing_strict_authority(operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client, selection=False, containment=False)
+    payload["registry_enabled"] = False
+    _assert_exposure_failure(_strict_exposure_post(client, operation, payload))
+
+
+@pytest.mark.parametrize("change", ["binding", "completion", "revision", "registry"])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_revalidates_after_lookup_before_descriptor_publication(
+    change, operation, monkeypatch,
+):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    original = capability_authorization_service._CAPABILITY_REGISTRY
+    visits = []
+
+    class ChangedRegistry:
+        def __iter__(self):
+            visits.append("lookup")
+            if change == "binding":
+                with companion_contracts_repository()._connect() as conn:
+                    conn.execute(
+                        "UPDATE surface_bindings SET surface_type = 'web_app' "
+                        "WHERE surface_id = 'dev'",
+                    )
+            elif change == "completion":
+                runtime_state_repository().complete_turn(
+                    **{key: payload[key] for key in (
+                        "request_id", "runtime_session_id", "runtime_turn_id",
+                    )},
+                    turn_status="completed",
+                )
+            elif change == "revision":
+                with runtime_state_repository()._connect() as conn:
+                    conn.execute("UPDATE conversation_runtime_threads SET revision = revision + 1")
+            else:
+                configure_capability_registry_for_tests(available=False)
+            return iter(original)
+
+    monkeypatch.setattr(capability_authorization_service, "_CAPABILITY_REGISTRY", ChangedRegistry())
+    _assert_exposure_failure(_strict_exposure_post(client, operation, payload))
+    assert visits == ["lookup"]
+
+
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_storage_failure_is_not_successful_empty_registry(operation, monkeypatch):
+    import anyio
+    import httpx
+
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    if operation == "match":
+        payload["current_user_text"] = "Run a service health check."
+    reads = _observe_registry(monkeypatch)
+
+    def fail(**kwargs):
+        raise sqlite3.OperationalError("private_sentinel storage failure")
+
+    monkeypatch.setattr(runtime_state_repository(), "persona_selection_events", fail)
+
+    async def submit():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test",
+        ) as http:
+            return await http.post(f"/v1/capabilities/{operation}", json=payload)
+
+    response = anyio.run(submit)
+    assert response.status_code == 500
+    assert "private_sentinel" not in response.text
+    assert "service_health_check" not in response.text
+    assert reads == []
+
+
+def test_strict_capability_exposure_has_no_authorization_or_confirmation_side_effects(monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    events_before = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    repo = capability_authorization_repository()
+    with repo._connect() as conn:
+        before = [
+            dict(row) for row in conn.execute("SELECT * FROM capability_confirmation_challenges")
+        ]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("exposure must not invoke execution authority")
+
+    for name in (
+        "authorize_capability", "decide_action_authority", "decide_action_flow",
+        "record_capability_confirmation", "capability_authorization_repository",
+    ):
+        monkeypatch.setattr(capability_authorization_service, name, forbidden)
+    for operation in ("match", "discover"):
+        response = _strict_exposure_post(client, operation, {
+            **payload,
+            **({"current_user_text": "Restart Jellyfin."} if operation == "match" else {}),
+        })
+        assert response.status_code == 200
+        assert response.json()["result"]["action_taken"] is False
+    with repo._connect() as conn:
+        after = [
+            dict(row) for row in conn.execute("SELECT * FROM capability_confirmation_challenges")
+        ]
+    assert after == before
+    assert runtime_state_repository().list_events_for_tests(payload["runtime_session_id"]) == (
+        events_before
+    )
+
+
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_legacy_exposure_keeps_persona_requirement_and_blocked_descriptor_compatibility(operation):
+    client = TestClient(app)
+    request = _base(surface="dev")
+    if operation == "match":
+        request["current_user_text"] = "Turn on office lights."
+    assert _strict_exposure_post(client, operation, request).status_code == 422
+    request["active_persona_id"] = "technical_architect"
+    response = _strict_exposure_post(client, operation, request)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["selection_contract"] == "legacy_unbound"
+    assert result["persona_selection_ref"] is None
+    if operation == "match":
+        assert result["result"]["capability_matched"] is False
+        assert result["result"]["capability"]["capability_id"] == "office_lights_on"
+    else:
+        assert result["result"]["blocked_examples"]
+
+
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_selected_valid_persona_still_requires_per_capability_registry_permission(operation):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    with companion_contracts_repository()._connect() as conn:
+        conn.execute(
+            "UPDATE surface_bindings SET default_persona_id = 'general_assistant' "
+            "WHERE surface_id = 'dev'",
+        )
+    payload, decision, _ = _strict_exposure_turn(client)
+    assert decision["active_persona_id"] == "general_assistant"
+    response = _strict_exposure_post(client, operation, payload)
+    assert response.status_code == 200
+    result = response.json()["result"]
+    if operation == "match":
+        assert result["capability_matched"] is False
+        assert result["capability"] is None
+        assert result["reason_codes"] == ["persona_not_allowed"]
+    else:
+        assert result["allowed_examples"] == result["blocked_examples"] == []
+
+
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_unregistered_surface_cannot_borrow_registry_permissions_from_fallback_persona(operation):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    with companion_contracts_repository()._connect() as conn:
+        conn.execute(
+            "UPDATE surface_bindings SET default_persona_id = 'technical_architect' "
+            "WHERE surface_id = 'unknown'",
+        )
+    # desktop appears in the capability registry but has no configured surface binding.
+    payload, decision, _ = _strict_exposure_turn(client, surface="desktop")
+    assert decision["active_persona_id"] == "technical_architect"
+    assert decision["selection_source"] == "conservative_fallback"
+    response = _strict_exposure_post(client, operation, payload)
+    assert response.status_code == 200
+    result = response.json()["result"]
+    if operation == "match":
+        assert result["capability_matched"] is False
+        assert result["capability"] is None
+        assert result["reason_codes"] == ["surface_not_allowed"]
+    else:
+        assert result["allowed_examples"] == result["blocked_examples"] == []
+
+
+@pytest.mark.parametrize("corruption", ["missing", "malformed"])
+@pytest.mark.parametrize("operation", ["match", "discover"])
+def test_strict_exposure_invalid_surface_authority_blocks_registry(
+    corruption, operation, monkeypatch,
+):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    with companion_contracts_repository()._connect() as conn:
+        if corruption == "missing":
+            conn.execute("DELETE FROM surface_bindings WHERE surface_id IN ('dev', 'unknown')")
+        else:
+            conn.execute("UPDATE surface_bindings SET surface_type = '' WHERE surface_id = 'dev'")
+    reads = _observe_registry(monkeypatch)
+    _assert_exposure_failure(_strict_exposure_post(client, operation, payload))
+    assert reads == []
 
 
 def _authority_request(
