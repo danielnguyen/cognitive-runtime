@@ -3469,6 +3469,27 @@ class WorldStateResolveRequest(RuntimeStateResolveRequest):
     runtime_session_id: str | None = Field(default=None, max_length=120)
     active_persona_id: str | None = Field(default=None, max_length=120)
     requested_domains: list[BoundedLabel] = Field(default_factory=list, max_length=12)
+    persona_selection_mode: Literal["legacy", "strict"] = "legacy"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
+    runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
+    expected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def strict_selection_fields(cls, value):
+        if isinstance(value, dict) and (
+            value.get("persona_selection_mode") == "strict" or value.get("persona_selection_ref")
+        ):
+            if value.get("persona_selection_mode") != "strict":
+                raise ValueError("persona_selection_requires_strict_mode")
+            if not all(value.get(key) for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id", "persona_selection_ref",
+            )):
+                raise ValueError("persona_selection_binding_required")
+            if set(value) - cls.model_fields.keys():
+                raise ValueError("persona_selection_unknown_fields")
+        return value
 
 
 class WorldStateResolveTrace(BaseModel):
@@ -3488,6 +3509,8 @@ class WorldStateResolveResponse(BaseModel):
     excluded_claim_summaries: list[WorldStateClaimSummary] = Field(default_factory=list)
     prompt_content: str | None = None
     trace: WorldStateResolveTrace
+    selection_contract: Literal["legacy_unbound", "strict_turn"] = "legacy_unbound"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
 
 
 CapabilityAuthorizationPhase = Literal["exposure", "selection", "dispatch"]

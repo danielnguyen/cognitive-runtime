@@ -932,15 +932,24 @@ async def world_state_diagnostics(
 async def world_state_resolve(
     body: WorldStateResolveRequest,
 ) -> WorldStateResolveResponse:
-    return resolve_world_state(
-        request_id=body.request_id,
-        owner_id=body.owner_id,
-        conversation_id=body.conversation_id,
-        surface=body.surface,
-        runtime_session_id=body.runtime_session_id,
-        active_persona_id=body.active_persona_id,
-        requested_domains=body.requested_domains,
-    )
+    try:
+        return resolve_world_state(
+            request_id=body.request_id,
+            owner_id=body.owner_id,
+            conversation_id=body.conversation_id,
+            surface=body.surface,
+            runtime_session_id=body.runtime_session_id,
+            active_persona_id=body.active_persona_id,
+            requested_domains=body.requested_domains,
+            **({key: getattr(body, key) for key in (
+                "persona_selection_mode", "persona_selection_ref", "runtime_turn_id",
+                "expected_thread_revision",
+            )} if body.persona_selection_mode == "strict" else {}),
+        )
+    except (ValueError, TypeError) as exc:
+        if body.persona_selection_mode != "strict":
+            raise
+        raise HTTPException(status_code=409, detail="world_state_authority_rejected") from exc
 
 
 @app.post("/v1/capabilities/authorize", response_model=CapabilityAuthorizationResponse)

@@ -10,7 +10,11 @@ from models import (
     PersonaContainmentResult,
 )
 from services.companion_contracts import companion_contracts_repository
-from services.runtime_identity import consume_persona_selection, persona_from_scope_hint
+from services.runtime_identity import (
+    consume_persona_selection,
+    consume_persona_selection_evidence,
+    persona_from_scope_hint,
+)
 from services.runtime_state import (
     record_runtime_event,
     resolve_runtime_session,
@@ -430,6 +434,65 @@ def validate_relationship_domain_baseline(result: PersonaContainmentResult) -> N
         raise ValueError("relationship_containment_scope_unresolved")
     if result.cross_scope_access_allowed:
         raise ValueError("relationship_containment_scope_unresolved")
+
+
+def consume_strict_persona_containment(body):
+    """Consume committed evidence only; never evaluate a missing predecessor."""
+    _, selection, events = consume_persona_selection_evidence(body, include_containment=True)
+    selection_index = next(
+        index for index, event in enumerate(events)
+        if event.event_type == "persona_selection_resolved"
+    )
+    committed = []
+    for index, event in enumerate(events):
+        if event.event_type != "persona_containment_evaluated":
+            continue
+        if index <= selection_index:
+            raise ValueError("persona_containment_order_invalid")
+        payload = event.event_payload_json
+        try:
+            authority = PersonaContainmentAuthority.model_validate(
+                payload.get("strict_containment"), strict=True,
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError("persona_containment_authority_invalid") from exc
+        if any(getattr(authority, key) != getattr(selection, key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id", "thread_revision",
+        )) or authority.persona_selection_ref != selection.selection_ref:
+            raise ValueError("persona_containment_binding_mismatch")
+        if authority.result.active_persona_id != selection.active_persona_id:
+            raise ValueError("persona_containment_persona_mismatch")
+        if payload.get("persona_selection_ref") != selection.selection_ref or (
+            payload.get("request_id") != selection.request_id
+        ):
+            raise ValueError("persona_containment_binding_mismatch")
+        result = authority.result.model_dump()
+        for key in (
+            "active_persona_id", "capability_domain", "allowed_memory_domains",
+            "blocked_memory_domains", "allowed_tool_domains", "artifact_access_policy",
+            "cross_scope_access_allowed", "cross_scope_reason", "reason_summary",
+        ):
+            if payload.get(key) != result[key]:
+                raise ValueError("persona_containment_inconsistent")
+        committed.append(authority)
+    if not committed:
+        raise ValueError("persona_containment_missing")
+    if any(authority != committed[0] for authority in committed[1:]):
+        raise ValueError("persona_containment_conflict")
+    return selection, committed[0]
+
+
+def validate_world_state_domain_baseline(result: PersonaContainmentResult) -> None:
+    """Broad domains cannot be translated into concrete state-domain grants."""
+    baseline = _PERSONA_BASE_ALLOWED_DOMAINS.get(result.active_persona_id)
+    domains = result.allowed_world_state_domains
+    if set(domains) & set(result.blocked_memory_domains):
+        raise ValueError("world_state_containment_policy_invalid")
+    if baseline is None or len(domains) != len(set(domains)) or set(domains) != baseline:
+        raise ValueError("world_state_containment_scope_unresolved")
+    if result.cross_scope_access_allowed:
+        raise ValueError("world_state_containment_scope_unresolved")
 
 
 def evaluate_persona_containment(
