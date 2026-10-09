@@ -19,6 +19,7 @@ from models import (
     ContinuationSelectionResponse,
     ContinuationSelectionResult,
     HistoryFollowupIntent,
+    PersonaSelectionDecision,
     RestraintPolicy,
     RetirementReservationCancelRequest,
     RetirementReservationCancelResponse,
@@ -2109,6 +2110,106 @@ class RuntimeStateRepository:
                 continue
             return event
         return None
+
+    def persona_selection_events(
+        self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
+        runtime_session_id: str, runtime_turn_id: str,
+        expected_thread_revision: int | None = None,
+        selection: PersonaSelectionDecision | None = None,
+        containment_payload: dict[str, Any] | None = None,
+    ) -> tuple[RuntimeSession, int, list[RuntimeEvent]]:
+        """Read/commit selection evidence only for the current admitted request."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            session = self._session_by_id(conn, runtime_session_id)
+            if session is None:
+                raise ValueError("runtime_session_not_found")
+            if (session.owner_id, session.conversation_id, session.surface) != (
+                owner_id, conversation_id, surface,
+            ) or session.status != "active":
+                raise ValueError("runtime_session_mismatch")
+            turn = self._turn_by_id(conn, runtime_turn_id)
+            if turn is None:
+                raise ValueError("runtime_turn_not_found")
+            if turn.runtime_session_id != runtime_session_id:
+                raise ValueError("runtime_turn_session_mismatch")
+            if turn.turn_status in _TERMINAL_TURN_STATUSES or turn.completed_at is not None:
+                raise ValueError("runtime_turn_not_current")
+            if self._thread_by_key(
+                conn, owner_id=owner_id, conversation_id=conversation_id,
+            ) is None:
+                raise ValueError("runtime_turn_not_current")
+            try:
+                thread = self._validate_current_turn(conn, session=session, turn=turn)
+            except RuntimeError as exc:
+                raise ValueError("runtime_turn_not_current") from exc
+            revision = thread["revision"]
+            if expected_thread_revision is not None and expected_thread_revision != revision:
+                raise ValueError("runtime_thread_revision_conflict")
+            rows = conn.execute(
+                "SELECT * FROM conversation_runtime_events WHERE runtime_turn_id = ? "
+                "AND event_type IN ('turn_started', 'interaction_governance_evaluated', "
+                "'persona_selection_resolved') ORDER BY id ASC;", (runtime_turn_id,),
+            ).fetchall()
+            try:
+                events = [self._event_from_row(row) for row in rows]
+            except (ValueError, TypeError) as exc:
+                raise ValueError("persona_selection_authority_invalid") from exc
+            if any(event.runtime_session_id != runtime_session_id for event in events):
+                raise ValueError("persona_selection_authority_invalid")
+            started = [event for event in events if event.event_type == "turn_started"]
+            if len(started) != 1 or started[0].event_payload_json.get("request_id") != request_id:
+                raise ValueError("runtime_turn_request_mismatch")
+            if selection is not None:
+                if (
+                    selection.request_id, selection.owner_id, selection.conversation_id,
+                    selection.surface, selection.runtime_session_id, selection.runtime_turn_id,
+                    selection.thread_revision,
+                ) != (
+                    request_id, owner_id, conversation_id, surface,
+                    runtime_session_id, runtime_turn_id, revision,
+                ):
+                    raise ValueError("persona_selection_binding_mismatch")
+                governance = [
+                    event for event in events
+                    if event.event_type == "interaction_governance_evaluated"
+                ]
+                if not governance or governance[-1].event_id != selection.governance_event_ref:
+                    raise ValueError("persona_selection_governance_changed")
+                previous = [
+                    event for event in events if event.event_type == "persona_selection_resolved"
+                ]
+                if containment_payload is not None and not previous:
+                    raise ValueError("persona_selection_not_found")
+                payload = selection.model_dump()
+                if previous:
+                    if len(previous) != 1 or previous[0].event_payload_json != payload:
+                        raise ValueError("persona_selection_conflict")
+                else:
+                    events.append(self._record_event(
+                        conn, runtime_session_id=runtime_session_id,
+                        runtime_turn_id=runtime_turn_id, event_type="persona_selection_resolved",
+                        event_payload_json=payload,
+                    ))
+                if containment_payload is not None:
+                    if (
+                        containment_payload.get("request_id") != request_id
+                        or containment_payload.get("active_persona_id") != (
+                            selection.active_persona_id
+                        )
+                        or containment_payload.get("persona_selection_ref") != (
+                            selection.selection_ref
+                        )
+                    ):
+                        raise ValueError("persona_selection_binding_mismatch")
+                    self._record_event(
+                        conn, runtime_session_id=runtime_session_id,
+                        runtime_turn_id=runtime_turn_id, event_type="persona_containment_evaluated",
+                        event_payload_json=containment_payload,
+                    )
+            elif containment_payload is not None:
+                raise ValueError("persona_selection_binding_required")
+            return session, revision, events
 
     def record_session_event(
         self,

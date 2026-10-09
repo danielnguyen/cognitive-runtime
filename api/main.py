@@ -747,16 +747,28 @@ async def runtime_privacy_context_evaluate(
 async def runtime_identity_resolve(
     body: RuntimeIdentityResolveRequest,
 ) -> RuntimeIdentityResolveResponse:
-    resolution = resolve_runtime_identity(body)
+    try:
+        resolution = resolve_runtime_identity(body)
+    except ValueError as exc:
+        if body.persona_selection_mode != "strict":
+            raise
+        detail = str(exc)
+        raise HTTPException(
+            status_code=404 if detail in {"runtime_session_not_found", "runtime_turn_not_found"}
+            else 409,
+            detail="persona_selection_rejected",
+        ) from exc
     record_runtime_event(
         runtime_session_id=resolution.runtime_session.runtime_session_id,
-        runtime_turn_id=None,
+        runtime_turn_id=body.runtime_turn_id if body.persona_selection_mode == "strict" else None,
         event_type="identity_resolved",
         event_payload_json={
             "request_id": body.request_id,
             "active_persona_id": resolution.trace.active_persona_id,
             "persona_resolution_reason": resolution.trace.persona_resolution_reason,
             "surface_id": resolution.trace.surface_id,
+            **({"persona_selection_ref": resolution.persona_selection.selection_ref}
+               if resolution.persona_selection else {}),
         },
     )
     return resolution
@@ -1028,6 +1040,8 @@ async def runtime_persona_containment_evaluate(
     try:
         return evaluate_persona_containment(body)
     except ValueError as exc:
+        if body.persona_selection_mode == "strict":
+            raise HTTPException(status_code=409, detail="persona_selection_rejected") from exc
         detail = str(exc)
         if detail == "runtime_session_not_found":
             raise HTTPException(status_code=404, detail=detail) from exc
