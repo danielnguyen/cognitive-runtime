@@ -495,6 +495,18 @@ def validate_world_state_domain_baseline(result: PersonaContainmentResult) -> No
         raise ValueError("world_state_containment_scope_unresolved")
 
 
+def validate_capability_tool_baseline(result: PersonaContainmentResult) -> None:
+    """Do not translate broad tool domains into registry capability-domain grants."""
+    baseline = _PERSONA_BASE_ALLOWED_DOMAINS.get(result.active_persona_id)
+    domains = result.allowed_tool_domains
+    if set(domains) & set(result.blocked_memory_domains):
+        raise ValueError("capability_containment_policy_invalid")
+    if baseline is None or len(domains) != len(set(domains)) or set(domains) != baseline:
+        raise ValueError("capability_tool_scope_unresolved")
+    if result.cross_scope_access_allowed:
+        raise ValueError("capability_tool_scope_unresolved")
+
+
 def evaluate_persona_containment(
     body: PersonaContainmentEvaluateRequest,
 ) -> PersonaContainmentEvaluateResponse:

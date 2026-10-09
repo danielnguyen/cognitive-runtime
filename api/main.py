@@ -969,14 +969,28 @@ async def capability_authorize(
 async def capability_match(
     body: CapabilityMatchRequest,
 ) -> CapabilityMatchResponse:
-    return match_registered_capability(body)
+    try:
+        return match_registered_capability(body)
+    except (ValueError, TypeError) as exc:
+        if body.persona_selection_mode != "strict":
+            raise
+        raise HTTPException(
+            status_code=409, detail="capability_exposure_authority_rejected",
+        ) from exc
 
 
 @app.post("/v1/capabilities/discover", response_model=CapabilityDiscoveryResponse)
 async def capability_discover(
     body: CapabilityDiscoveryRequest,
 ) -> CapabilityDiscoveryResponse:
-    return discover_registered_capabilities(body)
+    try:
+        return discover_registered_capabilities(body)
+    except (ValueError, TypeError) as exc:
+        if body.persona_selection_mode != "strict":
+            raise
+        raise HTTPException(
+            status_code=409, detail="capability_exposure_authority_rejected",
+        ) from exc
 
 
 @app.post("/v1/capabilities/authority", response_model=ActionAuthorityDecisionResponse)

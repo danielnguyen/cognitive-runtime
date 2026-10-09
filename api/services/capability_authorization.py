@@ -39,8 +39,13 @@ from models import (
     DryRunEffect,
     RelationshipSelectRequest,
     RuntimeIdentityResolveRequest,
+    SurfaceBinding,
 )
 from services.companion_contracts import companion_contracts_repository
+from services.persona_containment import (
+    consume_strict_persona_containment,
+    validate_capability_tool_baseline,
+)
 from services.relationships import select_relationships
 from services.runtime_identity import resolve_runtime_identity
 from services.runtime_state import (
@@ -1252,7 +1257,53 @@ def capability_authorization_repository() -> CapabilityAuthorizationRepository:
     return _CAPABILITY_AUTH_REPOSITORY
 
 
+def _strict_capability_exposure_authority(body):
+    try:
+        selection, containment = consume_strict_persona_containment(body)
+    except RuntimeError as exc:
+        if str(exc) == "default_persona_profile_missing":
+            raise ValueError("capability_persona_authority_unavailable") from exc
+        raise
+    validate_capability_tool_baseline(containment.result)
+    if selection.selection_reason == "bound_persona_unavailable":
+        raise ValueError("capability_persona_authority_unavailable")
+    repository = companion_contracts_repository()
+    record = repository.surface_binding(body.surface)
+    if record is None:
+        record = repository.surface_binding("unknown")
+    if record is None:
+        raise ValueError("capability_surface_authority_unavailable")
+    binding = SurfaceBinding.model_validate(record.__dict__, strict=True)
+    if any(not getattr(binding, key).strip() for key in (
+        "surface_id", "surface_type", "default_persona_id",
+    )) or binding.default_persona_id != selection.active_persona_id:
+        raise ValueError("capability_surface_authority_invalid")
+    if selection.selection_source == "conservative_fallback":
+        if binding.surface_id != "unknown":
+            raise ValueError("capability_surface_authority_changed")
+        exposure_surface = "unknown"
+    else:
+        if binding.surface_id != body.surface:
+            raise ValueError("capability_surface_authority_changed")
+        exposure_surface = binding.surface_id
+    return selection, containment, binding, exposure_surface
+
+
+def _revalidate_capability_exposure(body, authority, registry_available):
+    if _strict_capability_exposure_authority(body) != authority or (
+        (_CAPABILITY_REGISTRY_AVAILABLE and body.registry_enabled) != registry_available
+    ):
+        raise ValueError("capability_exposure_authority_changed")
+
+
 def match_registered_capability(body: CapabilityMatchRequest) -> CapabilityMatchResponse:
+    authority = (
+        _strict_capability_exposure_authority(body) if body.persona_selection_mode == "strict"
+        else None
+    )
+    persona_id = authority[0].active_persona_id if authority is not None else body.active_persona_id
+    surface = authority[3] if authority is not None else body.surface
+    registry_available = _CAPABILITY_REGISTRY_AVAILABLE and body.registry_enabled
     if not _CAPABILITY_REGISTRY_AVAILABLE or not body.registry_enabled:
         result = CapabilityMatchResult(
             capability_matched=False,
@@ -1273,25 +1324,40 @@ def match_registered_capability(body: CapabilityMatchRequest) -> CapabilityMatch
         else:
             ineligible_reason = _eligible_reason(
                 capability.record,
-                surface=body.surface,
-                active_persona_id=body.active_persona_id,
+                surface=surface,
+                active_persona_id=persona_id,
             )
             result = CapabilityMatchResult(
                 capability_matched=ineligible_reason is None,
                 reason_codes=[ineligible_reason or "matched"],
-                capability=capability.record,
+                capability=(
+                    capability.record if authority is None or ineligible_reason is None else None
+                ),
             )
+    if authority is not None:
+        _revalidate_capability_exposure(body, authority, registry_available)
     return CapabilityMatchResponse(
         request_id=body.request_id,
         owner_id=body.owner_id,
         conversation_id=body.conversation_id,
         surface=body.surface,
-        active_persona_id=body.active_persona_id,
+        active_persona_id=persona_id,
         result=result,
+        selection_contract="strict_turn" if authority is not None else "legacy_unbound",
+        persona_selection_ref=authority[0].selection_ref if authority is not None else None,
     )
 
 
-def discover_registered_capabilities(body: CapabilityDiscoveryRequest) -> CapabilityDiscoveryResponse:
+def discover_registered_capabilities(
+    body: CapabilityDiscoveryRequest,
+) -> CapabilityDiscoveryResponse:
+    authority = (
+        _strict_capability_exposure_authority(body) if body.persona_selection_mode == "strict"
+        else None
+    )
+    persona_id = authority[0].active_persona_id if authority is not None else body.active_persona_id
+    surface = authority[3] if authority is not None else body.surface
+    registry_available = _CAPABILITY_REGISTRY_AVAILABLE and body.registry_enabled
     if not _CAPABILITY_REGISTRY_AVAILABLE or not body.registry_enabled:
         result = CapabilityDiscoveryResult(registry_available=False)
     else:
@@ -1300,9 +1366,11 @@ def discover_registered_capabilities(body: CapabilityDiscoveryRequest) -> Capabi
         for capability in _CAPABILITY_REGISTRY:
             ineligible_reason = _eligible_reason(
                 capability.record,
-                surface=body.surface,
-                active_persona_id=body.active_persona_id,
+                surface=surface,
+                active_persona_id=persona_id,
             )
+            if authority is not None and ineligible_reason is not None:
+                continue
             example = CapabilityDiscoveryExample(
                 capability_id=capability.record.capability_id,
                 display_name=capability.record.display_name,
@@ -1320,13 +1388,17 @@ def discover_registered_capabilities(body: CapabilityDiscoveryRequest) -> Capabi
             allowed_examples=allowed_examples,
             blocked_examples=blocked_examples,
         )
+    if authority is not None:
+        _revalidate_capability_exposure(body, authority, registry_available)
     return CapabilityDiscoveryResponse(
         request_id=body.request_id,
         owner_id=body.owner_id,
         conversation_id=body.conversation_id,
         surface=body.surface,
-        active_persona_id=body.active_persona_id,
+        active_persona_id=persona_id,
         result=result,
+        selection_contract="strict_turn" if authority is not None else "legacy_unbound",
+        persona_selection_ref=authority[0].selection_ref if authority is not None else None,
     )
 
 
