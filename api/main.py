@@ -850,7 +850,12 @@ async def relationship_diagnostics(
 
 @app.post("/v1/relationships/select", response_model=RelationshipSelectResponse)
 async def relationship_select(body: RelationshipSelectRequest) -> RelationshipSelectResponse:
-    return select_relationships(body)
+    try:
+        return select_relationships(body)
+    except (ValueError, TypeError) as exc:
+        if body.persona_selection_mode != "strict":
+            raise
+        raise HTTPException(status_code=409, detail="relationship_authority_rejected") from exc
 
 
 @app.post("/v1/social-context/items/upsert", response_model=SocialContextItemResponse)

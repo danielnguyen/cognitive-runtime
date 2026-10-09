@@ -2117,6 +2117,7 @@ class RuntimeStateRepository:
         expected_thread_revision: int | None = None,
         selection: PersonaSelectionDecision | None = None,
         containment_payload: dict[str, Any] | None = None,
+        include_containment: bool = False,
     ) -> tuple[RuntimeSession, int, list[RuntimeEvent]]:
         """Read/commit selection evidence only for the current admitted request."""
         with self._connect() as conn:
@@ -2146,10 +2147,16 @@ class RuntimeStateRepository:
             revision = thread["revision"]
             if expected_thread_revision is not None and expected_thread_revision != revision:
                 raise ValueError("runtime_thread_revision_conflict")
+            event_types = [
+                "turn_started", "interaction_governance_evaluated", "persona_selection_resolved",
+            ]
+            if include_containment:
+                event_types.append("persona_containment_evaluated")
+            placeholders = ",".join("?" for _ in event_types)
             rows = conn.execute(
                 "SELECT * FROM conversation_runtime_events WHERE runtime_turn_id = ? "
-                "AND event_type IN ('turn_started', 'interaction_governance_evaluated', "
-                "'persona_selection_resolved') ORDER BY id ASC;", (runtime_turn_id,),
+                f"AND event_type IN ({placeholders}) ORDER BY id ASC;",
+                (runtime_turn_id, *event_types),
             ).fetchall()
             try:
                 events = [self._event_from_row(row) for row in rows]

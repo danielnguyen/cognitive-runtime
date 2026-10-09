@@ -126,9 +126,11 @@ def resolve_persona_selection(body: RuntimeIdentityResolveRequest):
     return session, binding, persona, selection
 
 
-def consume_persona_selection(body):
+def consume_persona_selection_evidence(body, *, include_containment: bool = False):
     scope = _selection_scope(body)
-    session, revision, events = runtime_state_repository().persona_selection_events(**scope)
+    session, revision, events = runtime_state_repository().persona_selection_events(
+        **scope, include_containment=include_containment,
+    )
     candidates = [event for event in events if event.event_type == "persona_selection_resolved"]
     if len(candidates) != 1:
         raise ValueError("persona_selection_not_found")
@@ -160,13 +162,18 @@ def consume_persona_selection(body):
         raise ValueError("persona_selection_authority_changed")
     if body.active_persona_id is not None and body.active_persona_id != selection.active_persona_id:
         raise ValueError("persona_selection_persona_mismatch")
-    if body.requested_persona_id is not None:
+    if getattr(body, "requested_persona_id", None) is not None:
         raise ValueError("persona_selection_override_unverified")
-    if body.persona_scope_hint is not None and (
+    if getattr(body, "persona_scope_hint", None) is not None and (
         persona_from_scope_hint(body.persona_scope_hint) != selection.proposed_persona_id
         or selection.proposal_status != "advisory"
     ):
         raise ValueError("persona_selection_hint_mismatch")
+    return session, selection, events
+
+
+def consume_persona_selection(body):
+    session, selection, _ = consume_persona_selection_evidence(body)
     return session, selection
 
 
