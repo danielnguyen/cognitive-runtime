@@ -519,6 +519,8 @@ class CapabilityAuthorizationRepository:
             )
 
     def authorize(self, body: CapabilityAuthorizationRequest) -> CapabilityAuthorizationResponse:
+        if body.persona_selection_mode == "strict":
+            return self._authorize_strict(body)
         _session_and_turn(body)
         identity = resolve_runtime_identity(
             RuntimeIdentityResolveRequest(
@@ -705,6 +707,69 @@ class CapabilityAuthorizationRepository:
             result=result,
         )
 
+    def _authorize_strict(
+        self, body: CapabilityAuthorizationRequest,
+    ) -> CapabilityAuthorizationResponse:
+        authority, record = _strict_action_context(body)
+        persona_id = authority[0].active_persona_id
+        reasons = _registered_authorization_reasons(
+            body, record, active_persona_id=persona_id,
+            operation_class=_registered_operation_class(record),
+        )
+        if body.authorization_phase in {"selection", "dispatch"} and not body.argument_digest:
+            reasons.append("argument_digest_required")
+        relationship_ids: list[str] = []
+        world_ids: list[str] = []
+        selector = None
+        confirmation_needed = record.requires_confirmation
+        if record.operation_kind not in {"read_only", "draft_or_prepare"}:
+            reasons.append("strict_consequential_action_unavailable")
+        # Denied registry/action metadata cannot reach protected context or any challenge path.
+        if not reasons:
+            relationship_reasons, relationship_ids = self._relationship_reasons(body, persona_id)
+            reasons.extend(relationship_reasons)
+            world_reasons, world_ids, selector, world_confirmation = self._world_state_reasons(
+                body, persona_id,
+            )
+            reasons.extend(world_reasons)
+            confirmation_needed = confirmation_needed or world_confirmation
+        if confirmation_needed or body.confirmation_challenge_ref is not None:
+            reasons.append("strict_confirmation_unavailable")
+        if selector is not None:
+            reasons.append("world_state_revalidation_required")
+        result = CapabilityAuthorizationResult(
+            phase=body.authorization_phase, allowed=not reasons,
+            decision_code=(
+                "revalidation_required" if selector is not None
+                else "authorization_denied" if reasons else "allowed"
+            ),
+            reason_codes=sorted(set(reasons)) or ["allowed"],
+            confirmation_state="required" if confirmation_needed else "not_required",
+            revalidation_required=selector is not None, revalidation_selector=selector,
+            relationship_ids_used=relationship_ids, world_state_claim_ids_used=world_ids,
+        )
+        _revalidate_strict_action(body, authority, record)
+        record_runtime_event(
+            runtime_session_id=body.runtime_session_id, runtime_turn_id=body.runtime_turn_id,
+            event_type="capability_authorization_evaluated",
+            event_payload_json={
+                "request_id": body.request_id, "capability_id": body.capability_id,
+                "authorization_phase": body.authorization_phase,
+                "active_persona_id": persona_id, "selection_contract": "strict_turn",
+                "persona_selection_ref": authority[0].selection_ref,
+                "allowed": result.allowed, "decision_code": result.decision_code,
+                "reason_codes": result.reason_codes,
+                "confirmation_state": result.confirmation_state,
+            },
+        )
+        _revalidate_strict_action(body, authority, record)
+        return CapabilityAuthorizationResponse(
+            request_id=body.request_id, owner_id=body.owner_id,
+            conversation_id=body.conversation_id, runtime_session_id=body.runtime_session_id,
+            runtime_turn_id=body.runtime_turn_id, capability_id=body.capability_id, result=result,
+            selection_contract="strict_turn", persona_selection_ref=authority[0].selection_ref,
+        )
+
     def confirm(self, body: CapabilityConfirmationRequest) -> CapabilityConfirmationResponse:
         _session_and_turn(body)
         now = _now()
@@ -776,6 +841,7 @@ class CapabilityAuthorizationRepository:
                     surface=body.surface,
                     runtime_session_id=body.runtime_session_id,
                     active_persona_id=active_persona_id,
+                    **_strict_protected_context_fields(body),
                     requested_scopes=(
                         [requirement.relationship_scope]
                         if requirement.relationship_scope
@@ -819,6 +885,7 @@ class CapabilityAuthorizationRepository:
             runtime_session_id=body.runtime_session_id,
             active_persona_id=active_persona_id,
             requested_domains=requested_domains,
+            **_strict_protected_context_fields(body),
         )
         claim_map = {claim.world_state_claim_id: claim for claim in resolved.included_claims}
         reasons: list[str] = []
@@ -1296,6 +1363,33 @@ def _revalidate_capability_exposure(body, authority, registry_available):
         raise ValueError("capability_exposure_authority_changed")
 
 
+def _strict_protected_context_fields(body):
+    if body.persona_selection_mode != "strict":
+        return {}
+    return {key: getattr(body, key) for key in (
+        "persona_selection_mode", "persona_selection_ref", "runtime_turn_id",
+        "expected_thread_revision",
+    )}
+
+
+def _strict_action_context(body):
+    authority = _strict_capability_exposure_authority(body)
+    if not _CAPABILITY_REGISTRY_AVAILABLE or not getattr(body, "registry_enabled", True):
+        raise ValueError("capability_registry_unavailable")
+    capability = _registered_capability_by_id(body.capability_id)
+    if capability is None or _eligible_reason(
+        capability.record, surface=authority[3], active_persona_id=authority[0].active_persona_id,
+    ) is not None:
+        raise ValueError("capability_permission_denied")
+    # Copy the metadata so an intervening in-place registry mutation is detectable.
+    return authority, capability.record.model_copy(deep=True)
+
+
+def _revalidate_strict_action(body, authority, record):
+    if _strict_action_context(body) != (authority, record):
+        raise ValueError("capability_action_authority_changed")
+
+
 def match_registered_capability(body: CapabilityMatchRequest) -> CapabilityMatchResponse:
     authority = (
         _strict_capability_exposure_authority(body) if body.persona_selection_mode == "strict"
@@ -1403,6 +1497,35 @@ def discover_registered_capabilities(
 
 
 def decide_action_authority(
+    body: ActionAuthorityDecisionRequest,
+) -> ActionAuthorityDecisionResponse:
+    if body.persona_selection_mode != "strict":
+        return _decide_action_authority(body)
+    authority, record = _strict_action_context(body)
+    response = _decide_action_authority(body.model_copy(update={
+        "active_persona_id": authority[0].active_persona_id, "surface": authority[3],
+    }))
+    decision = response.result
+    if (
+        record.operation_kind not in {"read_only", "draft_or_prepare"}
+        or record.requires_confirmation
+        or decision.risk_level in {"medium_requires_confirmation", "high_requires_confirmation"}
+    ):
+        decision.allowed = False
+        decision.authority_level = "blocked"
+        decision.requires_confirmation = (
+            decision.requires_confirmation or record.requires_confirmation
+            or decision.risk_level in {"medium_requires_confirmation", "high_requires_confirmation"}
+        )
+        _append_reason(decision.reason_summary, "strict_consequential_action_unavailable")
+    response.surface = body.surface
+    response.selection_contract = "strict_turn"
+    response.persona_selection_ref = authority[0].selection_ref
+    _revalidate_strict_action(body, authority, record)
+    return response
+
+
+def _decide_action_authority(
     body: ActionAuthorityDecisionRequest,
 ) -> ActionAuthorityDecisionResponse:
     reasons: list[str] = []
@@ -1528,6 +1651,9 @@ def decide_action_authority(
 
 
 def decide_action_flow(body: ActionFlowDecisionRequest) -> ActionFlowDecisionResponse:
+    strict_context = (
+        _strict_action_context(body) if body.persona_selection_mode == "strict" else None
+    )
     authority_response = decide_action_authority(
         ActionAuthorityDecisionRequest(
             request_id=body.request_id,
@@ -1543,6 +1669,10 @@ def decide_action_flow(body: ActionFlowDecisionRequest) -> ActionFlowDecisionRes
             interaction_governance_tension=body.interaction_governance_tension,
             user_authorization_signal=body.user_authorization_signal,
             registry_enabled=body.registry_enabled,
+            **({key: getattr(body, key) for key in (
+                "persona_selection_mode", "persona_selection_ref", "runtime_session_id",
+                "runtime_turn_id", "expected_thread_revision",
+            )} if strict_context is not None else {}),
         )
     )
     authority = authority_response.result
@@ -1588,7 +1718,10 @@ def decide_action_flow(body: ActionFlowDecisionRequest) -> ActionFlowDecisionRes
     for reason in consequence_reasons:
         _append_reason(reasons, reason)
     if body.flow_intent == "confirmation_received":
-        _append_reason(reasons, "confirmation_received")
+        _append_reason(reasons, (
+            "strict_confirmation_unavailable" if strict_context is not None
+            else "confirmation_received"
+        ))
     elif body.flow_intent == "confirmation_cancelled":
         _append_reason(reasons, "confirmation_cancelled")
     elif body.flow_intent == "confirmation_expired":
@@ -1631,11 +1764,14 @@ def decide_action_flow(body: ActionFlowDecisionRequest) -> ActionFlowDecisionRes
         in {"answer_only", "prepare_only", "execute_low_risk"}
     )
     confirmed_execution_allowed = bool(
-        authority.authority_level == "execute_after_confirmation"
+        strict_context is None
+        and authority.authority_level == "execute_after_confirmation"
         and body.flow_intent == "confirmation_received"
     )
     dry_run_gate_satisfied = bool(
-        not dry_run_required or body.flow_intent == "confirmation_received"
+        not dry_run_required or (
+            strict_context is None and body.flow_intent == "confirmation_received"
+        )
     )
     if dry_run_required and not dry_run_gate_satisfied:
         _append_reason(reasons, "dry_run_pending")
@@ -1645,6 +1781,7 @@ def decide_action_flow(body: ActionFlowDecisionRequest) -> ActionFlowDecisionRes
         and not target_unresolved
         and not cancelled_or_expired
         and body.flow_intent != "preview_requested"
+        and not (strict_context is not None and body.flow_intent == "confirmation_received")
     )
     if execution_allowed:
         _append_reason(reasons, "execution_allowed_by_policy")
@@ -1682,13 +1819,20 @@ def decide_action_flow(body: ActionFlowDecisionRequest) -> ActionFlowDecisionRes
         ),
         reason_summary=reasons,
     )
+    if strict_context is not None:
+        # The endpoint is advisory; no unverified confirmation text can become a grant.
+        decision.confirmation_required = authority.requires_confirmation
+        decision.confirmation_text = None
+        _revalidate_strict_action(body, *strict_context)
     return ActionFlowDecisionResponse(
         request_id=body.request_id,
         owner_id=body.owner_id,
         conversation_id=body.conversation_id,
         surface=body.surface,
-        active_persona_id=body.active_persona_id,
+        active_persona_id=authority_response.active_persona_id,
         result=decision,
+        selection_contract=authority_response.selection_contract,
+        persona_selection_ref=authority_response.persona_selection_ref,
     )
 
 

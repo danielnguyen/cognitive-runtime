@@ -958,6 +958,10 @@ async def capability_authorize(
 ) -> CapabilityAuthorizationResponse:
     try:
         return authorize_capability(body)
+    except (ValueError, TypeError) as exc:
+        if body.persona_selection_mode != "strict":
+            raise
+        raise HTTPException(status_code=409, detail="capability_action_authority_rejected") from exc
     except RuntimeError as exc:
         http_error = _bounded_http_error(exc, _CAPABILITY_ERROR_STATUS)
         if http_error is None:
@@ -997,14 +1001,24 @@ async def capability_discover(
 async def capability_authority(
     body: ActionAuthorityDecisionRequest,
 ) -> ActionAuthorityDecisionResponse:
-    return decide_action_authority(body)
+    try:
+        return decide_action_authority(body)
+    except (ValueError, TypeError) as exc:
+        if body.persona_selection_mode != "strict":
+            raise
+        raise HTTPException(status_code=409, detail="capability_action_authority_rejected") from exc
 
 
 @app.post("/v1/capabilities/flow", response_model=ActionFlowDecisionResponse)
 async def capability_flow(
     body: ActionFlowDecisionRequest,
 ) -> ActionFlowDecisionResponse:
-    return decide_action_flow(body)
+    try:
+        return decide_action_flow(body)
+    except (ValueError, TypeError) as exc:
+        if body.persona_selection_mode != "strict":
+            raise
+        raise HTTPException(status_code=409, detail="capability_action_authority_rejected") from exc
 
 
 @app.post("/v1/capabilities/action-summary", response_model=ActionSummaryResponse)

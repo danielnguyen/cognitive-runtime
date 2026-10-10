@@ -4346,3 +4346,739 @@ def test_read_and_draft_do_not_require_risky_confirmation():
     assert read["confirmation_state"] == "not_required"
     assert draft["allowed"] is True
     assert draft["confirmation_state"] == "not_required"
+
+
+def _strict_action_request(payload, operation, capability_id="service_health_check", **overrides):
+    request = {**payload, "capability_id": capability_id}
+    if operation == "authorize":
+        record = next(item.record for item in capability_authorization_service._CAPABILITY_REGISTRY
+                      if item.record.capability_id == capability_id)
+        request.update(
+            authorization_phase="selection", capability_domain=record.domain,
+            operation_class=capability_authorization_service._registered_operation_class(record),
+            supported_surfaces=record.allowed_surfaces, argument_digest="args:bounded",
+        )
+    request.update(overrides)
+    return request
+
+
+def _strict_action_post(client, payload, operation, **overrides):
+    return client.post(f"/v1/capabilities/{operation}", json=_strict_action_request(
+        payload, operation, **overrides,
+    ))
+
+
+def _assert_strict_action_failure(response):
+    assert response.status_code == 409
+    assert response.json() == {"detail": "capability_action_authority_rejected"}
+    assert "private_sentinel" not in response.text
+    assert "service_health_check" not in response.text
+    assert "result" not in response.json()
+
+
+def _challenge_snapshot():
+    with capability_authorization_repository()._connect() as conn:
+        return [
+            dict(row) for row in conn.execute("SELECT * FROM capability_confirmation_challenges")
+        ]
+
+
+@pytest.mark.parametrize("surface,capability_id,level", [
+    ("dev", "service_health_check", "answer_only"),
+    ("dev", "draft_notification", "prepare_only"),
+    ("vscode", "runtime.world_state.read", "answer_only"),
+])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_nonconsequential_decisions_use_one_selected_persona(
+    surface, capability_id, level, operation,
+):
+    client = TestClient(app)
+    payload, decision, _ = _strict_exposure_turn(client, surface=surface)
+    before = _challenge_snapshot()
+    response = _strict_action_post(client, payload, operation, capability_id=capability_id)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selection_contract"] == "strict_turn"
+    assert body["persona_selection_ref"] == decision["selection_ref"]
+    result = body["result"]
+    if operation == "authorize":
+        assert result["allowed"] is True
+        assert result["confirmation_state"] == "not_required"
+        assert result["challenge_ref"] is None
+    else:
+        assert body["active_persona_id"] == decision["active_persona_id"]
+        assert result["action_taken"] is False
+        if operation == "authority":
+            assert result["allowed"] is True
+            assert result["authority_level"] == level
+            assert result["requires_confirmation"] is False
+        else:
+            assert result["execution_allowed"] is True  # Read/preparation policy only.
+            assert result["confirmation_required"] is False
+    assert _challenge_snapshot() == before
+
+
+@pytest.mark.parametrize("authorization_phase", ["exposure", "selection", "dispatch"])
+def test_strict_nonconsequential_authorization_checks_each_phase(authorization_phase):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_action_post(
+        client, payload, "authorize", authorization_phase=authorization_phase,
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["allowed"] is True
+    assert response.json()["result"]["phase"] == authorization_phase
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("text,proposal", [
+    ("I broke the server and prod is failing", "technical_architect"),
+    ("That was wrong in the report.", "personal_companion"),
+])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_advisory_personas_never_upgrade_strict_action_decisions(text, proposal, operation):
+    client = TestClient(app)
+    payload, decision, _ = _strict_exposure_turn(client, text=text, surface="web")
+    assert decision["proposed_persona_id"] == proposal
+    assert decision["contextual_activation"] is False
+    assert decision["active_persona_id"] == "general_assistant"
+    _assert_strict_action_failure(_strict_action_post(client, payload, operation))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("request_id", "other_request"), ("owner_id", "other_owner"),
+    ("conversation_id", "other_conversation"), ("surface", "vscode"),
+    ("runtime_session_id", "other_session"), ("runtime_turn_id", "other_turn"),
+    ("expected_thread_revision", 0), ("active_persona_id", "home_operator"),
+    ("persona_selection_ref", "psel_00000000000000000000000000000000"),
+])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_action_binding_failure_precedes_registry_and_protected_reads(
+    field, value, operation, monkeypatch,
+):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    request = _strict_action_request(payload, operation, **{field: value})
+    before = _challenge_snapshot()
+    reads = _observe_registry(monkeypatch)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid authority cannot read protected context")
+
+    monkeypatch.setattr(capability_authorization_service, "select_relationships", forbidden)
+    monkeypatch.setattr(capability_authorization_service, "resolve_world_state", forbidden)
+    _assert_strict_action_failure(client.post(f"/v1/capabilities/{operation}", json=request))
+    assert reads == []
+    assert _challenge_snapshot() == before
+
+
+@pytest.mark.parametrize("mutation", [
+    {"persona_selection_ref": "malformed"}, {"persona_selection_ref": None},
+    {"runtime_session_id": None}, {"runtime_turn_id": None},
+    {"selection_source": "explicit_user"}, {"persona_scope_hint": "technical_operator"},
+    {"requested_persona_id": "technical_architect"}, {"expected_thread_revision": True},
+    {"persona_selection_mode": "unsupported"}, {"persona_selection_mode": "legacy"},
+])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_action_rejects_incomplete_spoofed_or_downgraded_contract(mutation, operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_action_post(client, payload, operation, **mutation)
+    assert response.status_code == 422
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("selection,containment", [(False, False), (True, False)])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_action_does_not_manufacture_missing_predecessors(selection, containment, operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client, selection=selection, containment=containment)
+    before = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    _assert_strict_action_failure(_strict_action_post(client, payload, operation))
+    assert runtime_state_repository().list_events_for_tests(payload["runtime_session_id"]) == before
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("status", ["completed", "abandoned"])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_terminal_strict_turn_cannot_authorize_action(status, operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    runtime_state_repository().complete_turn(
+        **{key: payload[key] for key in ("request_id", "runtime_session_id", "runtime_turn_id")},
+        turn_status=status,
+    )
+    _assert_strict_action_failure(_strict_action_post(client, payload, operation))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("corruption", [
+    "selection", "governance", "containment", "tool_domains", "unmapped_tools", "conflict",
+])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_invalid_strict_policy_blocks_action_before_lookup(corruption, operation, monkeypatch):
+    client = TestClient(app)
+    payload, _, containment = _strict_exposure_turn(client)
+    if corruption == "conflict":
+        assert client.post("/v1/runtime/persona-containment/evaluate", json={
+            **containment, "current_user_text": "What is 2+2?",
+        }).status_code == 200
+    else:
+        kind = {
+            "selection": "persona_selection_resolved",
+            "governance": "interaction_governance_evaluated",
+        }.get(corruption, "persona_containment_evaluated")
+        with runtime_state_repository()._connect() as conn:
+            row = conn.execute(
+                "SELECT id, event_payload_json FROM conversation_runtime_events "
+                "WHERE event_type = ?", (kind,),
+            ).fetchone()
+            changed = json.loads(row["event_payload_json"])
+            if corruption == "selection":
+                value = "private_sentinel invalid_json"
+            else:
+                if corruption == "governance":
+                    changed["interaction_kind"] = "question"
+                elif corruption == "containment":
+                    changed["strict_containment"]["status"] = "failed"
+                else:
+                    domains = ["general"] if corruption == "tool_domains" else ["operations"]
+                    changed["strict_containment"]["result"]["allowed_tool_domains"] = domains
+                    changed["allowed_tool_domains"] = domains
+                value = json.dumps(changed)
+            conn.execute(
+                "UPDATE conversation_runtime_events SET event_payload_json = ? WHERE id = ?",
+                (value, row["id"]),
+            )
+    request = _strict_action_request(payload, operation)
+    reads = _observe_registry(monkeypatch)
+    _assert_strict_action_failure(client.post(f"/v1/capabilities/{operation}", json=request))
+    assert reads == []
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("surface", ["unknown", "unregistered", "web", "vscode"])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_action_cannot_borrow_registered_surface_permissions(surface, operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client, surface=surface)
+    _assert_strict_action_failure(_strict_action_post(client, payload, operation))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_action_registry_unavailable_is_failure(operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    request = _strict_action_request(payload, operation)
+    configure_capability_registry_for_tests(available=False)
+    _assert_strict_action_failure(client.post(f"/v1/capabilities/{operation}", json=request))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_consequential_action_never_issues_or_consumes_challenge(operation, monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    before = _challenge_snapshot()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("strict consequential paths cannot mutate confirmation")
+
+    repo = capability_authorization_repository()
+    for method in ("_issue_challenge", "_resume_selection_challenge",
+                   "_consume_dispatch_challenge_atomic", "confirm"):
+        monkeypatch.setattr(repo, method, forbidden)
+    response = _strict_action_post(
+        client, payload, operation, capability_id="jellyfin_restart",
+        **({"authorization_phase": "dispatch", "confirmation_challenge_ref": "caller-confirmed"}
+           if operation == "authorize" else {"user_authorization_signal": "explicit"}),
+    )
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert "strict_consequential_action_unavailable" in (
+        result.get("reason_codes", result.get("reason_summary"))
+    )
+    if operation == "authorize":
+        assert result["allowed"] is False
+        assert result["challenge_ref"] is None
+        assert result["challenge_expires_at"] is None
+    elif operation == "authority":
+        assert result["allowed"] is False
+        assert result["authority_level"] == "blocked"
+        assert result["action_taken"] is False
+    else:
+        assert result["execution_allowed"] is False
+        assert result["confirmation_required"] is True
+        assert result["confirmation_text"] is None
+        assert result["action_taken"] is False
+    assert _challenge_snapshot() == before
+
+
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_even_registry_eligible_low_reversible_strict_state_change_is_blocked(
+    operation, monkeypatch,
+):
+    # A fixture extends eligibility only, preserving the actual state_change/risk metadata.
+    # This proves strict blocking does not depend on today's incidental persona exclusion.
+    registry = tuple(
+        capability_authorization_service.RegisteredCapability(
+            record=item.record.model_copy(update={
+                "allowed_personas": ["technical_architect"], "allowed_surfaces": ["dev"],
+            }) if item.record.capability_id == "office_lights_on" else item.record,
+            match_phrases=item.match_phrases,
+        ) for item in capability_authorization_service._CAPABILITY_REGISTRY
+    )
+    monkeypatch.setattr(capability_authorization_service, "_CAPABILITY_REGISTRY", registry)
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_action_post(client, payload, operation, capability_id="office_lights_on")
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result.get("allowed", result.get("execution_allowed")) is False
+    if operation == "authority":
+        assert result["risk_level"] == "low_reversible"
+        assert result["authority_level"] == "blocked"
+    assert "strict_consequential_action_unavailable" in (
+        result.get("reason_codes", result.get("reason_summary"))
+    )
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("intent", ["confirmation_received", "preview_requested",
+                                    "confirmation_cancelled", "confirmation_expired"])
+def test_strict_flow_labels_do_not_grant_permission(intent):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_action_post(client, payload, "flow", flow_intent=intent,
+                                   affects_multiple_systems=True)
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["execution_allowed"] is False
+    assert result["action_taken"] is False
+    if intent == "confirmation_received":
+        assert "strict_confirmation_unavailable" in result["reason_summary"]
+        assert "confirmation_received" not in result["reason_summary"]
+        assert "dry_run_pending" in result["reason_summary"]
+    assert _challenge_snapshot() == []
+
+
+def test_strict_authorization_forwards_exact_binding_to_protected_consumers(monkeypatch):
+    client = TestClient(app)
+    payload, decision, _ = _strict_exposure_turn(client)
+    relationship_id = _relationship(client)
+    claim = client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(),
+    }).json()["claim"]
+    calls = []
+    relationships = capability_authorization_service.select_relationships
+    world = capability_authorization_service.resolve_world_state
+
+    def observe_relationships(body):
+        assert body.persona_selection_mode == "strict"
+        for key in ("request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id", "persona_selection_ref"):
+            assert getattr(body, key) == payload[key]
+        assert body.active_persona_id == decision["active_persona_id"]
+        calls.append("relationship")
+        result = relationships(body)
+        assert result.selection_contract == "strict_turn"
+        return result
+
+    def observe_world(**kwargs):
+        assert kwargs["persona_selection_mode"] == "strict"
+        for key in ("request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id", "persona_selection_ref"):
+            assert kwargs[key] == payload[key]
+        assert kwargs["active_persona_id"] == decision["active_persona_id"]
+        calls.append("world")
+        result = world(**kwargs)
+        assert result.selection_contract == "strict_turn"
+        return result
+
+    monkeypatch.setattr(
+        capability_authorization_service, "select_relationships", observe_relationships,
+    )
+    monkeypatch.setattr(capability_authorization_service, "resolve_world_state", observe_world)
+    response = _strict_action_post(
+        client, payload, "authorize", relationship_requirements=_relationship_requirement(),
+        selected_relationship_ids=[relationship_id],
+        world_state_requirements=[{"domain": "active_repository", "attribute": "branch_status"}],
+        selected_world_state_claim_ids=[claim["world_state_claim_id"]],
+    )
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["allowed"] is True
+    assert result["relationship_ids_used"] == [relationship_id]
+    assert result["world_state_claim_ids_used"] == [claim["world_state_claim_id"]]
+    assert calls == ["relationship", "world"]
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("restriction", ["relationship", "world", "confirmation"])
+def test_strict_authorization_keeps_protected_consumer_denials_and_confirmation(restriction):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    kwargs = {}
+    if restriction == "relationship":
+        relationship_id = _relationship(client, blocked_persona_scopes_json=["technical_architect"])
+        kwargs.update(relationship_requirements=_relationship_requirement(),
+                      selected_relationship_ids=[relationship_id])
+    else:
+        claim = client.post("/v1/world-state/claims/upsert", json={
+            **_base(), "claim": _claim(
+                sensitivity="restricted" if restriction == "world" else "medium",
+                confirmation_policy="confirm_before_action" if restriction == "confirmation"
+                else "none",
+            ),
+        }).json()["claim"]
+        kwargs.update(world_state_requirements=[{"domain": "active_repository"}],
+                      selected_world_state_claim_ids=[claim["world_state_claim_id"]])
+    response = _strict_action_post(
+        client, payload, "authorize", capability_id="draft_notification", **kwargs,
+    )
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["allowed"] is False
+    assert result["challenge_ref"] is None
+    if restriction == "confirmation":
+        assert result["confirmation_state"] == "required"
+        assert "strict_confirmation_unavailable" in result["reason_codes"]
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("domain", ["allowed_relationship_domains", "allowed_world_state_domains"])
+def test_strict_authorization_does_not_map_narrowed_protected_domains(domain, monkeypatch):
+    import services.world_state as world_service
+    from services.relationships import relationship_repository
+
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    with runtime_state_repository()._connect() as conn:
+        row = conn.execute(
+            "SELECT id, event_payload_json FROM conversation_runtime_events "
+            "WHERE event_type = 'persona_containment_evaluated'",
+        ).fetchone()
+        changed = json.loads(row["event_payload_json"])
+        changed["strict_containment"]["result"][domain] = ["general"]
+        conn.execute("UPDATE conversation_runtime_events SET event_payload_json = ? WHERE id = ?",
+                     (json.dumps(changed), row["id"]))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unrepresentable scope must fail before protected read")
+
+    if domain == "allowed_relationship_domains":
+        monkeypatch.setattr(relationship_repository(), "diagnostics", forbidden)
+    else:
+        monkeypatch.setattr(world_service, "get_world_state_diagnostics", forbidden)
+    _assert_strict_action_failure(_strict_action_post(
+        client, payload, "authorize", relationship_requirements=(
+            _relationship_requirement() if domain == "allowed_relationship_domains" else []
+        ),
+    ))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("mutation", ["domain", "operation", "surface_list", "digest", "challenge"])
+def test_strict_authorization_cannot_launder_caller_metadata(mutation, monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    overrides = {
+        "domain": {"capability_domain": "personal"},
+        "operation": {"operation_class": "external_write"},
+        "surface_list": {"supported_surfaces": ["dev", "unknown"]},
+        "digest": {"argument_digest": None},
+        "challenge": {"confirmation_challenge_ref": "caller-accepted"},
+    }[mutation]
+    if mutation != "challenge":
+        def forbidden(*args, **kwargs):
+            raise AssertionError("metadata denial cannot read protected context")
+        monkeypatch.setattr(capability_authorization_service, "resolve_world_state", forbidden)
+    response = _strict_action_post(client, payload, "authorize", **overrides)
+    assert response.status_code == 200
+    assert response.json()["result"]["allowed"] is False
+    assert response.json()["result"]["challenge_ref"] is None
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("operation", ["authority", "flow"])
+def test_strict_consequence_flags_cannot_be_downgraded_by_explicit_label(operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_action_post(client, payload, operation,
+                                   consequence_flags={"external_consequence": True},
+                                   user_authorization_signal="explicit")
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result.get("allowed", result.get("execution_allowed")) is False
+    assert result.get("requires_confirmation", result.get("confirmation_required")) is True
+    assert result["action_taken"] is False
+
+
+@pytest.mark.parametrize("change", ["binding", "completion", "revision", "registry", "policy"])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_action_revalidates_before_publication(change, operation, monkeypatch):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    request = _strict_action_request(payload, operation)
+    original = capability_authorization_service._revalidate_strict_action
+    changed = []
+
+    def mutate_then_validate(body, authority, record):
+        if not changed:
+            changed.append(change)
+            if change == "binding":
+                with companion_contracts_repository()._connect() as conn:
+                    conn.execute("UPDATE surface_bindings SET surface_type = 'web_app' "
+                                 "WHERE surface_id = 'dev'")
+            elif change == "completion":
+                runtime_state_repository().complete_turn(
+                    **{key: payload[key] for key in (
+                        "request_id", "runtime_session_id", "runtime_turn_id",
+                    )}, turn_status="completed",
+                )
+            elif change == "revision":
+                with runtime_state_repository()._connect() as conn:
+                    conn.execute("UPDATE conversation_runtime_threads SET revision = revision + 1")
+            elif change == "registry":
+                configure_capability_registry_for_tests(available=False)
+            else:
+                registered = capability_authorization_service._registered_capability_by_id(
+                    body.capability_id,
+                )
+                monkeypatch.setattr(registered.record, "requires_confirmation", True)
+        return original(body, authority, record)
+
+    monkeypatch.setattr(capability_authorization_service, "_revalidate_strict_action",
+                        mutate_then_validate)
+    _assert_strict_action_failure(client.post(f"/v1/capabilities/{operation}", json=request))
+    assert changed == [change]
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("dependency", ["state", "relationship", "world"])
+def test_unavailable_strict_dependency_never_becomes_authorization_success(dependency, monkeypatch):
+    import anyio
+    import httpx
+
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    request = _strict_action_request(payload, "authorize",
+                                     relationship_requirements=_relationship_requirement())
+
+    def fail(*args, **kwargs):
+        raise sqlite3.OperationalError("private_sentinel storage failure")
+
+    if dependency == "state":
+        monkeypatch.setattr(runtime_state_repository(), "persona_selection_events", fail)
+    elif dependency == "relationship":
+        monkeypatch.setattr(capability_authorization_service, "select_relationships", fail)
+    else:
+        monkeypatch.setattr(capability_authorization_service, "resolve_world_state", fail)
+
+    async def submit():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test",
+        ) as http:
+            return await http.post("/v1/capabilities/authorize", json=request)
+
+    response = anyio.run(submit)
+    assert response.status_code == 500
+    assert "private_sentinel" not in response.text
+    assert "result" not in response.text
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_legacy_action_contract_remains_unbound_and_requires_persona(operation):
+    client = TestClient(app)
+    started = _start_turn(client)
+    if operation == "authorize":
+        payload = _authorized_request(started)
+    else:
+        payload = {**_base(surface="dev"), "capability_id": "service_health_check",
+                   "active_persona_id": "technical_architect"}
+    response = client.post(f"/v1/capabilities/{operation}", json=payload)
+    assert response.status_code == 200
+    assert response.json()["selection_contract"] == "legacy_unbound"
+    assert response.json()["persona_selection_ref"] is None
+    payload.pop("active_persona_id")
+    assert client.post(f"/v1/capabilities/{operation}", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_unregistered_surface_cannot_use_registry_surface_name_through_fallback(operation):
+    from services.companion_contracts import companion_contracts_repository
+
+    with companion_contracts_repository()._connect() as conn:
+        conn.execute("UPDATE surface_bindings SET default_persona_id = 'technical_architect' "
+                     "WHERE surface_id = 'unknown'")
+    client = TestClient(app)
+    payload, decision, _ = _strict_exposure_turn(client, surface="desktop")
+    assert decision["active_persona_id"] == "technical_architect"
+    assert decision["selection_source"] == "conservative_fallback"
+    _assert_strict_action_failure(_strict_action_post(client, payload, operation))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("operation", ["authority", "flow"])
+def test_request_disabled_registry_cannot_become_strict_action_success(operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    _assert_strict_action_failure(_strict_action_post(
+        client, payload, operation, registry_enabled=False,
+    ))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_actions_reject_caller_only_consent_fields(operation):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_action_post(client, payload, operation, confirmed=True,
+                                   confirmation_source="trusted_client")
+    assert response.status_code == 422
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("change", ["completion", "containment"])
+def test_strict_authorization_revalidates_after_actual_protected_read(change, monkeypatch):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    original = capability_authorization_service.resolve_world_state
+    reads = []
+
+    def read_then_change(**kwargs):
+        result = original(**kwargs)
+        reads.append(result.selection_contract)
+        if change == "completion":
+            runtime_state_repository().complete_turn(
+                **{key: payload[key] for key in (
+                    "request_id", "runtime_session_id", "runtime_turn_id",
+                )}, turn_status="completed",
+            )
+        else:
+            with runtime_state_repository()._connect() as conn:
+                conn.execute("UPDATE conversation_runtime_events SET event_payload_json = '{}' "
+                             "WHERE event_type = 'persona_containment_evaluated'")
+        return result
+
+    monkeypatch.setattr(capability_authorization_service, "resolve_world_state", read_then_change)
+    _assert_strict_action_failure(_strict_action_post(client, payload, "authorize"))
+    assert reads == ["strict_turn"]
+    assert _challenge_snapshot() == []
+    assert not any(event.event_type == "capability_authorization_evaluated" for event in (
+        runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    ))
+
+
+def test_strict_authorization_event_is_structural_and_creates_no_new_persona_authority():
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_action_post(client, payload, "authorize")
+    assert response.status_code == 200
+    events = runtime_state_repository().list_events_for_tests(payload["runtime_session_id"])
+    assert sum(event.event_type == "persona_selection_resolved" for event in events) == 1
+    assert sum(event.event_type == "persona_containment_evaluated" for event in events) == 1
+    decision = next(event for event in events if (
+        event.event_type == "capability_authorization_evaluated"
+    ))
+    assert decision.event_payload_json["selection_contract"] == "strict_turn"
+    assert decision.event_payload_json["persona_selection_ref"] == payload["persona_selection_ref"]
+    assert set(decision.event_payload_json) == {
+        "request_id", "capability_id", "authorization_phase", "active_persona_id",
+        "selection_contract", "persona_selection_ref", "allowed", "decision_code", "reason_codes",
+        "confirmation_state",
+    }
+    assert "I broke the server" not in json.dumps(decision.event_payload_json)
+    assert "argument_digest" not in decision.event_payload_json
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("mutation", ["missing", "malformed"])
+@pytest.mark.parametrize("operation", ["authorize", "authority", "flow"])
+def test_strict_action_surface_authority_must_remain_valid(mutation, operation):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    with companion_contracts_repository()._connect() as conn:
+        if mutation == "missing":
+            conn.execute("DELETE FROM surface_bindings WHERE surface_id IN ('dev', 'unknown')")
+        else:
+            conn.execute("UPDATE surface_bindings SET surface_type = '' WHERE surface_id = 'dev'")
+    _assert_strict_action_failure(_strict_action_post(client, payload, operation))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("operation", ["authority", "flow"])
+def test_strict_action_storage_failure_never_returns_success(operation, monkeypatch):
+    import anyio
+    import httpx
+
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    request = _strict_action_request(payload, operation)
+
+    def unavailable(**kwargs):
+        raise sqlite3.OperationalError("private_sentinel")
+
+    monkeypatch.setattr(runtime_state_repository(), "persona_selection_events", unavailable)
+
+    async def submit():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test",
+        ) as http:
+            return await http.post(f"/v1/capabilities/{operation}", json=request)
+
+    response = anyio.run(submit)
+    assert response.status_code == 500
+    assert "private_sentinel" not in response.text
+    assert "result" not in response.text
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("authorization_phase", ["exposure", "selection", "dispatch"])
+def test_each_strict_consequential_phase_is_denied_without_challenge(authorization_phase):
+    client = TestClient(app)
+    payload, _, _ = _strict_exposure_turn(client)
+    response = _strict_action_post(client, payload, "authorize", capability_id="jellyfin_restart",
+                                   authorization_phase=authorization_phase)
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["allowed"] is False
+    assert result["confirmation_state"] == "required"
+    assert result["challenge_ref"] is None
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("authorization_phase", ["selection", "dispatch"])
+def test_strict_authorization_cannot_launder_or_consume_real_legacy_challenge(authorization_phase):
+    client = TestClient(app)
+    payload, decision, _ = _strict_exposure_turn(client)
+    strict_request = _strict_action_request(payload, "authorize", capability_id="jellyfin_restart")
+    legacy_request = {
+        key: value for key, value in strict_request.items()
+        if key not in {
+            "persona_selection_mode", "persona_selection_ref", "expected_thread_revision",
+        }
+    }
+    legacy_request["active_persona_id"] = decision["active_persona_id"]
+    issued = client.post("/v1/capabilities/authorize", json=legacy_request)
+    assert issued.status_code == 200
+    assert issued.json()["selection_contract"] == "legacy_unbound"
+    challenge_ref = issued.json()["result"]["challenge_ref"]
+    assert challenge_ref is not None
+    before = _challenge_snapshot()
+    assert len(before) == 1
+    response = _strict_action_post(
+        client, payload, "authorize", capability_id="jellyfin_restart",
+        authorization_phase=authorization_phase, confirmation_challenge_ref=challenge_ref,
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["allowed"] is False
+    assert response.json()["result"]["challenge_ref"] is None
+    assert _challenge_snapshot() == before
