@@ -756,12 +756,11 @@ class CapabilityAuthorizationRepository:
             event_type="capability_authorization_evaluated",
             event_payload_json={
                 "request_id": body.request_id, "capability_id": body.capability_id,
-                "authorization_" + "pha" + "se": stage,
+                "operation_class": _registered_operation_class(record),
+                # Preserve the existing result fields; selectors remain response-only.
+                **result.model_dump(exclude={"revalidation_selector"}),
                 "active_persona_id": persona_id, "selection_contract": "strict_turn",
                 "persona_selection_ref": authority[0].selection_ref,
-                "allowed": result.allowed, "decision_code": result.decision_code,
-                "reason_codes": result.reason_codes,
-                "confirmation_state": result.confirmation_state,
             },
         )
         _revalidate_strict_action(body, authority, record)

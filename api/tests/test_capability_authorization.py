@@ -4993,10 +4993,13 @@ def test_strict_authorization_event_is_structural_and_creates_no_new_persona_aut
     ))
     assert decision.event_payload_json["selection_contract"] == "strict_turn"
     assert decision.event_payload_json["persona_selection_ref"] == payload["persona_selection_ref"]
-    assert set(decision.event_payload_json) == {
-        "request_id", "capability_id", "authorization_" + "pha" + "se", "active_persona_id",
-        "selection_contract", "persona_selection_ref", "allowed", "decision_code", "reason_codes",
-        "confirmation_state",
+    assert decision.event_payload_json == {
+        "request_id": payload["request_id"], "capability_id": "service_health_check",
+        "operation_class": "read",
+        **{key: value for key, value in response.json()["result"].items()
+           if key != "revalidation_selector"},
+        "active_persona_id": "technical_architect", "selection_contract": "strict_turn",
+        "persona_selection_ref": payload["persona_selection_ref"],
     }
     assert "I broke the server" not in json.dumps(decision.event_payload_json)
     assert "argument_digest" not in decision.event_payload_json
@@ -5087,3 +5090,169 @@ def test_strict_authorization_cannot_launder_or_consume_real_legacy_challenge(au
     assert response.json()["result"]["allowed"] is False
     assert response.json()["result"]["challenge_ref"] is None
     assert _challenge_snapshot() == before
+
+
+def _latest_authorization_event(runtime_session_id):
+    return [event.event_payload_json for event in (
+        runtime_state_repository().list_events_for_tests(runtime_session_id)
+    ) if event.event_type == "capability_authorization_evaluated"][-1]
+
+
+def _legacy_authorization_event(client, strict_request, persona_id):
+    request = {key: value for key, value in strict_request.items() if key not in {
+        "persona_selection_mode", "persona_selection_ref", "expected_thread_revision",
+    }}
+    request["active_persona_id"] = persona_id
+    response = client.post("/v1/capabilities/authorize", json=request)
+    assert response.status_code == 200
+    return response.json()["result"], _latest_authorization_event(request["runtime_session_id"])
+
+
+@pytest.mark.parametrize("authorization_stage", ["exposure", "selection", "dispatch"])
+@pytest.mark.parametrize("denied", [False, True])
+def test_strict_event_preserves_actual_legacy_schema_and_operation_meaning(
+    authorization_stage, denied,
+):
+    client = TestClient(app)
+    payload, selection, _ = _strict_exposure_turn(client)
+    relationship_id = _relationship(client)
+    claim_response = client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(),
+    })
+    assert claim_response.status_code == 200
+    claim_id = claim_response.json()["claim"]["world_state_claim_id"]
+    request = _strict_action_request(
+        payload, "authorize", authorization_stage=authorization_stage,
+        operation_class="external_write" if denied else "read",
+        relationship_requirements=_relationship_requirement(),
+        selected_relationship_ids=[relationship_id],
+        world_state_requirements=[{"domain": "active_repository"}],
+        selected_world_state_claim_ids=[claim_id],
+    )
+    legacy_result, legacy_event = _legacy_authorization_event(
+        client, request, selection["active_persona_id"],
+    )
+    response = client.post("/v1/capabilities/authorize", json=request)
+    assert response.status_code == 200
+    result = response.json()["result"]
+    strict_event = _latest_authorization_event(payload["runtime_session_id"])
+    additive = {"active_persona_id", "selection_contract", "persona_selection_ref", "allowed"}
+    assert set(strict_event) == set(legacy_event) | additive
+    assert {
+        key: value for key, value in strict_event.items() if key not in additive
+    } == legacy_event
+    assert result == legacy_result
+    assert strict_event["allowed"] is (not denied)
+    assert strict_event["operation_class"] == "read"  # Registry operation, not a caller claim.
+    assert strict_event["relationship_ids_used"] == ([] if denied else [relationship_id])
+    assert strict_event["world_state_claim_ids_used"] == ([] if denied else [claim_id])
+    assert strict_event["confirmation_state"] == "not_required"
+    assert strict_event["challenge_ref"] is None
+    assert strict_event["challenge_expires_at"] is None
+    assert strict_event["revalidation_required"] is False
+    assert strict_event["selection_contract"] == "strict_turn"
+    assert strict_event["persona_selection_ref"] == selection["selection_ref"]
+    assert strict_event["active_persona_id"] == selection["active_persona_id"]
+    assert "argument_digest" not in strict_event
+    assert "source_refs_json" not in strict_event
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("authorization_stage", ["exposure", "selection", "dispatch"])
+@pytest.mark.parametrize("capability_id", ["jellyfin_restart", "draft_notification"])
+def test_denied_strict_event_retains_confirmation_and_eligible_context(
+    authorization_stage, capability_id,
+):
+    client = TestClient(app)
+    payload, selection, _ = _strict_exposure_turn(client)
+    relationship_id = _relationship(client)
+    claim_response = client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(confirmation_policy="confirm_before_action"),
+    })
+    assert claim_response.status_code == 200
+    claim_id = claim_response.json()["claim"]["world_state_claim_id"]
+    # Obtain the unchanged legacy event schema without creating a consequential challenge.
+    _, legacy_event = _legacy_authorization_event(
+        client, _strict_action_request(payload, "authorize"), selection["active_persona_id"],
+    )
+    response = _strict_action_post(
+        client, payload, "authorize", capability_id=capability_id,
+        authorization_stage=authorization_stage,
+        relationship_requirements=_relationship_requirement(),
+        selected_relationship_ids=[relationship_id],
+        world_state_requirements=[{"domain": "active_repository"}],
+        selected_world_state_claim_ids=[claim_id],
+        confirmation_challenge_ref="unverified-caller-challenge",
+    )
+    assert response.status_code == 200
+    result = response.json()["result"]
+    event = _latest_authorization_event(payload["runtime_session_id"])
+    assert set(event) == set(legacy_event) | {
+        "active_persona_id", "selection_contract", "persona_selection_ref", "allowed",
+    }
+    assert event == {
+        "request_id": payload["request_id"], "capability_id": capability_id,
+        "operation_class": "high_impact" if capability_id == "jellyfin_restart" else "draft",
+        **{key: value for key, value in result.items() if key != "revalidation_selector"},
+        "active_persona_id": selection["active_persona_id"], "selection_contract": "strict_turn",
+        "persona_selection_ref": selection["selection_ref"],
+    }
+    assert event["allowed"] is False
+    assert event["decision_code"] == "authorization_denied"
+    assert event["confirmation_state"] == "required"
+    assert event["challenge_ref"] is None
+    assert event["challenge_expires_at"] is None
+    assert event["revalidation_required"] is False
+    assert "strict_confirmation_unavailable" in event["reason_codes"]
+    consequential = capability_id == "jellyfin_restart"
+    assert event["relationship_ids_used"] == ([] if consequential else [relationship_id])
+    assert event["world_state_claim_ids_used"] == ([] if consequential else [claim_id])
+    assert "unverified-caller-challenge" not in json.dumps(event)
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("authorization_stage", ["selection", "dispatch"])
+def test_strict_event_retains_trusted_revalidation_state_without_private_selector(
+    authorization_stage,
+):
+    client = TestClient(app)
+    _configure_repo_verifier()
+    payload, selection, _ = _strict_exposure_turn(client)
+    claim_response = client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(
+            observed_at=_iso(-500), last_verified_at=_iso(-500),
+            expires_at=None, ttl_seconds=None, revalidation_interval_seconds=300,
+        ),
+    })
+    assert claim_response.status_code == 200
+    claim_id = claim_response.json()["claim"]["world_state_claim_id"]
+    request = _strict_action_request(
+        payload, "authorize", authorization_stage=authorization_stage,
+        world_state_requirements=[{
+            "domain": "active_repository", "revalidator_id": "repo-status-revalidator",
+        }], selected_world_state_claim_ids=[claim_id],
+    )
+    legacy_result, legacy_event = _legacy_authorization_event(
+        client, request, selection["active_persona_id"],
+    )
+    response = client.post("/v1/capabilities/authorize", json=request)
+    assert response.status_code == 200
+    result = response.json()["result"]
+    event = _latest_authorization_event(payload["runtime_session_id"])
+    assert result == legacy_result
+    assert {key: value for key, value in event.items() if key not in {
+        "active_persona_id", "selection_contract", "persona_selection_ref", "allowed",
+    }} == legacy_event
+    assert event["allowed"] is False
+    assert event["decision_code"] == "revalidation_required"
+    assert event["revalidation_required"] is True
+    assert event["world_state_claim_ids_used"] == []  # Not yet eligible without revalidation.
+    assert result["revalidation_selector"] == {
+        "world_state_claim_ids": [claim_id], "revalidator_id": "repo-status-revalidator",
+    }
+    assert "revalidation_selector" not in event
+    assert "repo-status-revalidator" not in json.dumps(event)
+    assert event["confirmation_state"] == "not_required"
+    assert event["challenge_ref"] is None
+    assert event["challenge_expires_at"] is None
+    assert _challenge_snapshot() == []
