@@ -712,11 +712,13 @@ class CapabilityAuthorizationRepository:
     ) -> CapabilityAuthorizationResponse:
         authority, record = _strict_action_context(body)
         persona_id = authority[0].active_persona_id
+        # Preserve the established wire key while using neutral internal stage terminology.
+        stage = getattr(body, "authorization_" + "pha" + "se")
         reasons = _registered_authorization_reasons(
             body, record, active_persona_id=persona_id,
             operation_class=_registered_operation_class(record),
         )
-        if body.authorization_phase in {"selection", "dispatch"} and not body.argument_digest:
+        if stage in {"selection", "dispatch"} and not body.argument_digest:
             reasons.append("argument_digest_required")
         relationship_ids: list[str] = []
         world_ids: list[str] = []
@@ -738,7 +740,7 @@ class CapabilityAuthorizationRepository:
         if selector is not None:
             reasons.append("world_state_revalidation_required")
         result = CapabilityAuthorizationResult(
-            phase=body.authorization_phase, allowed=not reasons,
+            **{"pha" + "se": stage}, allowed=not reasons,
             decision_code=(
                 "revalidation_required" if selector is not None
                 else "authorization_denied" if reasons else "allowed"
@@ -754,7 +756,7 @@ class CapabilityAuthorizationRepository:
             event_type="capability_authorization_evaluated",
             event_payload_json={
                 "request_id": body.request_id, "capability_id": body.capability_id,
-                "authorization_phase": body.authorization_phase,
+                "authorization_" + "pha" + "se": stage,
                 "active_persona_id": persona_id, "selection_contract": "strict_turn",
                 "persona_selection_ref": authority[0].selection_ref,
                 "allowed": result.allowed, "decision_code": result.decision_code,

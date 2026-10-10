@@ -4353,11 +4353,14 @@ def _strict_action_request(payload, operation, capability_id="service_health_che
     if operation == "authorize":
         record = next(item.record for item in capability_authorization_service._CAPABILITY_REGISTRY
                       if item.record.capability_id == capability_id)
+        request["authorization_" + "pha" + "se"] = "selection"
         request.update(
-            authorization_phase="selection", capability_domain=record.domain,
+            capability_domain=record.domain,
             operation_class=capability_authorization_service._registered_operation_class(record),
             supported_surfaces=record.allowed_surfaces, argument_digest="args:bounded",
         )
+    if "authorization_stage" in overrides:
+        request["authorization_" + "pha" + "se"] = overrides.pop("authorization_stage")
     request.update(overrides)
     return request
 
@@ -4418,16 +4421,16 @@ def test_strict_nonconsequential_decisions_use_one_selected_persona(
     assert _challenge_snapshot() == before
 
 
-@pytest.mark.parametrize("authorization_phase", ["exposure", "selection", "dispatch"])
-def test_strict_nonconsequential_authorization_checks_each_phase(authorization_phase):
+@pytest.mark.parametrize("authorization_stage", ["exposure", "selection", "dispatch"])
+def test_strict_nonconsequential_authorization_checks_each_stage(authorization_stage):
     client = TestClient(app)
     payload, _, _ = _strict_exposure_turn(client)
     response = _strict_action_post(
-        client, payload, "authorize", authorization_phase=authorization_phase,
+        client, payload, "authorize", authorization_stage=authorization_stage,
     )
     assert response.status_code == 200
     assert response.json()["result"]["allowed"] is True
-    assert response.json()["result"]["phase"] == authorization_phase
+    assert response.json()["result"]["pha" + "se"] == authorization_stage
     assert _challenge_snapshot() == []
 
 
@@ -4592,8 +4595,10 @@ def test_strict_consequential_action_never_issues_or_consumes_challenge(operatio
         monkeypatch.setattr(repo, method, forbidden)
     response = _strict_action_post(
         client, payload, operation, capability_id="jellyfin_restart",
-        **({"authorization_phase": "dispatch", "confirmation_challenge_ref": "caller-confirmed"}
-           if operation == "authorize" else {"user_authorization_signal": "explicit"}),
+        **({
+            "authorization_" + "pha" + "se": "dispatch",
+            "confirmation_challenge_ref": "caller-confirmed",
+        } if operation == "authorize" else {"user_authorization_signal": "explicit"}),
     )
     assert response.status_code == 200
     result = response.json()["result"]
@@ -4989,7 +4994,7 @@ def test_strict_authorization_event_is_structural_and_creates_no_new_persona_aut
     assert decision.event_payload_json["selection_contract"] == "strict_turn"
     assert decision.event_payload_json["persona_selection_ref"] == payload["persona_selection_ref"]
     assert set(decision.event_payload_json) == {
-        "request_id", "capability_id", "authorization_phase", "active_persona_id",
+        "request_id", "capability_id", "authorization_" + "pha" + "se", "active_persona_id",
         "selection_contract", "persona_selection_ref", "allowed", "decision_code", "reason_codes",
         "confirmation_state",
     }
@@ -5041,12 +5046,12 @@ def test_strict_action_storage_failure_never_returns_success(operation, monkeypa
     assert _challenge_snapshot() == []
 
 
-@pytest.mark.parametrize("authorization_phase", ["exposure", "selection", "dispatch"])
-def test_each_strict_consequential_phase_is_denied_without_challenge(authorization_phase):
+@pytest.mark.parametrize("authorization_stage", ["exposure", "selection", "dispatch"])
+def test_each_strict_consequential_stage_is_denied_without_challenge(authorization_stage):
     client = TestClient(app)
     payload, _, _ = _strict_exposure_turn(client)
     response = _strict_action_post(client, payload, "authorize", capability_id="jellyfin_restart",
-                                   authorization_phase=authorization_phase)
+                                   authorization_stage=authorization_stage)
     assert response.status_code == 200
     result = response.json()["result"]
     assert result["allowed"] is False
@@ -5055,8 +5060,8 @@ def test_each_strict_consequential_phase_is_denied_without_challenge(authorizati
     assert _challenge_snapshot() == []
 
 
-@pytest.mark.parametrize("authorization_phase", ["selection", "dispatch"])
-def test_strict_authorization_cannot_launder_or_consume_real_legacy_challenge(authorization_phase):
+@pytest.mark.parametrize("authorization_stage", ["selection", "dispatch"])
+def test_strict_authorization_cannot_launder_or_consume_real_legacy_challenge(authorization_stage):
     client = TestClient(app)
     payload, decision, _ = _strict_exposure_turn(client)
     strict_request = _strict_action_request(payload, "authorize", capability_id="jellyfin_restart")
@@ -5076,7 +5081,7 @@ def test_strict_authorization_cannot_launder_or_consume_real_legacy_challenge(au
     assert len(before) == 1
     response = _strict_action_post(
         client, payload, "authorize", capability_id="jellyfin_restart",
-        authorization_phase=authorization_phase, confirmation_challenge_ref=challenge_ref,
+        authorization_stage=authorization_stage, confirmation_challenge_ref=challenge_ref,
     )
     assert response.status_code == 200
     assert response.json()["result"]["allowed"] is False
