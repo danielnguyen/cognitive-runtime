@@ -3538,6 +3538,8 @@ CapabilityDecisionCode = Literal[
     "revalidation_required",
 ]
 CapabilityReasonCode = Literal[
+    "strict_consequential_action_unavailable",
+    "strict_confirmation_unavailable",
     "allowed",
     "registered_capability_domain_mismatch",
     "registered_operation_class_mismatch",
@@ -3787,7 +3789,7 @@ class CapabilityDiscoveryResponse(BaseModel):
 
 
 class ActionAuthorityDecisionRequest(RuntimeStateResolveRequest):
-    active_persona_id: str = Field(max_length=120)
+    active_persona_id: str | None = Field(default=None, max_length=120)
     capability_id: str = Field(max_length=120)
     target_resolution_state: ActionTargetResolutionState = "resolved"
     world_state_freshness: ActionWorldStateFreshness = "fresh"
@@ -3798,6 +3800,32 @@ class ActionAuthorityDecisionRequest(RuntimeStateResolveRequest):
     interaction_governance_tension: InteractionGovernanceTension | None = None
     user_authorization_signal: ActionUserAuthorizationSignal = "explicit"
     registry_enabled: bool = True
+
+    persona_selection_mode: Literal["legacy", "strict"] = "legacy"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
+    expected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def selection_fields(cls, value):
+        if isinstance(value, dict):
+            if value.get("persona_selection_mode") == "strict" or (
+                value.get("persona_selection_ref")
+            ):
+                if value.get("persona_selection_mode") != "strict":
+                    raise ValueError("persona_selection_requires_strict_mode")
+                if not all(value.get(key) for key in (
+                    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+                    "runtime_turn_id", "persona_selection_ref",
+                )):
+                    raise ValueError("persona_selection_binding_required")
+                if set(value) - cls.model_fields.keys():
+                    raise ValueError("persona_selection_unknown_fields")
+            elif value.get("active_persona_id") is None:
+                raise ValueError("legacy_active_persona_required")
+        return value
 
 
 class ActionAuthorityDecision(BaseModel):
@@ -3818,9 +3846,12 @@ class ActionAuthorityDecisionResponse(BaseModel):
     active_persona_id: str = Field(max_length=120)
     result: ActionAuthorityDecision
 
+    selection_contract: Literal["legacy_unbound", "strict_turn"] = "legacy_unbound"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
+
 
 class ActionFlowDecisionRequest(RuntimeStateResolveRequest):
-    active_persona_id: str = Field(max_length=120)
+    active_persona_id: str | None = Field(default=None, max_length=120)
     capability_id: str = Field(max_length=120)
     flow_intent: ActionFlowIntent = "execution_requested"
     target_resolution_state: ActionTargetResolutionState = "resolved"
@@ -3834,6 +3865,32 @@ class ActionFlowDecisionRequest(RuntimeStateResolveRequest):
     interaction_governance_tension: InteractionGovernanceTension | None = None
     user_authorization_signal: ActionUserAuthorizationSignal = "explicit"
     registry_enabled: bool = True
+
+    persona_selection_mode: Literal["legacy", "strict"] = "legacy"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
+    runtime_session_id: str | None = Field(default=None, max_length=120)
+    runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120)
+    expected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def selection_fields(cls, value):
+        if isinstance(value, dict):
+            if value.get("persona_selection_mode") == "strict" or (
+                value.get("persona_selection_ref")
+            ):
+                if value.get("persona_selection_mode") != "strict":
+                    raise ValueError("persona_selection_requires_strict_mode")
+                if not all(value.get(key) for key in (
+                    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+                    "runtime_turn_id", "persona_selection_ref",
+                )):
+                    raise ValueError("persona_selection_binding_required")
+                if set(value) - cls.model_fields.keys():
+                    raise ValueError("persona_selection_unknown_fields")
+            elif value.get("active_persona_id") is None:
+                raise ValueError("legacy_active_persona_required")
+        return value
 
 
 class DryRunEffect(BaseModel):
@@ -3868,6 +3925,9 @@ class ActionFlowDecisionResponse(BaseModel):
     surface: str = Field(max_length=64)
     active_persona_id: str = Field(max_length=120)
     result: ActionFlowDecision
+
+    selection_contract: Literal["legacy_unbound", "strict_turn"] = "legacy_unbound"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
 
 
 class ActionSummaryRequest(RuntimeStateResolveRequest):
@@ -3999,7 +4059,7 @@ class CapabilityWorldStateRequirement(BaseModel):
 class CapabilityAuthorizationRequest(RuntimeStateResolveRequest):
     runtime_session_id: str = Field(max_length=120)
     runtime_turn_id: str | None = Field(default=None, max_length=120)
-    active_persona_id: str = Field(max_length=120)
+    active_persona_id: str | None = Field(default=None, max_length=120)
     authorization_phase: CapabilityAuthorizationPhase
     capability_id: str = Field(max_length=120)
     capability_domain: BoundedLabel
@@ -4017,6 +4077,30 @@ class CapabilityAuthorizationRequest(RuntimeStateResolveRequest):
     )
     selected_world_state_claim_ids: list[str] = Field(default_factory=list, max_length=64)
     confirmation_challenge_ref: str | None = Field(default=None, max_length=120)
+
+    persona_selection_mode: Literal["legacy", "strict"] = "legacy"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
+    expected_thread_revision: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def selection_fields(cls, value):
+        if isinstance(value, dict):
+            if value.get("persona_selection_mode") == "strict" or (
+                value.get("persona_selection_ref")
+            ):
+                if value.get("persona_selection_mode") != "strict":
+                    raise ValueError("persona_selection_requires_strict_mode")
+                if not all(value.get(key) for key in (
+                    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+                    "runtime_turn_id", "persona_selection_ref",
+                )):
+                    raise ValueError("persona_selection_binding_required")
+                if set(value) - cls.model_fields.keys():
+                    raise ValueError("persona_selection_unknown_fields")
+            elif value.get("active_persona_id") is None:
+                raise ValueError("legacy_active_persona_required")
+        return value
 
 
 class CapabilityRevalidationSelector(BaseModel):
@@ -4046,6 +4130,9 @@ class CapabilityAuthorizationResponse(BaseModel):
     runtime_turn_id: str | None = Field(default=None, max_length=120)
     capability_id: str = Field(max_length=120)
     result: CapabilityAuthorizationResult
+
+    selection_contract: Literal["legacy_unbound", "strict_turn"] = "legacy_unbound"
+    persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
 
 
 class CapabilityConfirmationRequest(RuntimeStateResolveRequest):
