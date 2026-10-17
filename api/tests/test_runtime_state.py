@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+from asyncio import CancelledError
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -6198,3 +6199,387 @@ def test_return_snapshot_semantic_binding_preserves_legitimate_join(tmp_path, mo
         reopened.return_after_gap_snapshot(session.runtime_session_id, turn.runtime_turn_id)
         == snapshot
     )
+
+
+def _sqlite_timing_events(caplog):
+    return [
+        json.loads(record.getMessage()) for record in caplog.records
+        if record.name == "uvicorn.error" and record.getMessage().startswith('{"event":"sqlite_')
+    ]
+
+
+@pytest.mark.parametrize("flag", [None, "false", "0", "invalid"])
+def test_sqlite_timing_default_off_preserves_native_connection_and_no_collector(
+    monkeypatch, caplog, flag,
+):
+    import services.runtime_state as state_service
+
+    if flag is None:
+        monkeypatch.delenv("SQLITE_TRANSACTION_TIMING_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", flag)
+    monkeypatch.setattr(
+        state_service, "_SqliteTimingRequest",
+        lambda *args: pytest.fail("disabled diagnostics allocated a collector"),
+    )
+    caplog.set_level("INFO", logger="uvicorn.error")
+    response = _start(TestClient(app), request_id="native", owner_id="owner",
+                      conversation_id="native-conversation", surface="dev")
+    assert response.status_code == 200
+    with state_service.runtime_state_repository()._connect() as conn:
+        assert type(conn) is sqlite3.Connection
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 10000
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert _sqlite_timing_events(caplog) == []
+
+
+def test_sqlite_timing_actual_turn_transitions_and_privacy(monkeypatch, caplog):
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    client = TestClient(app)
+    started = _start(client, request_id="start-sensitive", owner_id="private-owner",
+                     conversation_id="private-conversation", surface="dev")
+    assert started.status_code == 200
+    session = started.json()["runtime_session"]["runtime_session_id"]
+    turn = started.json()["runtime_turn"]["runtime_turn_id"]
+    assert client.post("/v1/runtime/turns/update", json={
+        "request_id": "update-sensitive", "runtime_session_id": session,
+        "runtime_turn_id": turn, "turn_status": "responding",
+    }).status_code == 200
+    assert _complete(client, request_id="complete-sensitive", runtime_session_id=session,
+                     runtime_turn_id=turn).status_code == 200
+    events = _sqlite_timing_events(caplog)
+    writes = [event for event in events if event.get("outcome") == "committed"]
+    assert [event["transaction"] for event in writes] == [
+        "turn_start", "turn_update", "turn_complete",
+    ]
+    for event, operation, request in zip(writes, ["start", "update", "complete"], [
+        "start-sensitive", "update-sensitive", "complete-sensitive",
+    ], strict=True):
+        assert event["operation"] == f"POST /v1/runtime/turns/{operation}"
+        assert event["request_ref"] == sha256(request.encode()).hexdigest()
+        assert event["begin_kind"] == "explicit_immediate"
+        assert event["implicit_begin_statement_ms"] is None
+        for key in ["connection_ms", "begin_ms", "context_work_ms", "commit_ms"]:
+            assert event[key] >= 0
+        assert 0 <= event["start_ns"] < event["end_ns"]
+        assert event["rollback_ms"] is None
+    text = json.dumps(events)
+    for private in ["private-owner", "private-conversation", session, turn,
+                    "start-sensitive", "UPDATE", "SELECT", "sqlite3"]:
+        assert private not in text
+    diagnostics = client.get(f"/v1/runtime/sessions/{session}").json()
+    assert diagnostics["latest_turn"]["turn_status"] == "completed"
+    assert not any(e["event_type"].startswith("sqlite_") for e in diagnostics["events"])
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("private SQL failure"),
+                                     CancelledError()])
+def test_sqlite_timing_rollback_preserves_exception_and_rows(monkeypatch, caplog, failure):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    repo = state_service.runtime_state_repository()
+    before = _runtime_rows(repo.db_path)
+    original = repo._record_event
+
+    def fail_after_insert(conn, **kwargs):
+        original(conn, **kwargs)
+        if kwargs["event_type"] == "turn_started":
+            raise failure
+
+    monkeypatch.setattr(repo, "_record_event", fail_after_insert)
+    with pytest.raises(type(failure)) as raised:
+        state_service.start_turn(request_id="rollback", owner_id="owner",
+                                 conversation_id="rollback-conversation", surface="dev")
+    assert raised.value is failure
+    assert _runtime_rows(repo.db_path) == before
+    events = _sqlite_timing_events(caplog)
+    transaction = next(e for e in events if e.get("transaction") == "turn_start")
+    assert transaction["outcome"] == "rolled_back"
+    assert transaction["rollback_ms"] >= 0
+    assert transaction["commit_ms"] is None
+    expected = "cancelled" if isinstance(failure, CancelledError) else "failed"
+    assert events[-1]["outcome"] == expected
+    assert "private SQL failure" not in json.dumps(events)
+    assert state_service._SQLITE_TIMING_CONTEXT.get() is None
+
+
+def test_sqlite_timing_connection_failure_and_sink_failure_do_not_change_outcome(
+    monkeypatch, caplog, tmp_path,
+):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    failure = sqlite3.OperationalError("private database path")
+    original = sqlite3.connect
+
+    def fail_connect(*args, **kwargs):
+        raise failure
+
+    @state_service.sqlite_timing_request("POST /v1/runtime/turns/start")
+    def connect(*, request_id):
+        return state_service.sqlite_connection(tmp_path / "probe.db", label="turn_start")
+
+    monkeypatch.setattr(sqlite3, "connect", fail_connect)
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        connect(request_id="connection-failure")
+    assert raised.value is failure
+    event = _sqlite_timing_events(caplog)[0]
+    assert event["outcome"] == "connection_failed"
+    assert event["connection_ms"] >= 0
+    assert "private database path" not in json.dumps(_sqlite_timing_events(caplog))
+    monkeypatch.setattr(sqlite3, "connect", original)
+
+    def fail_log(*args, **kwargs):
+        raise RuntimeError("sink unavailable")
+
+    monkeypatch.setattr(state_service._SQLITE_TIMING_LOG, "info", fail_log)
+    conn = connect(request_id="sink-failure")
+    assert isinstance(conn, sqlite3.Connection)
+    conn.close()
+
+
+def test_sqlite_timing_native_commit_failure_rolls_back_without_masking(monkeypatch, caplog):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    repo = state_service.runtime_state_repository()
+    original = repo._record_event
+    before = _runtime_rows(repo.db_path)
+
+    def deferred_foreign_key_violation(conn, **kwargs):
+        conn.execute("PRAGMA defer_foreign_keys = ON")
+        event = original(conn, **kwargs)
+        if kwargs["event_type"] == "turn_started":
+            conn.execute("UPDATE conversation_runtime_turns SET runtime_session_id = ?",
+                         ("missing-private-session",))
+        return event
+
+    monkeypatch.setattr(repo, "_record_event", deferred_foreign_key_violation)
+    with pytest.raises(sqlite3.IntegrityError):
+        state_service.start_turn(request_id="commit-failure", owner_id="owner",
+                                 conversation_id="commit-failure-conversation", surface="dev")
+    assert _runtime_rows(repo.db_path) == before
+    event = _sqlite_timing_events(caplog)[0]
+    assert event["outcome"] == "commit_failed"
+    assert event["exit_may_include_rollback"] is True
+    assert event["commit_ms"] >= 0
+    assert "missing-private-session" not in json.dumps(_sqlite_timing_events(caplog))
+
+
+def test_sqlite_timing_concurrent_request_isolation(monkeypatch, caplog):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    barrier = threading.Barrier(2)
+    original = state_service.runtime_state_repository()._connect
+
+    def synchronized_connect(label="runtime_read"):
+        if label == "turn_start":
+            barrier.wait(timeout=5)
+        return original(label)
+
+    monkeypatch.setattr(state_service.runtime_state_repository(), "_connect", synchronized_connect)
+
+    def start(index):
+        state_service.start_turn(request_id=f"concurrent-{index}", owner_id="owner",
+                                 conversation_id=f"concurrent-conversation-{index}", surface="dev")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(start, range(2)))
+    events = [e for e in _sqlite_timing_events(caplog) if e.get("transaction") == "turn_start"]
+    assert len(events) == 2
+    assert {e["request_ref"] for e in events} == {
+        sha256(f"concurrent-{i}".encode()).hexdigest() for i in range(2)
+    }
+    assert all(e["connection_index"] == 1 and e["outcome"] == "committed" for e in events)
+    assert state_service._SQLITE_TIMING_CONTEXT.get() is None
+
+
+def test_sqlite_timing_cap_and_malformed_request_do_not_change_database_work(
+    monkeypatch, caplog, tmp_path,
+):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    classes = []
+
+    @state_service.sqlite_timing_request("POST /v1/runtime/turns/start")
+    def reads(*, request_id):
+        for _ in range(40):
+            with state_service.sqlite_connection(tmp_path / "cap.db", label="runtime_read") as conn:
+                classes.append(type(conn))
+                assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+    reads(request_id="bounded")
+    events = _sqlite_timing_events(caplog)
+    assert len(events) == 33
+    assert events[-1]["events"] == 32 and events[-1]["dropped"] == 8
+    assert classes[-8:] == [sqlite3.Connection] * 8
+    caplog.clear()
+    reads(request_id="private\n" * 100)
+    assert _sqlite_timing_events(caplog) == []
+    assert classes[-40:] == [sqlite3.Connection] * 40
+
+
+@pytest.mark.parametrize("implicit", [False, True])
+def test_sqlite_timing_boundary_clock_and_native_context_semantics(
+    monkeypatch, caplog, implicit,
+):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    clock = [0]
+    monkeypatch.setattr(state_service, "perf_counter_ns", lambda: clock[0])
+    statements = []
+
+    @state_service.sqlite_timing_request("POST /v1/runtime/turns/update")
+    def transaction(*, request_id):
+        conn = state_service.runtime_state_repository()._connect("turn_update")
+
+        def authorize(action, first, second, database, source):
+            if action == sqlite3.SQLITE_TRANSACTION:
+                clock[0] += 7_000_000 if first == "COMMIT" else 2_000_000
+            elif action == sqlite3.SQLITE_UPDATE:
+                clock[0] += 3_000_000
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(authorize)
+        conn.set_trace_callback(statements.append)
+        with conn:
+            if not implicit:
+                conn.execute("BEGIN IMMEDIATE;")
+            conn.execute("UPDATE conversation_runtime_turns SET turn_status = ?", ("received",))
+        assert conn.execute("SELECT 1").fetchone()[0] == 1  # __exit__ did not close it.
+        conn.close()
+
+    transaction(request_id="clocked")
+    event = _sqlite_timing_events(caplog)[0]
+    assert event["commit_ms"] == 7
+    if implicit:
+        assert event["begin_kind"] == "implicit_with_first_statement"
+        assert event["begin_ms"] is None
+        assert event["implicit_begin_statement_ms"] == 5
+        assert event["context_work_ms"] == 0
+    else:
+        assert event["begin_ms"] == 2
+        assert event["context_work_ms"] == 3
+    assert [s.split()[0] for s in statements] == ["BEGIN", "UPDATE", "COMMIT", "SELECT"]
+
+
+def test_sqlite_timing_request_payload_cannot_enable_diagnostics(monkeypatch, caplog):
+    monkeypatch.delenv("SQLITE_TRANSACTION_TIMING_ENABLED", raising=False)
+    caplog.set_level("INFO", logger="uvicorn.error")
+    response = TestClient(app).post("/v1/runtime/turns/start", json={
+        "request_id": "payload-enable", "owner_id": "owner", "conversation_id": "payload",
+        "surface": "dev", "sqlite_transaction_timing_enabled": True,
+        "SQLITE_TRANSACTION_TIMING_ENABLED": True,
+    })
+    assert response.status_code == 422  # Existing contract rejects unknown request fields.
+    assert _sqlite_timing_events(caplog) == []
+
+
+def test_sqlite_timing_begin_failure_preserves_database_and_exception(monkeypatch, caplog):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    repo = state_service.runtime_state_repository()
+    original = repo._connect
+    before = _runtime_rows(repo.db_path)
+
+    def deny_begin(label="runtime_read"):
+        conn = original(label)
+        conn.set_authorizer(lambda action, *args: sqlite3.SQLITE_DENY
+                            if action == sqlite3.SQLITE_TRANSACTION else sqlite3.SQLITE_OK)
+        return conn
+
+    monkeypatch.setattr(repo, "_connect", deny_begin)
+    with pytest.raises(sqlite3.DatabaseError):
+        state_service.start_turn(request_id="begin-denied", owner_id="owner",
+                                 conversation_id="begin-denied-conversation", surface="dev")
+    assert _runtime_rows(repo.db_path) == before
+    event = _sqlite_timing_events(caplog)[0]
+    assert event["outcome"] == "failed_without_transaction"
+    assert event["begin_kind"] == "explicit_immediate"
+    assert event["begin_ms"] >= 0
+    assert event["commit_ms"] is None and event["rollback_ms"] is None
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_sqlite_timing_explicit_commit_and_rollback_are_not_duplicated(
+    monkeypatch, caplog, rollback,
+):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    statements = []
+
+    @state_service.sqlite_timing_request("POST /v1/capabilities/authorize")
+    def transaction(*, request_id):
+        conn = state_service.runtime_state_repository()._connect("challenge_consume")
+        conn.set_trace_callback(statements.append)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE conversation_runtime_turns SET turn_status = 'received'")
+        if rollback:
+            conn.rollback()
+        else:
+            conn.commit()
+        conn.close()
+
+    transaction(request_id="explicit-boundary")
+    events = _sqlite_timing_events(caplog)
+    assert len(events) == 2  # One transaction and one request summary.
+    event = events[0]
+    assert event["outcome"] == ("rolled_back" if rollback else "committed")
+    assert event["context_exit_ms"] is None
+    assert event["rollback_ms" if rollback else "commit_ms"] >= 0
+    assert [s.split()[0] for s in statements] == [
+        "BEGIN", "UPDATE", "ROLLBACK" if rollback else "COMMIT",
+    ]
+
+
+def test_sqlite_timing_cold_initialization_reports_script_commit_limitation(monkeypatch, caplog):
+    import services.runtime_state as state_service
+
+    monkeypatch.setattr(state_service, "_RUNTIME_REPOSITORY", None)
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    state_service.start_turn(request_id="cold", owner_id="owner",
+                             conversation_id="cold-conversation", surface="dev")
+    events = _sqlite_timing_events(caplog)
+    script = next(e for e in events if e.get("transaction") == "schema_initialization")
+    assert script["script_may_include_implicit_commits"] is True
+    assert script["outcome"] == "script_completed"
+    assert script["script_work_ms"] > 0
+    assert script["commit_ms"] is None  # Do not invent internal sqlite3_exec commit spans.
+    assert sum(e.get("outcome") == "committed" for e in events) == 1
+
+
+@pytest.mark.parametrize("sql", [None, 42, "SELECT private_missing_column"])
+def test_sqlite_timing_invalid_sql_preserves_native_exception(monkeypatch, caplog, sql):
+    import services.runtime_state as state_service
+
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    with sqlite3.connect(":memory:") as native:
+        with pytest.raises(Exception) as baseline:
+            native.execute(sql)
+
+    @state_service.sqlite_timing_request("POST /v1/runtime/turns/start")
+    def invalid(*, request_id):
+        with state_service.runtime_state_repository()._connect("turn_start") as conn:
+            conn.execute(sql)
+
+    with pytest.raises(type(baseline.value)) as observed:
+        invalid(request_id="malformed")
+    assert str(observed.value) == str(baseline.value)
+    assert "private_missing_column" not in json.dumps(_sqlite_timing_events(caplog))

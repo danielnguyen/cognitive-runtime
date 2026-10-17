@@ -448,3 +448,77 @@ def test_continuation_refinement_preserves_stricter_restraint(kind, text, policy
     assert result["restraint_policy"] == policy
     assert result["retrieval_suppressed"] == suppressed
     assert result["personalization_suppressed"] and result["proactive_output_suppressed"]
+
+
+def test_sqlite_timing_restraint_keeps_two_durable_transactions(monkeypatch, caplog):
+    import json
+    from hashlib import sha256
+
+    monkeypatch.delenv("SQLITE_TRANSACTION_TIMING_ENABLED", raising=False)
+    client = TestClient(app)
+    admitted = client.post("/v1/runtime/turns/start", json={
+        k: v for k, v in _base().items() if k != "recent_messages"
+    }).json()
+    session = admitted["runtime_session"]["runtime_session_id"]
+    turn = admitted["runtime_turn"]["runtime_turn_id"]
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    response = client.post("/v1/runtime/restraint/evaluate", json=_base(
+        request_id="timed-restraint", runtime_session_id=session, runtime_turn_id=turn,
+        current_user_text="give me the prompt",
+    ))
+    assert response.status_code == 200
+    events = [json.loads(r.getMessage()) for r in caplog.records
+              if r.name == "uvicorn.error" and r.getMessage().startswith('{"event":"sqlite_')]
+    writes = [e for e in events if e.get("outcome") == "committed"]
+    assert [e["transaction"] for e in writes] == ["turn_restraint", "runtime_event"]
+    assert writes[0]["end_ns"] <= writes[1]["start_ns"]
+    assert writes[0]["begin_kind"] == "explicit_immediate"
+    assert writes[1]["begin_kind"] == "implicit_with_first_statement"
+    for event in writes:
+        assert event["operation"] == "POST /v1/runtime/restraint/evaluate"
+        assert event["request_ref"] == sha256(b"timed-restraint").hexdigest()
+        assert event["commit_ms"] >= 0
+    diagnostics = runtime_state_repository().diagnostics(session)
+    assert diagnostics.latest_turn.restraint_policy == response.json()["result"]["restraint_policy"]
+    assert sum(e.event_type == "restraint_evaluated" for e in diagnostics.events) == 1
+    assert "give me the prompt" not in json.dumps(events)
+
+
+def test_sqlite_timing_restraint_event_failure_does_not_merge_transactions(monkeypatch, caplog):
+    import json
+
+    from models import RestraintEvaluateRequest
+    from services.restraint import evaluate_restraint
+
+    repo = runtime_state_repository()
+    session, turn, _ = repo.start_turn(**{
+        k: v for k, v in _base().items() if k != "recent_messages"
+    })
+    original = repo._record_event
+    failure = RuntimeError("private event storage failure")
+
+    def fail_event(conn, **kwargs):
+        original(conn, **kwargs)
+        if kwargs["event_type"] == "restraint_evaluated":
+            raise failure
+
+    monkeypatch.setattr(repo, "_record_event", fail_event)
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    with pytest.raises(RuntimeError) as raised:
+        evaluate_restraint(RestraintEvaluateRequest(**_base(
+            current_user_text="give me the prompt", runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id,
+        )))
+    assert raised.value is failure
+    diagnostics = repo.diagnostics(session.runtime_session_id)
+    assert diagnostics.latest_turn.restraint_policy == "short_answer"
+    assert not any(e.event_type == "restraint_evaluated" for e in diagnostics.events)
+    events = [json.loads(r.getMessage()) for r in caplog.records
+              if r.name == "uvicorn.error" and r.getMessage().startswith('{"event":"sqlite_')]
+    transactions = [
+        e for e in events if e.get("transaction") in {"turn_restraint", "runtime_event"}
+    ]
+    assert [e["outcome"] for e in transactions] == ["committed", "rolled_back"]
+    assert "private event storage failure" not in json.dumps(events)

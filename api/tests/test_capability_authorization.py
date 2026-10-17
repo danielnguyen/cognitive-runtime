@@ -5256,3 +5256,39 @@ def test_strict_event_retains_trusted_revalidation_state_without_private_selecto
     assert event["challenge_ref"] is None
     assert event["challenge_expires_at"] is None
     assert _challenge_snapshot() == []
+
+
+def test_sqlite_timing_capability_exposure_preserves_decision_and_single_event_commit(
+    monkeypatch, caplog,
+):
+    from hashlib import sha256
+
+    client = TestClient(app)
+    turn = _start_turn(client)
+    body = _authorized_request(turn, request_id="timed-capability")
+    baseline = client.post("/v1/capabilities/authorize", json=body)
+    assert baseline.status_code == 200
+    before = len(runtime_state_repository().diagnostics(body["runtime_session_id"]).events)
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    response = client.post("/v1/capabilities/authorize", json=body)
+    assert response.status_code == 200
+    assert response.json() == baseline.json()
+    events = [json.loads(r.getMessage()) for r in caplog.records
+              if r.name == "uvicorn.error" and r.getMessage().startswith('{"event":"sqlite_')]
+    writes = [e for e in events if e.get("outcome") == "committed"]
+    assert len(writes) == 1
+    assert writes[0]["transaction"] == "runtime_event"
+    assert writes[0]["begin_kind"] == "implicit_with_first_statement"
+    assert writes[0]["commit_ms"] >= 0
+    assert all(e["request_ref"] == sha256(b"timed-capability").hexdigest() for e in events)
+    assert all(e["operation"] == "POST /v1/capabilities/authorize" for e in events)
+    diagnostics = runtime_state_repository().diagnostics(body["runtime_session_id"])
+    assert len(diagnostics.events) == before + 1
+    assert diagnostics.events[-1].event_type == "capability_authorization_evaluated"
+    assert diagnostics.events[-1].event_payload_json["decision_code"] == response.json()[
+        "result"
+    ]["decision_code"]
+    assert not capability_authorization_repository()._connect().execute(
+        "SELECT * FROM capability_confirmation_challenges"
+    ).fetchall()
