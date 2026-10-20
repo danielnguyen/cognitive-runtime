@@ -2170,6 +2170,125 @@ def test_semantic_no_match_can_reduce_natural_topical_source_match():
 
 
 @pytest.mark.parametrize(
+    "task_text", ["What is 7 + 5?", "What is 9 + 4?", "What is a hostname?"]
+)
+@pytest.mark.parametrize(
+    "operation_hint",
+    [
+        "lookup",
+        "latest",
+        "aggregate",
+        "comparison",
+        "exhaustive_review",
+        "contradiction_review",
+        "absence_check",
+        "historical_reconstruction",
+        "decision_support",
+        "unknown",
+    ],
+)
+def test_semantic_no_match_operation_does_not_make_ordinary_question_material(
+    task_text: str,
+    operation_hint: str,
+):
+    runtime = _start_runtime()
+    discovery = _discovery(_discovery_source("source_a", "Alpine Register"))
+    initial = _derive(
+        runtime,
+        task_text=task_text,
+        task_context=_context(source_discovery=discovery),
+    )
+    refined = _derive(
+        runtime,
+        task_text=task_text,
+        task_context=_context(
+            source_discovery=discovery,
+            semantic_advisory=_semantic_advisory("no_match", operation_hint),
+        ),
+    )
+
+    assert initial.status_code == refined.status_code == 200
+    _assert_not_applicable(initial.json()["result"])
+    result = refined.json()["result"]
+    _assert_not_applicable(result)
+    assert result["source_match"] == {
+        "status": "no_match",
+        "matched_source_ids": [],
+        "reason_codes": ["semantic_no_match"],
+    }
+    assert "semantic_operation_hint" not in result["reason_codes"]
+    assert "aggregate_spec" not in result
+    events = _shape_events(runtime["runtime_session_id"])
+    assert len(events) == 2
+    assert all(
+        event["event_payload_json"]["derivation_status"] == "not_applicable"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("inventory_status", ["partial", "unknown", "unavailable"])
+@pytest.mark.parametrize("operation_hint", ["lookup", "aggregate"])
+def test_semantic_no_match_ordinary_question_keeps_unavailable_scope_ungranted(
+    inventory_status: str,
+    operation_hint: str,
+):
+    response = _derive(
+        _start_runtime(),
+        task_text="What is 9 + 4?",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                inventory_status=inventory_status,
+            ),
+            semantic_advisory=_semantic_advisory("no_match", operation_hint),
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    _assert_not_applicable(result)
+    assert result["source_match"]["status"] == "inventory_unavailable"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "probe_source_ids" not in result["source_match"]
+    assert "aggregate_spec" not in result
+
+
+@pytest.mark.parametrize("inventory_status", ["complete", "partial"])
+@pytest.mark.parametrize("verification_required", [False, True])
+def test_semantic_no_match_preserves_independent_evidence_requirement(
+    inventory_status: str,
+    verification_required: bool,
+):
+    response = _derive(
+        _start_runtime(),
+        task_text=(
+            "What is 9 + 4?"
+            if verification_required
+            else "Check the maintenance record for the service date."
+        ),
+        task_context=_context(
+            external_verification_required=verification_required,
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                inventory_status=inventory_status,
+            ),
+            semantic_advisory=_semantic_advisory("no_match", "lookup"),
+        ),
+    )
+
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == "targeted_lookup"
+    assert result["evidence_scope_material"] is True
+    assert result["source_match"]["status"] == (
+        "no_match" if inventory_status == "complete" else "inventory_unavailable"
+    )
+    assert result["source_match"]["matched_source_ids"] == []
+    assert "probe_source_ids" not in result["source_match"]
+
+
+@pytest.mark.parametrize(
     ("task_text", "expected_reason"),
     [
         ("What is in alpha_review_archive?", "source_id_match"),
@@ -2652,6 +2771,7 @@ def test_semantic_partial_inventory_preserves_positive_and_negative_limits():
         _start_runtime(),
         task_text="Please handle this question.",
         task_context=_context(
+            external_verification_required=True,
             source_discovery=discovery,
             semantic_advisory=_semantic_advisory("no_match", "lookup"),
         ),
@@ -3183,6 +3303,7 @@ def test_supported_operation_remains_material_when_semantics_find_no_source():
         _start_runtime(),
         task_text="Please handle this bounded question.",
         task_context=_context(
+            external_verification_required=True,
             source_discovery=_discovery(
                 _discovery_source("source_a", "Alpine Register")
             ),
@@ -3937,7 +4058,7 @@ def test_aggregate_no_match_accepts_legacy_and_enriched_contracts(enriched: bool
         else {}
     )
     request = _fixed_shape_request(
-        task_text="Calculate the requested statistic.",
+        task_text="Verify the requested statistic against the records.",
         source_discovery=_discovery(),
         semantic_advisory=_semantic_advisory(
             "no_match",

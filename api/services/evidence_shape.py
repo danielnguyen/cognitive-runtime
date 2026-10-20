@@ -827,7 +827,13 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         if context.semantic_advisory is not None
         else None
     )
-    semantic_operation_material = semantic_operation not in {None, "unknown"}
+    # An unsuccessful source interpretation cannot establish an evidence need
+    # from its operation hint alone. Independent task/context requirements remain.
+    semantic_operation_material = (
+        context.semantic_advisory is not None
+        and context.semantic_advisory.interpretation_status != "no_match"
+        and semantic_operation not in {None, "unknown"}
+    )
     reasons = _materiality_reasons(
         body,
         explicit_evidence=explicit_evidence,
