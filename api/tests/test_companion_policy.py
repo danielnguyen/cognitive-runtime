@@ -445,3 +445,118 @@ def test_contract_operational_failures_do_not_default(monkeypatch, error, consum
             resolve_interaction_contract(
                 owner_id="owner", surface="dev", requested_scene=None, runtime_state=state,
             )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_scene"),
+    [
+        ("coding_build", "coding_build"),
+        ("coding", "coding_build"),
+        ("coding_build_mode", "coding_build"),
+        ("planning", "planning"),
+        ("work_triage", "work_triage"),
+    ],
+)
+def test_compile_infers_only_registered_work_modes_without_state_mutation(mode, expected_scene):
+    client = TestClient(app)
+    updated = client.post(
+        "/v1/runtime/state/update",
+        json={**_base(), "updates": {"interaction_mode": mode}},
+    )
+    assert updated.status_code == 200
+    state_before = resolve_state(**{key: _base()[key] for key in (
+        "owner_id", "conversation_id", "surface",
+    )}).model_dump()
+
+    inferred = client.post("/v1/companion/policy/compile", json=_base())
+    explicit = client.post(
+        "/v1/companion/policy/compile",
+        json={**_base(), "requested_scene": expected_scene},
+    )
+
+    assert inferred.status_code == explicit.status_code == 200
+    body = inferred.json()
+    assert body["scene_id"] == expected_scene
+    assert body["scene_source"] == "runtime_interaction_mode"
+    assert body["scene_confidence"] == 0.6
+    assert body["runtime_state"] == state_before
+    assert body["overlays"] == explicit.json()["overlays"]
+    assert body["interaction_contract"] == explicit.json()["interaction_contract"]
+    assert resolve_state(**{key: _base()[key] for key in (
+        "owner_id", "conversation_id", "surface",
+    )}).model_dump() == state_before
+    assert companion_contracts_repository().list_scene_resolution_events_for_tests() == []
+
+
+@pytest.mark.parametrize("mode", [
+    None, "", "unknown", "driving", "overload_recovery", "reflective",
+    "reflective_conversation", "notifications_briefings", "medical_urgency",
+    "voice_private", "technical_architect", "Coding", " coding ",
+])
+def test_compile_does_not_infer_sensitive_or_unrecognized_modes(mode):
+    client = TestClient(app)
+    assert client.post(
+        "/v1/runtime/state/update",
+        json={**_base(), "updates": {"interaction_mode": mode}},
+    ).status_code == 200
+    response = client.post("/v1/companion/policy/compile", json=_base())
+    assert response.status_code == 200
+    assert response.json()["scene_id"] == "general"
+    assert response.json()["scene_source"] == "general"
+    assert response.json()["runtime_state"]["active_scene"] is None
+
+
+def test_scene_selection_across_requests_preserves_saved_choice_and_identity():
+    client = TestClient(app)
+    scope = {key: _base()[key] for key in ("owner_id", "conversation_id", "surface")}
+    assert client.post(
+        "/v1/runtime/state/update",
+        json={**_base(), "updates": {
+            "active_scene": "planning", "interaction_mode": "coding",
+            "temporary_constraints": ["do_not_personalize"],
+        }},
+    ).status_code == 200
+    saved_state = resolve_state(**scope).model_dump()
+
+    def compile_request(request_id, **fields):
+        response = client.post(
+            "/v1/companion/policy/compile",
+            json={**_base(), "request_id": request_id, **fields},
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    saved = compile_request("scene-saved")
+    override = compile_request("scene-override", requested_scene="work_triage")
+    restored = compile_request("scene-restored")
+    assert [body["scene_id"] for body in (saved, override, restored)] == [
+        "planning", "work_triage", "planning",
+    ]
+    assert [body["scene_source"] for body in (saved, override, restored)] == [
+        "runtime_state", "requested_scene", "runtime_state",
+    ]
+    assert saved["overlays"][2]["content"] != override["overlays"][2]["content"]
+    assert saved["overlays"] == restored["overlays"]
+    assert resolve_state(**scope).model_dump() == saved_state
+
+    assert client.post("/v1/runtime/state/reset", json=_base()).status_code == 200
+    general = compile_request("scene-reset")
+    assert general["scene_id"] == "general"
+    assert general["runtime_state"]["active_scene"] is None
+    assert general["runtime_state"]["interaction_mode"] is None
+    for mode, expected_scene in (("coding", "coding_build"), ("work_triage", "work_triage")):
+        assert client.post(
+            "/v1/runtime/state/update",
+            json={**_base(), "updates": {"interaction_mode": mode}},
+        ).status_code == 200
+        inferred = compile_request("scene-inferred-" + mode)
+        assert inferred["scene_id"] == expected_scene
+        assert inferred["runtime_state"]["active_scene"] is None
+        assert inferred["runtime_state"]["runtime_state_id"] == saved_state["runtime_state_id"]
+        assert (inferred["profile_id"], inferred["profile_version"]) == (
+            saved["profile_id"], saved["profile_version"],
+        )
+        assert inferred["interaction_contract"] == saved["interaction_contract"]
+    transient = compile_request("scene-transient", requested_scene="planning")
+    assert transient["scene_id"] == "planning"
+    assert compile_request("scene-after-transient")["scene_id"] == "work_triage"
