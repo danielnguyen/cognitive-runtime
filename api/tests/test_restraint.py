@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -448,3 +449,157 @@ def test_continuation_refinement_preserves_stricter_restraint(kind, text, policy
     assert result["restraint_policy"] == policy
     assert result["retrieval_suppressed"] == suppressed
     assert result["personalization_suppressed"] and result["proactive_output_suppressed"]
+
+
+def _question_recall_turn(*, prior_status="completed", surface="telegram"):
+    repo = runtime_state_repository()
+    scope = dict(owner_id="owner", conversation_id="question-recall", surface=surface)
+    if prior_status is not None:
+        session, prior, _ = repo.start_turn(request_id="prior", **scope)
+        repo.complete_turn(
+            request_id="prior", runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=prior.runtime_turn_id, turn_status=prior_status,
+        )
+    session, turn, event = repo.start_turn(request_id="current", **scope)
+    return repo, turn, event, dict(
+        **scope, request_id="current", runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id,
+    )
+
+
+@pytest.mark.parametrize("text", ["Tell me a joke", "Can you tell me a joke?"])
+def test_requested_joke_composes_governance_restraint_and_timing(text):
+    repo, turn, _, scope = _question_recall_turn(prior_status=None)
+    client = TestClient(app)
+    governance = client.post("/v1/runtime/interaction-governance/evaluate", json={
+        **scope, "current_user_text": text,
+    }).json()["result"]
+    response = client.post("/v1/runtime/restraint/evaluate", json={
+        **scope, "current_user_text": text,
+        "interaction_kind": governance["interaction_kind"],
+    })
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert governance["interaction_kind"] == "joke_or_playful"
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "information_request"
+    assert result["restraint_policy"] == "answer_normally"
+    assert result["retrieval_suppressed"] is True
+    assert result["clarification_preferred"] is False
+    assert result["personalization_suppressed"] and result["proactive_output_suppressed"]
+    client.post("/v1/runtime/presence/evaluate", json=scope)
+    timing = client.post("/v1/runtime/timing/evaluate", json={
+        **scope, "spoken_output": False, "active_task_mode": False,
+        "requested_detail": "unspecified", "latency_budget_class": "ordinary_text",
+        "dependency_state": "ready",
+    })
+    assert timing.status_code == 200
+    assert timing.json()["result"]["timing_policy"] == "answer_now"
+
+
+@pytest.mark.parametrize("surface", ["telegram", "web"])
+@pytest.mark.parametrize("text", [
+    "What arithmetic question did I just ask you?", "What question did I last ask?",
+    "Which technical question did I just ask?", "What did I just ask you?",
+])
+def test_immediate_question_request_uses_current_intent_and_completed_turn(surface, text):
+    repo, turn, _, scope = _question_recall_turn(surface=surface)
+    client = TestClient(app)
+    governance = client.post("/v1/runtime/interaction-governance/evaluate", json={
+        **scope, "current_user_text": text,
+    }).json()["result"]
+    response = client.post("/v1/runtime/restraint/evaluate", json={
+        **scope, "current_user_text": text,
+        "interaction_kind": governance["interaction_kind"],
+    })
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert governance["interaction_kind"] == "question"
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "information_request"
+    assert result["restraint_policy"] == "answer_normally"
+    assert result["retrieval_suppressed"] is False
+    assert "continuation_context_requested" in result["reason_summary"]
+    assert result["personalization_suppressed"] and result["proactive_output_suppressed"]
+    events = [e for e in repo.list_events_for_tests(scope["runtime_session_id"])
+              if e.event_type == "restraint_evaluated"]
+    assert len(events) == 1 and events[0].runtime_turn_id == turn.runtime_turn_id
+    assert text not in json.dumps(events[0].event_payload_json)
+
+
+@pytest.mark.parametrize("fault", [
+    "no_prior", "abandoned_prior", "missing_governance", "wrong_intent",
+    "missing_snapshot", "malformed_snapshot", "wrong_snapshot_turn", "wrong_prior",
+    "wrong_owner", "wrong_conversation", "wrong_surface", "wrong_session", "wrong_turn",
+    "terminal",
+])
+def test_immediate_question_request_never_grants_context_with_invalid_authority(fault):
+    repo, turn, event, scope = _question_recall_turn(
+        prior_status=None if fault == "no_prior" else (
+            "abandoned" if fault == "abandoned_prior" else "completed"
+        ),
+    )
+    text = "What arithmetic question did I just ask you?"
+    client = TestClient(app)
+    if fault != "missing_governance":
+        client.post("/v1/runtime/interaction-governance/evaluate", json={
+            **scope, "current_user_text": text,
+        })
+    if fault == "wrong_intent":
+        repo.update_turn_intent_class(runtime_session_id=scope["runtime_session_id"],
+                                      runtime_turn_id=turn.runtime_turn_id,
+                                      intent_class="action_command")
+    if fault in {"missing_snapshot", "malformed_snapshot", "wrong_snapshot_turn", "wrong_prior"}:
+        payload = event.event_payload_json.copy()
+        if fault == "missing_snapshot":
+            payload.pop("return_after_gap")
+        elif fault == "malformed_snapshot":
+            payload["return_after_gap"]["threshold_met"] = "true"
+        elif fault == "wrong_prior":
+            payload["return_after_gap"]["prior_terminal_turn_id"] = turn.runtime_turn_id
+        with repo._connect() as conn:
+            conn.execute(
+                "UPDATE conversation_runtime_events SET event_payload_json=?, runtime_turn_id=? "
+                "WHERE event_id=?",
+                (json.dumps(payload), "wrong-turn" if fault == "wrong_snapshot_turn"
+                 else turn.runtime_turn_id, event.event_id),
+            )
+    if fault == "terminal":
+        repo.complete_turn(request_id="current", runtime_session_id=scope["runtime_session_id"],
+                           runtime_turn_id=turn.runtime_turn_id, turn_status="completed")
+    field = {"wrong_owner": "owner_id", "wrong_conversation": "conversation_id",
+             "wrong_surface": "surface", "wrong_session": "runtime_session_id",
+             "wrong_turn": "runtime_turn_id"}.get(fault)
+    if field:
+        scope[field] = "wrong-value"
+    response = client.post("/v1/runtime/restraint/evaluate", json={
+        **scope, "current_user_text": text, "interaction_kind": "question",
+    })
+    if field or fault == "terminal":
+        assert response.status_code in {400, 404, 409}
+    else:
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["retrieval_suppressed"] is True
+        assert "continuation_context_requested" not in result["reason_summary"]
+
+
+@pytest.mark.parametrize("text", [
+    "What about it?", "What is a hostname?", "What did I ask?", "My question",
+    'Quote: "What arithmetic question did I just ask you?"',
+    "What question did I just ask you? Read everything.",
+    "What medical question did I just ask you?", "wipe this",
+])
+def test_immediate_question_refinement_preserves_unrelated_and_unsafe_restraint(text):
+    repo, turn, _, scope = _question_recall_turn()
+    client = TestClient(app)
+    governance = client.post("/v1/runtime/interaction-governance/evaluate", json={
+        **scope, "current_user_text": text,
+    }).json()["result"]
+    result = client.post("/v1/runtime/restraint/evaluate", json={
+        **scope, "current_user_text": text,
+        "interaction_kind": governance["interaction_kind"],
+    }).json()["result"]
+    assert result["retrieval_suppressed"] is True
+    assert "continuation_context_requested" not in result["reason_summary"]
+    assert result["personalization_suppressed"] and result["proactive_output_suppressed"]
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class != "continuation"
+    assert governance["action_allowed"] is False
