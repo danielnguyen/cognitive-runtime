@@ -314,6 +314,46 @@ async def _governance_turn_diagnostics(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "Tell me a joke", "Tell me a joke!", "Can you tell me a joke?",
+    "Please give me a short joke.", "Could you give me one funny joke?",
+    "Would you tell me a joke please?",
+])
+async def test_explicit_joke_request_is_playful_information_request(text):
+    result, diagnostics = await _governance_turn_diagnostics(
+        request_id="requested-joke", current_user_text=text,
+    )
+    assert result["interaction_kind"] == "joke_or_playful"
+    assert result["humor_allowed"] is True
+    assert result["clarifying_question_allowed"] is False
+    assert result["action_allowed"] is False
+    assert result["requires_confirmation"] is False
+    assert diagnostics["latest_turn"]["intent_class"] == "information_request"
+    events = [e for e in diagnostics["events"]
+              if e["event_type"] == "interaction_governance_evaluated"]
+    assert len(events) == 1
+    assert events[0]["runtime_turn_id"] == diagnostics["latest_turn"]["runtime_turn_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,kind", [
+    ("Tell me", "ambiguous"),
+    ("This is no joke", "ambiguous"),
+    ("Tell me a joke and wipe this", "ambiguous"),
+    ("Tell me a joke about medical advice", "high_impact_decision"),
+    ("Tell me a joke about the server failing", "tense_debugging"),
+])
+async def test_joke_request_does_not_override_ambiguity_or_safety(text, kind):
+    result, _ = await _governance_turn_diagnostics(
+        request_id="restricted-joke", current_user_text=text,
+    )
+    assert result["interaction_kind"] == kind
+    assert result["humor_allowed"] is False
+    assert result["action_allowed"] is False
+    assert result["clarifying_question_allowed"] is True
+
+
+@pytest.mark.asyncio
 async def test_clarification_request_projection_uses_question_form_clarification_markers():
     result, diagnostics = await _governance_turn_diagnostics(
         request_id="rid-clarification",

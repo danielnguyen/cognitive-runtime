@@ -248,7 +248,15 @@ def _is_failure_report(text: str) -> bool:
 
 
 def _is_playful(text: str) -> bool:
-    return _contains_any(text, _PLAYFUL_MARKERS)
+    return _contains_any(text, _PLAYFUL_MARKERS) or _is_joke_request(text)
+
+
+def _is_joke_request(text: str) -> bool:
+    return re.fullmatch(
+        r"(?:(?:please|can you|could you|would you) )?(?:tell|give) me "
+        r"(?:a|one) (?:(?:short|funny|silly) )?joke(?: please)?",
+        _canonical_turn_text(text),
+    ) is not None
 
 
 def _is_brainstorm(text: str) -> bool:
@@ -376,7 +384,7 @@ def _map_intent_class(
         return "continuation"
     if _is_interruption(text, body):
         return "interruption"
-    if kind == "question":
+    if kind == "question" or (kind == "joke_or_playful" and _is_joke_request(text)):
         return "information_request"
     if kind == "command":
         return "action_command"

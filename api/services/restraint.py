@@ -15,6 +15,7 @@ from services.runtime_state import (
     record_runtime_event,
     resolve_runtime_session,
     runtime_session_by_id,
+    runtime_state_repository,
     sqlite_timing_request,
     update_runtime_turn_restraint_policy,
     validate_runtime_turn_session,
@@ -93,6 +94,10 @@ _GUIDANCE_MARKERS = (
     "taxes",
 )
 _ALL_CAPS_TOKEN = re.compile(r"\b[A-Z]{4,}\b")
+_IMMEDIATE_QUESTION_REQUEST = re.compile(
+    r"(?:what|which)(?: [a-z][a-z-]*){0,3} question did i (?:just|last) ask(?: you)?"
+    r"|what did i just ask(?: you)?"
+)
 
 
 def _normalize_text(text: str) -> str:
@@ -210,6 +215,7 @@ def evaluate_restraint(body: RestraintEvaluateRequest) -> RestraintEvaluateRespo
         runtime_session_id = session.runtime_session_id
 
     continuation_intent = False
+    turn = None
     if body.runtime_turn_id:
         try:
             turn = validate_runtime_turn_session(
@@ -225,17 +231,35 @@ def evaluate_restraint(body: RestraintEvaluateRequest) -> RestraintEvaluateRespo
     text = _normalize_text(raw_text)
     interaction_kind = body.interaction_kind or _infer_interaction_kind(raw_text, text)
 
-    retrieval_requested = _contains_any(text, _RETRIEVAL_REQUEST_MARKERS) or continuation_intent
     personalization_requested = _contains_any(text, _PERSONALIZATION_REQUEST_MARKERS)
     proactive_requested = _contains_any(text, _PROACTIVE_REQUEST_MARKERS)
     required_guidance = _contains_any(text, _GUIDANCE_MARKERS)
+    conversation_context_requested = continuation_intent
+    if (
+        turn is not None
+        and turn.intent_class == "information_request"
+        and interaction_kind == "question"
+        and not required_guidance
+        and _IMMEDIATE_QUESTION_REQUEST.fullmatch(text.rstrip(" .!?")) is not None
+    ):
+        snapshot = runtime_state_repository().return_after_gap_snapshot(
+            runtime_session_id, turn.runtime_turn_id,
+        )
+        conversation_context_requested = (
+            snapshot is not None and snapshot.prior_terminal_turn_id is not None
+        )
+    # This existing purpose marker makes CO narrow retrieval to the conversation;
+    # it does not change the persisted intent or grant owner-wide memory access.
+    retrieval_requested = (
+        _contains_any(text, _RETRIEVAL_REQUEST_MARKERS) or conversation_context_requested
+    )
 
     retrieval_suppressed = not retrieval_requested
     personalization_suppressed = not personalization_requested
     proactive_output_suppressed = not proactive_requested
 
     reason_summary: list[str] = []
-    if continuation_intent:
+    if conversation_context_requested:
         reason_summary.append("continuation_context_requested")
     if retrieval_suppressed:
         reason_summary.append("retrieval_not_requested")
