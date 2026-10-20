@@ -4589,6 +4589,7 @@ class CompanionPolicyCompileResponse(BaseModel):
     scene_source: Literal[
         "requested_scene",
         "runtime_state",
+        "runtime_interaction_mode",
         "general",
         "fallback_general",
     ]
@@ -4739,7 +4740,9 @@ class InterruptEvaluateResponse(BaseModel):
 
 DiagnosticResult = Literal["pass", "warn", "fail"]
 DiagnosticSeverity = Literal["none", "low", "medium", "high"]
-SceneSource = Literal["requested_scene", "runtime_state", "general", "fallback_general"]
+SceneSource = Literal[
+    "requested_scene", "runtime_state", "runtime_interaction_mode", "general", "fallback_general",
+]
 
 
 class ScenePolicyDetail(BaseModel):

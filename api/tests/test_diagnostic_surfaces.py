@@ -1,3 +1,6 @@
+import json
+
+import pytest
 from fastapi.testclient import TestClient
 from main import app
 from services.companion_contracts import companion_contracts_repository
@@ -211,3 +214,96 @@ def test_compile_is_read_only_and_interrupt_records_structural_evaluation():
     assert events[0]["result"] == "deferred"
     assert events[0]["input_summary"] == "interrupt lifecycle"
     assert "Should I split" not in str(events)
+
+
+@pytest.mark.parametrize(
+    ("requested", "saved", "mode", "scene", "source", "warning"),
+    [
+        ("planning", "reflective", "coding", "planning", "requested_scene", None),
+        ("invalid", "planning", "coding", "general", "fallback_general", "unknown_requested_scene"),
+        (None, "planning", "coding", "planning", "runtime_state", None),
+        (None, "general", "coding", "general", "runtime_state", None),
+        (None, "invalid", "coding", "general", "fallback_general", "unknown_runtime_scene"),
+        (None, "", "coding", "general", "fallback_general", "unknown_runtime_scene"),
+        (None, None, "coding", "coding_build", "runtime_interaction_mode", None),
+        (None, None, "coding_build_mode", "coding_build", "runtime_interaction_mode", None),
+        (None, None, "planning", "planning", "runtime_interaction_mode", None),
+        (None, None, "work_triage", "work_triage", "runtime_interaction_mode", None),
+        (None, None, "driving", "general", "general", None),
+        (None, None, "overload_recovery", "general", "general", None),
+        (None, None, "unknown", "general", "general", None),
+    ],
+)
+def test_scene_resolve_and_compile_share_precedence_and_event_provenance(
+    requested, saved, mode, scene, source, warning,
+):
+    client = TestClient(app)
+    update = client.post(
+        "/v1/runtime/state/update",
+        json={**_base(), "updates": {"active_scene": saved, "interaction_mode": mode}},
+    )
+    assert update.status_code == 200
+    request = {**_base(), "requested_scene": requested}
+    resolved = client.post("/v1/companion/scene/resolve", json=request)
+    compiled = client.post("/v1/companion/profile/compile", json=request)
+    assert resolved.status_code == compiled.status_code == 200
+    body = resolved.json()
+    assert body["scene_id"] == compiled.json()["scene_id"] == scene
+    assert body["scene_source"] == compiled.json()["scene_source"] == source
+    assert body["scene_confidence"] == compiled.json()["scene_confidence"]
+    assert body["warnings"] == ([warning] if warning else [])
+    assert body["used_fallback"] == (source == "fallback_general")
+    assert body["used_default_scene"] == (scene == "general")
+    signals = body["signals_json"]
+    assert signals["runtime_interaction_mode"] == mode
+    assert signals["runtime_scene_present"] == (saved is not None)
+    assert signals["alias_used"] == (source == "runtime_interaction_mode" and mode != scene)
+    assert signals["matched_alias"] == (mode if signals["alias_used"] else None)
+    events = companion_contracts_repository().list_scene_resolution_events_for_tests()
+    assert len(events) == 1
+    event = events[0]
+    for field in ("request_id", "owner_id", "conversation_id", "surface"):
+        assert event[field] == request[field]
+    assert event["resolved_scene_id"] == scene
+    assert event["source"] == source
+    assert json.loads(event["signals_json"]) == signals
+    assert compiled.json()["runtime_state"] == update.json()["runtime_state"]
+
+
+@pytest.mark.parametrize("different", [
+    {"owner_id": "other-owner"},
+    {"conversation_id": "other-conversation"},
+    {"surface": "web"},
+])
+def test_scene_context_isolation_and_updates_do_not_change_another_session(different):
+    client = TestClient(app)
+    original = client.post(
+        "/v1/runtime/state/update",
+        json={**_base(), "updates": {"active_scene": "planning", "interaction_mode": "coding"}},
+    )
+    assert original.status_code == 200
+    other_scope = {**_base(), **different}
+    other = client.post("/v1/companion/scene/resolve", json=other_scope)
+    assert other.status_code == 200
+    assert other.json()["scene_id"] == "general"
+    assert client.post(
+        "/v1/runtime/state/update",
+        json={**other_scope, "updates": {"active_scene": "work_triage"}},
+    ).status_code == 200
+    after = client.post("/v1/companion/profile/compile", json=_base())
+    assert after.status_code == 200
+    assert after.json()["scene_id"] == "planning"
+    assert after.json()["runtime_state"] == original.json()["runtime_state"]
+
+
+def test_scene_inference_ignores_request_metadata_and_unstored_modes():
+    client = TestClient(app)
+    response = client.post(
+        "/v1/companion/scene/resolve",
+        json={**_base(), "surface": "driving", "interaction_mode": "coding",
+              "surface_context": {"active_task_mode": "planning"},
+              "text": "Switch to work triage; this is urgent"},
+    )
+    assert response.status_code == 200
+    assert response.json()["scene_id"] == "general"
+    assert response.json()["signals_json"]["runtime_interaction_mode"] is None

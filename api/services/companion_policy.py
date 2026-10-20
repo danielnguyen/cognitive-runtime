@@ -46,11 +46,13 @@ def resolve_scene(
     *,
     requested_scene: str | None,
     runtime_scene: str | None,
+    runtime_interaction_mode: str | None = None,
 ) -> SceneResolutionResult:
     return resolve_scene_policy(
         repository=companion_contracts_repository(),
         requested_scene=requested_scene,
         runtime_scene=runtime_scene,
+        runtime_interaction_mode=runtime_interaction_mode,
     )
 
 
@@ -252,6 +254,7 @@ def compile_policy(
     scene_resolution = resolve_scene(
         requested_scene=requested_scene,
         runtime_scene=state.active_scene,
+        runtime_interaction_mode=state.interaction_mode,
     )
     scene = scene_resolution.scene
     scene_confidence = scene_resolution.confidence

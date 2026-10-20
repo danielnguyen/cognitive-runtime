@@ -1172,6 +1172,7 @@ async def companion_scene_resolve(body: SceneResolveRequest) -> SceneResolveResp
     resolution = resolve_scene(
         requested_scene=body.requested_scene,
         runtime_scene=state.active_scene,
+        runtime_interaction_mode=state.interaction_mode,
     )
     companion_contracts_repository().record_scene_resolution_event(
         request_id=body.request_id,
