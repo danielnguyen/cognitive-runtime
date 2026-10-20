@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
+from asyncio import CancelledError
+from contextvars import ContextVar
 from datetime import UTC, datetime
+from functools import wraps
 from hashlib import sha256
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Any, get_args
 from uuid import uuid4
 
@@ -76,6 +81,278 @@ _CONTINUATION_REASON_ORDER = (
 _RUNTIME_REPOSITORY: RuntimeStateRepository | None = None
 
 
+# Server-only opt-in; no request payload can enable transaction diagnostics.
+_SQLITE_TIMING_LOG = logging.getLogger("uvicorn.error")
+_SQLITE_TIMING_LIMIT = 32
+_SQLITE_TIMING_CONTEXT: ContextVar[_SqliteTimingRequest | None] = ContextVar(
+    "sqlite_timing_request", default=None,
+)
+_SQLITE_TRANSACTION_LABELS = {
+    "runtime_read", "capability_read", "schema_initialization", "session_resolution",
+    "turn_start", "turn_update", "turn_complete", "turn_restraint", "turn_intent",
+    "runtime_event", "challenge_issue", "challenge_resume", "challenge_consume",
+}
+
+
+def _sqlite_timing_log(event: dict[str, Any]) -> None:
+    try:
+        _SQLITE_TIMING_LOG.info("%s", json.dumps(event, separators=(",", ":")))
+    except Exception:
+        # A diagnostic sink must never replace a database result or exception.
+        pass
+
+
+class _SqliteTimingRequest:
+    def __init__(self, request_id: str, operation: str) -> None:
+        # Exact request association without logging arbitrary caller-provided text.
+        self.request_ref = sha256(request_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+        self.operation = operation
+        self.started_ns = perf_counter_ns()
+        self.connections = 0
+        self.emitted = 0
+        self.dropped = 0
+
+    def reserve(self, label: str):
+        if self.connections >= _SQLITE_TIMING_LIMIT:
+            self.dropped += 1
+            return None
+        self.connections += 1
+        return _SqliteConnectionTiming(self, label)
+
+    def emit(self, event: dict[str, Any]) -> None:
+        if self.emitted >= _SQLITE_TIMING_LIMIT:
+            self.dropped += 1
+            return
+        self.emitted += 1
+        _sqlite_timing_log({
+            "event": "sqlite_transaction_timing", "schema_version": 1,
+            "request_ref": self.request_ref, "operation": self.operation, **event,
+        })
+
+
+def sqlite_timing_request(operation: str):
+    """Bound diagnostics to the synchronous service call, including its failure exits."""
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            enabled = os.environ.get("SQLITE_TRANSACTION_TIMING_ENABLED", "").lower()
+            if enabled not in {"1", "true", "yes", "on"} or _SQLITE_TIMING_CONTEXT.get():
+                return function(*args, **kwargs)
+            request_id = kwargs.get("request_id")
+            if request_id is None and args:
+                request_id = getattr(args[0], "request_id", None)
+            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 256:
+                return function(*args, **kwargs)
+            scope = _SqliteTimingRequest(request_id, operation)
+            token = _SQLITE_TIMING_CONTEXT.set(scope)
+            outcome = "success"
+            try:
+                return function(*args, **kwargs)
+            except BaseException as exc:
+                outcome = "cancelled" if isinstance(exc, CancelledError) else "failed"
+                raise
+            finally:
+                _SQLITE_TIMING_CONTEXT.reset(token)
+                _sqlite_timing_log({
+                    "event": "sqlite_transaction_timing_summary", "schema_version": 1,
+                    "request_ref": scope.request_ref, "operation": operation,
+                    "outcome": outcome, "events": scope.emitted, "dropped": scope.dropped,
+                })
+        return wrapped
+    return decorate
+
+
+class _SqliteConnectionTiming:
+    def __init__(self, scope: _SqliteTimingRequest, label: str) -> None:
+        self.scope = scope
+        self.label = label if label in _SQLITE_TRANSACTION_LABELS else "runtime_read"
+        self.index = scope.connections
+        self.started_ns = perf_counter_ns()
+        self.ready_ns = self.started_ns
+        self.connect_started_ns = None
+        self.connected_ns = None
+        self.entered_ns = self.started_ns
+        self.begin_ms = None
+        self.begin_kind = "none"
+        self.implicit_begin_statement_ms = None
+        self.script_work_ms = 0.0
+        self.finished = False
+
+    def finish(self, outcome: str, exit_started: int, **exit_fields) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        end = perf_counter_ns()
+        work_ms = max(0.0, (exit_started - self.entered_ns) / 1e6
+                      - (self.begin_ms or 0.0) - (self.implicit_begin_statement_ms or 0.0))
+        self.scope.emit({
+            "transaction": self.label, "connection_index": self.index,
+            "start_ns": self.started_ns - self.scope.started_ns,
+            "end_ns": end - self.scope.started_ns,
+            "connection_ms": (
+                (self.connected_ns - self.connect_started_ns) / 1e6
+                if self.connect_started_ns is not None else None
+            ),
+            "connection_setup_ms": (
+                (self.ready_ns - self.started_ns) / 1e6
+                - ((self.connected_ns - self.connect_started_ns) / 1e6
+                   if self.connect_started_ns is not None else 0.0)
+            ),
+            "begin_kind": self.begin_kind, "begin_ms": self.begin_ms,
+            "implicit_begin_statement_ms": self.implicit_begin_statement_ms,
+            # Context work includes Python and reads before an implicit BEGIN.
+            "context_work_ms": work_ms, "script_work_ms": self.script_work_ms,
+            "script_may_include_implicit_commits": self.script_work_ms > 0,
+            "outcome": outcome, "commit_ms": None, "rollback_ms": None,
+            "context_exit_ms": None, "exit_may_include_rollback": False, **exit_fields,
+        })
+
+
+class _DiagnosticSqliteConnection(sqlite3.Connection):
+    """Delegate every database operation unchanged; time native boundaries only."""
+    _timing: _SqliteConnectionTiming | None = None
+    _script_depth = 0
+
+    def __enter__(self):
+        result = super().__enter__()
+        if self._timing:
+            self._timing.entered_ns = perf_counter_ns()
+        return result
+
+    def execute(self, sql, parameters=()):
+        timing = self._timing
+        if timing is None or timing.finished:
+            return super().execute(sql, parameters)
+        active = self.in_transaction
+        started = perf_counter_ns()
+        try:
+            return super().execute(sql, parameters)
+        finally:
+            duration = (perf_counter_ns() - started) / 1e6
+            command = (
+                sql.lstrip().split(None, 1)[0].upper()
+                if isinstance(sql, str) and sql.strip() else ""
+            )
+            if command == "BEGIN":
+                timing.begin_ms = duration
+                mode = sql.split()[1].rstrip(";").upper() if len(sql.split()) > 1 else ""
+                timing.begin_kind = {
+                    "IMMEDIATE": "explicit_immediate", "DEFERRED": "explicit_deferred",
+                    "EXCLUSIVE": "explicit_exclusive",
+                }.get(mode, "explicit_deferred")
+            elif not active and self.in_transaction:
+                # sqlite3 performs implicit BEGIN inside the first DML call. Its
+                # acquisition cannot be separated safely from that statement.
+                timing.begin_kind = "implicit_with_first_statement"
+                timing.implicit_begin_statement_ms = duration
+
+    def executescript(self, sql_script):
+        started = perf_counter_ns() if self._timing else None
+        self._script_depth += 1
+        try:
+            return super().executescript(sql_script)
+        finally:
+            self._script_depth -= 1
+            if started is not None:
+                self._timing.script_work_ms += (perf_counter_ns() - started) / 1e6
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        timing = self._timing
+        if timing is None:
+            return super().__exit__(exc_type, exc_value, traceback)
+        active = self.in_transaction
+        started = perf_counter_ns()
+        failed = False
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            elapsed = (perf_counter_ns() - started) / 1e6
+            rollback = exc_type is not None
+            outcome = ("rollback_failed" if rollback else "commit_failed") if failed else (
+                "rolled_back" if rollback and active else "committed" if active
+                else "failed_without_transaction" if rollback
+                else "script_completed" if timing.script_work_ms else "read_only"
+            )
+            timing.finish(
+                outcome, started,
+                commit_ms=elapsed if active and not rollback else None,
+                rollback_ms=elapsed if active and rollback else None,
+                context_exit_ms=elapsed,
+                # Native __exit__ may roll back after a failed commit.
+                exit_may_include_rollback=failed and not rollback,
+            )
+
+    def commit(self):
+        return self._finish_explicit_transaction(False)
+
+    def rollback(self):
+        return self._finish_explicit_transaction(True)
+
+    def _finish_explicit_transaction(self, rollback: bool):
+        # Some supported sqlite3 versions call self.commit() inside executescript.
+        # Keep that native behavior inside the explicitly labeled script interval.
+        if self._script_depth:
+            return super().rollback() if rollback else super().commit()
+        timing = self._timing
+        active = self.in_transaction
+        started = perf_counter_ns() if timing else None
+        failed = False
+        try:
+            return super().rollback() if rollback else super().commit()
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            if timing is not None:
+                elapsed = (perf_counter_ns() - started) / 1e6
+                timing.finish(
+                    ("rollback_failed" if rollback else "commit_failed") if failed
+                    else "no_transaction" if not active
+                    else "rolled_back" if rollback else "committed",
+                    started, commit_ms=elapsed if active and not rollback else None,
+                    rollback_ms=elapsed if active and rollback else None, context_exit_ms=None,
+                    explicit_exit_ms=elapsed,
+                    exit_may_include_rollback=False,
+                )
+
+
+def sqlite_connection(path: Path, *, label: str, timeout: float | None = None,
+                      runtime_pragmas: bool = False) -> sqlite3.Connection:
+    """Keep the existing connection options and native context-manager semantics."""
+    scope = _SQLITE_TIMING_CONTEXT.get()
+    timing = scope.reserve(label) if scope is not None else None
+    options = {} if timeout is None else {"timeout": timeout}
+    if timing is not None:
+        options["factory"] = _DiagnosticSqliteConnection
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if timing is not None:
+            timing.connect_started_ns = perf_counter_ns()
+        conn = sqlite3.connect(path, **options)
+        if timing is not None:
+            timing.connected_ns = perf_counter_ns()
+        conn.row_factory = sqlite3.Row
+        if runtime_pragmas:
+            conn.execute("PRAGMA busy_timeout = 10000;")
+            conn.execute("PRAGMA foreign_keys = ON;")
+    except BaseException:
+        if timing is not None:
+            timing.ready_ns = perf_counter_ns()
+            if timing.connected_ns is None:
+                timing.connected_ns = timing.ready_ns
+            timing.entered_ns = timing.ready_ns
+            timing.finish("connection_failed", timing.ready_ns)
+        raise
+    if timing is not None:
+        timing.ready_ns = perf_counter_ns()
+        timing.entered_ns = timing.ready_ns
+        conn._timing = timing
+    return conn
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -125,16 +402,11 @@ class RuntimeStateRepository:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 10000;")
-        conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
+    def _connect(self, label: str = "runtime_read") -> sqlite3.Connection:
+        return sqlite_connection(self.db_path, label=label, timeout=10.0, runtime_pragmas=True)
 
     def _initialize(self) -> None:
-        with self._connect() as conn:
+        with self._connect("schema_initialization") as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS conversation_runtime_sessions (
@@ -1517,7 +1789,7 @@ class RuntimeStateRepository:
         surface_session_id: str | None = None,
         active_mode: str | None = None,
     ) -> RuntimeSession:
-        with self._connect() as conn:
+        with self._connect("session_resolution") as conn:
             conn.execute("BEGIN IMMEDIATE;")
             self._raise_if_retirement_reserved(
                 conn,
@@ -1678,7 +1950,7 @@ class RuntimeStateRepository:
         continuation_state: str | None = None,
         expected_thread_revision: int | None = None,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
-        with self._connect() as conn:
+        with self._connect("turn_start") as conn:
             conn.execute("BEGIN IMMEDIATE;")
             self._raise_if_retirement_reserved(
                 conn,
@@ -1823,7 +2095,7 @@ class RuntimeStateRepository:
         continuation_state: str | None = None,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         now = _now()
-        with self._connect() as conn:
+        with self._connect("turn_update") as conn:
             conn.execute("BEGIN IMMEDIATE;")
             session = self._session_by_id(conn, runtime_session_id)
             if session is None:
@@ -1895,7 +2167,7 @@ class RuntimeStateRepository:
         continuation_state: str | None = None,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         now = _now()
-        with self._connect() as conn:
+        with self._connect("turn_complete") as conn:
             conn.execute("BEGIN IMMEDIATE;")
             return self._complete_turn_in_transaction(
                 conn,
@@ -2226,7 +2498,7 @@ class RuntimeStateRepository:
         event_type: str,
         event_payload_json: dict[str, Any],
     ) -> RuntimeEvent:
-        with self._connect() as conn:
+        with self._connect("runtime_event") as conn:
             return self._record_event(
                 conn,
                 runtime_session_id=runtime_session_id,
@@ -2243,7 +2515,7 @@ class RuntimeStateRepository:
         intent_class: str,
     ) -> RuntimeTurn:
         now = _now()
-        with self._connect() as conn:
+        with self._connect("turn_intent") as conn:
             conn.execute("BEGIN IMMEDIATE;")
             session = self._session_by_id(conn, runtime_session_id)
             if session is None:
@@ -2276,7 +2548,7 @@ class RuntimeStateRepository:
         restraint_policy: str,
     ) -> RuntimeTurn:
         now = _now()
-        with self._connect() as conn:
+        with self._connect("turn_restraint") as conn:
             conn.execute("BEGIN IMMEDIATE;")
             session = self._session_by_id(conn, runtime_session_id)
             if session is None:
@@ -2764,6 +3036,7 @@ def reset_state(*, owner_id: str, conversation_id: str, surface: str) -> Runtime
     )
 
 
+@sqlite_timing_request("POST /v1/runtime/turns/start")
 def start_turn(
     *,
     request_id: str,
@@ -2795,6 +3068,7 @@ def start_turn(
     )
 
 
+@sqlite_timing_request("POST /v1/runtime/turns/update")
 def update_turn(
     *,
     request_id: str,
@@ -2816,6 +3090,7 @@ def update_turn(
     )
 
 
+@sqlite_timing_request("POST /v1/runtime/turns/complete")
 def complete_turn(
     *,
     request_id: str,

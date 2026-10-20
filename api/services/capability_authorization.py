@@ -53,6 +53,8 @@ from services.runtime_state import (
     record_runtime_event,
     runtime_session_by_id,
     runtime_state_db_path,
+    sqlite_connection,
+    sqlite_timing_request,
     validate_runtime_turn_session,
 )
 from services.world_state import (
@@ -484,14 +486,11 @@ class CapabilityAuthorizationRepository:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _connect(self, label: str = "capability_read") -> sqlite3.Connection:
+        return sqlite_connection(self.db_path, label=label)
 
     def _initialize(self) -> None:
-        with self._connect() as conn:
+        with self._connect("schema_initialization") as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS capability_confirmation_challenges (
@@ -1055,7 +1054,7 @@ class CapabilityAuthorizationRepository:
                 f"{body.argument_digest}:{issued_at}"
             ),
         )
-        with self._connect() as conn:
+        with self._connect("challenge_issue") as conn:
             conn.execute(
                 """
                 INSERT INTO capability_confirmation_challenges (
@@ -1107,7 +1106,7 @@ class CapabilityAuthorizationRepository:
         assert body.confirmation_challenge_ref is not None
         if not body.runtime_turn_id:
             return ["confirmation_turn_not_current"], None
-        with self._connect() as conn:
+        with self._connect("challenge_resume") as conn:
             row = self._challenge_row(
                 conn,
                 body.owner_id,
@@ -1139,7 +1138,7 @@ class CapabilityAuthorizationRepository:
         if not body.confirmation_challenge_ref:
             return ["challenge_missing"]
         now = _now()
-        conn = self._connect()
+        conn = self._connect("challenge_consume")
         try:
             conn.execute("BEGIN IMMEDIATE;")
             row = self._challenge_row(conn, body.owner_id, body.confirmation_challenge_ref)
@@ -1948,6 +1947,7 @@ def compose_action_summary(body: ActionSummaryRequest) -> ActionSummaryResponse:
     )
 
 
+@sqlite_timing_request("POST /v1/capabilities/authorize")
 def authorize_capability(body: CapabilityAuthorizationRequest) -> CapabilityAuthorizationResponse:
     return capability_authorization_repository().authorize(body)
 
