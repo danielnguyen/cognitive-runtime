@@ -16,6 +16,7 @@ from services.runtime_state import (
     resolve_runtime_session,
     runtime_session_by_id,
     runtime_state_repository,
+    sqlite_timing_request,
     update_runtime_turn_intent_class,
 )
 
@@ -617,6 +618,7 @@ def _classify(body: InteractionGovernanceEvaluateRequest) -> InteractionGovernan
     )
 
 
+@sqlite_timing_request("POST /v1/runtime/interaction-governance/evaluate")
 def evaluate_interaction_governance(
     body: InteractionGovernanceEvaluateRequest,
 ) -> InteractionGovernanceEvaluateResponse:

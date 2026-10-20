@@ -16,6 +16,7 @@ from services.runtime_state import (
     resolve_runtime_session,
     runtime_session_by_id,
     runtime_state_repository,
+    sqlite_timing_request,
     update_runtime_turn_restraint_policy,
     validate_runtime_turn_session,
 )
@@ -191,6 +192,7 @@ def _result(
     )
 
 
+@sqlite_timing_request("POST /v1/runtime/restraint/evaluate")
 def evaluate_restraint(body: RestraintEvaluateRequest) -> RestraintEvaluateResponse:
     runtime_session_id = body.runtime_session_id
     if runtime_session_id:

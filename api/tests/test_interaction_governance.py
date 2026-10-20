@@ -1469,3 +1469,36 @@ async def test_client_history_without_admitted_turn_cannot_authorize_interruptio
     )).json()
     assert diagnostics["latest_turn"] is None
     assert response.json()["result"]["action_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_sqlite_timing_governance_keeps_two_durable_transactions(monkeypatch, caplog):
+    import json
+    from hashlib import sha256
+
+    monkeypatch.delenv("SQLITE_TRANSACTION_TIMING_ENABLED", raising=False)
+    admitted = await _post("/v1/runtime/turns/start", {
+        k: v for k, v in _base().items() if k != "recent_messages"
+    })
+    session = admitted.json()["runtime_session"]["runtime_session_id"]
+    turn = admitted.json()["runtime_turn"]["runtime_turn_id"]
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    response = await _post("/v1/runtime/interaction-governance/evaluate", _base(
+        request_id="timed-governance", runtime_session_id=session, runtime_turn_id=turn,
+        current_user_text="What does this function do?",
+    ))
+    assert response.status_code == 200
+    events = [json.loads(r.getMessage()) for r in caplog.records
+              if r.name == "uvicorn.error" and r.getMessage().startswith('{"event":"sqlite_')]
+    writes = [e for e in events if e.get("outcome") == "committed"]
+    assert [e["transaction"] for e in writes] == ["turn_intent", "runtime_event"]
+    assert writes[0]["end_ns"] <= writes[1]["start_ns"]
+    assert writes[0]["begin_kind"] == "explicit_immediate"
+    assert writes[1]["begin_kind"] == "implicit_with_first_statement"
+    assert all(e["request_ref"] == sha256(b"timed-governance").hexdigest() for e in events)
+    assert all(e["operation"] == "POST /v1/runtime/interaction-governance/evaluate" for e in events)
+    diagnostics = runtime_state_repository().diagnostics(session)
+    assert diagnostics.latest_turn.intent_class == "information_request"
+    assert sum(e.event_type == "interaction_governance_evaluated" for e in diagnostics.events) == 1
+    assert "What does this function do?" not in json.dumps(events)
