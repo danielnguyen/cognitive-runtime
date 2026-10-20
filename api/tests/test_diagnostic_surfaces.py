@@ -1,4 +1,6 @@
 import json
+import os
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -307,3 +309,128 @@ def test_scene_inference_ignores_request_metadata_and_unstored_modes():
     assert response.status_code == 200
     assert response.json()["scene_id"] == "general"
     assert response.json()["signals_json"]["runtime_interaction_mode"] is None
+
+
+_SCENE_ENDPOINTS = (
+    "/v1/companion/scene/resolve",
+    "/v1/companion/profile/compile",
+    "/v1/companion/policy/compile",
+)
+
+
+def _bound_scene_request(client):
+    started = client.post("/v1/runtime/turns/start", json=_base())
+    assert started.status_code == 200
+    return {
+        **_base(),
+        "runtime_session_id": started.json()["runtime_session"]["runtime_session_id"],
+        "runtime_turn_id": started.json()["runtime_turn"]["runtime_turn_id"],
+    }
+
+
+def _scene_storage_snapshot():
+    snapshots = []
+    for variable in ("COGNITIVE_RUNTIME_DB_PATH", "COMPANION_CONTRACTS_DB_PATH"):
+        with sqlite3.connect(os.environ[variable]) as conn:
+            snapshots.append(tuple(conn.iterdump()))
+    return snapshots
+
+
+@pytest.mark.parametrize("endpoint", _SCENE_ENDPOINTS)
+@pytest.mark.parametrize("binding", [
+    {"runtime_session_id": "session-only"},
+    {"runtime_turn_id": "turn-only"},
+    {"runtime_session_id": "", "runtime_turn_id": "turn"},
+    {"runtime_session_id": "session", "runtime_turn_id": None},
+    {"runtime_session_id": None, "runtime_turn_id": None},
+    {"runtime_session_id": 123, "runtime_turn_id": "turn"},
+    {"runtime_session_id": "session", "runtime_turn_id": "x" * 121},
+])
+def test_scene_apis_reject_incomplete_or_malformed_binding_without_writes(endpoint, binding):
+    before = _scene_storage_snapshot()
+    response = TestClient(app).post(endpoint, json={**_base(), **binding})
+    assert response.status_code == 422
+    assert _scene_storage_snapshot() == before
+
+
+@pytest.mark.parametrize("endpoint", _SCENE_ENDPOINTS)
+@pytest.mark.parametrize("field", [
+    "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id", "runtime_turn_id",
+])
+def test_bound_scene_apis_reject_mismatches_without_writes(endpoint, field):
+    client = TestClient(app)
+    request = _bound_scene_request(client)
+    before = _scene_storage_snapshot()
+    response = client.post(endpoint, json={**request, field: "wrong-context"})
+    assert response.status_code in {400, 404, 409}
+    assert "scene_id" not in response.json()
+    assert "runtime_state" not in response.json()
+    assert _scene_storage_snapshot() == before
+
+
+@pytest.mark.parametrize("endpoint", _SCENE_ENDPOINTS)
+@pytest.mark.parametrize("status", ["completed", "abandoned"])
+def test_bound_scene_apis_reject_terminal_turns_and_do_not_fall_back(endpoint, status):
+    client = TestClient(app)
+    request = _bound_scene_request(client)
+    assert client.post("/v1/runtime/turns/complete", json={
+        "request_id": "finish-scene", "runtime_session_id": request["runtime_session_id"],
+        "runtime_turn_id": request["runtime_turn_id"], "turn_status": status,
+    }).status_code == 200
+    before = _scene_storage_snapshot()
+    response = client.post(endpoint, json=request)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "runtime_turn_not_current"}
+    assert _scene_storage_snapshot() == before
+    # Legacy state-only compilation remains available after completion.
+    assert client.post(endpoint, json=_base()).status_code == 200
+
+
+@pytest.mark.parametrize("endpoint", _SCENE_ENDPOINTS)
+def test_bound_scene_apis_do_not_bootstrap_missing_context(endpoint):
+    before = _scene_storage_snapshot()
+    response = TestClient(app).post(endpoint, json={
+        **_base(), "runtime_session_id": "fabricated-session", "runtime_turn_id": "fabricated-turn",
+    })
+    assert response.status_code == 404
+    assert _scene_storage_snapshot() == before
+
+
+def test_bound_scene_resolution_records_only_its_existing_event_and_is_repeatable():
+    client = TestClient(app)
+    request = _bound_scene_request(client)
+    assert client.post("/v1/runtime/state/update", json={
+        **_base(), "updates": {"interaction_mode": "coding"},
+    }).status_code == 200
+    with sqlite3.connect(os.environ["COGNITIVE_RUNTIME_DB_PATH"]) as conn:
+        before = tuple(conn.iterdump())
+    first = client.post("/v1/companion/scene/resolve", json=request)
+    repeat = client.post("/v1/companion/scene/resolve", json=request)
+    assert first.status_code == repeat.status_code == 200
+    assert first.json() == repeat.json()
+    assert first.json()["scene_source"] == "runtime_interaction_mode"
+    events = companion_contracts_repository().list_scene_resolution_events_for_tests()
+    # Preserve legacy one-event-per-call semantics, not replay deduplication.
+    assert len(events) == 2
+    assert all(e["request_id"] == request["request_id"] for e in events)
+    assert all(e["resolved_scene_id"] == "coding_build" for e in events)
+    with sqlite3.connect(os.environ["COGNITIVE_RUNTIME_DB_PATH"]) as conn:
+        assert tuple(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("endpoint", _SCENE_ENDPOINTS)
+def test_bound_scene_apis_bound_storage_failures_are_safe(monkeypatch, endpoint):
+    from services.runtime_state import runtime_state_repository
+
+    client = TestClient(app)
+    request = _bound_scene_request(client)
+    before = _scene_storage_snapshot()
+
+    def unavailable():
+        raise sqlite3.OperationalError("private-storage-diagnostic")
+
+    monkeypatch.setattr(runtime_state_repository(), "_connect", unavailable)
+    response = client.post(endpoint, json=request)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _scene_storage_snapshot() == before

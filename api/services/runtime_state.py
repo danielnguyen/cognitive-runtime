@@ -5,13 +5,14 @@ import logging
 import os
 import sqlite3
 from asyncio import CancelledError
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from functools import wraps
 from hashlib import sha256
 from pathlib import Path
 from time import perf_counter_ns
-from typing import Any, get_args
+from typing import Any, Iterator, get_args
 from uuid import uuid4
 
 from models import (
@@ -1854,6 +1855,65 @@ class RuntimeStateRepository:
             )
             return self.runtime_state_by_session_id(session.runtime_session_id)
         return self._runtime_state_from_row(row)
+
+    @contextmanager
+    def current_turn_state(
+        self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
+        runtime_session_id: str, runtime_turn_id: str,
+    ) -> Iterator[RuntimeState]:
+        """Keep an admitted request current through its consumer's decision.
+
+        This read must not bootstrap a session or repair an inconsistent thread.
+        The existing transaction lock serializes lifecycle/state writes until the
+        consumer has compiled its response and recorded any existing scene event.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            session = self._session_by_id(conn, runtime_session_id)
+            if session is None:
+                raise RuntimeError("runtime_session_not_found")
+            if (session.owner_id, session.conversation_id, session.surface) != (
+                owner_id, conversation_id, surface,
+            ) or session.status != "active" or session.closed_at is not None:
+                raise RuntimeError("runtime_session_mismatch")
+            turn = self._turn_by_id(conn, runtime_turn_id)
+            if turn is None:
+                raise RuntimeError("runtime_turn_not_found")
+            if turn.runtime_session_id != runtime_session_id:
+                raise RuntimeError("runtime_turn_session_mismatch")
+            if turn.turn_status in _TERMINAL_TURN_STATUSES or turn.completed_at is not None:
+                raise RuntimeError("runtime_turn_not_current")
+            inspection = self._inspect_continuation_thread(
+                conn, owner_id=owner_id, conversation_id=conversation_id,
+            )
+            if inspection["state"] == "contended":
+                raise RuntimeError("runtime_thread_contended")
+            if inspection["state"] == "missing":
+                raise RuntimeError("runtime_turn_not_current")
+            if inspection["state"] not in {"active", "idle"}:
+                raise RuntimeError("runtime_thread_unavailable")
+            # Read-only inspection proved the thread exists and is consistent.
+            thread = self._validate_current_turn(conn, session=session, turn=turn)
+            if thread["active_request_id"] != request_id:
+                raise RuntimeError("runtime_turn_not_current")
+            started = conn.execute(
+                """SELECT * FROM conversation_runtime_events
+                   WHERE runtime_turn_id = ? AND event_type = 'turn_started';""",
+                (runtime_turn_id,),
+            ).fetchall()
+            if (
+                len(started) != 1
+                or started[0]["runtime_session_id"] != runtime_session_id
+                or self._event_from_row(started[0]).event_payload_json.get("request_id")
+                != request_id
+            ):
+                raise RuntimeError("runtime_turn_not_current")
+            row = conn.execute(
+                "SELECT * FROM conversation_runtime_sessions WHERE runtime_session_id = ?;",
+                (runtime_session_id,),
+            ).fetchone()
+            assert row is not None
+            yield self._runtime_state_from_row(row)
 
     def runtime_state_by_session_id(self, runtime_session_id: str) -> RuntimeState:
         with self._connect() as conn:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from hashlib import sha256
 from json import JSONDecodeError
+from typing import Iterator
 
 from models import (
+    CompanionPolicyCompileRequest,
     CompanionPolicyOverlay,
     InteractionContract,
     InteractionContractTrace,
@@ -18,6 +21,7 @@ from services.companion_contracts import (
     companion_contracts_repository,
     compiled_default_interaction_contract,
 )
+from services.runtime_state import resolve_state, runtime_state_repository
 from services.scene_resolution import SceneResolutionResult, resolve_scene_policy
 
 _KNOWN_SURFACES = {
@@ -243,6 +247,22 @@ def resolve_interaction_contract(
         requested_scene=requested_scene, runtime_state=runtime_state,
     )
     return contract, trace
+
+
+@contextmanager
+def companion_policy_state(request: CompanionPolicyCompileRequest) -> Iterator[RuntimeState]:
+    if request.runtime_session_id is None:
+        yield resolve_state(
+            owner_id=request.owner_id, conversation_id=request.conversation_id,
+            surface=request.surface,
+        )
+    else:
+        with runtime_state_repository().current_turn_state(
+            request_id=request.request_id, owner_id=request.owner_id,
+            conversation_id=request.conversation_id, surface=request.surface,
+            runtime_session_id=request.runtime_session_id, runtime_turn_id=request.runtime_turn_id,
+        ) as state:
+            yield state
 
 
 def compile_policy(
