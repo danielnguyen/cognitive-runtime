@@ -6799,3 +6799,394 @@ def test_current_turn_state_releases_guard_on_failure_or_cancellation(tmp_path, 
             raise error
     assert _runtime_rows(db_path) == before
     repo.complete_turn(request_id="finish", **binding, turn_status="completed")
+
+
+def _pause_scope(tmp_path, **turn_fields):
+    db_path = _use_database(tmp_path, "surface-pause.sqlite3")
+    repo = RuntimeStateRepository(db_path)
+    scope = dict(request_id="pause-request", owner_id="owner-pause",
+                 conversation_id="conversation-pause", surface="web")
+    session, turn, _ = repo.start_turn(**scope, **turn_fields)
+    completion = dict(
+        request_id=scope["request_id"], runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id, turn_status="completed", session_transition="pause",
+    )
+    return db_path, repo, scope, completion
+
+
+@pytest.mark.parametrize("continuation", [None, "waiting", "deferred_expansion"])
+def test_explicit_pause_atomically_completes_turn_and_preserves_continuation(
+    tmp_path, continuation,
+):
+    _, repo, scope, completion = _pause_scope(tmp_path, continuation_state=continuation)
+    before = repo.diagnostics(completion["runtime_session_id"])
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runtime_session"] == {
+        **before.runtime_session.model_dump(), "status": "paused",
+        "last_activity_at": body["runtime_turn"]["completed_at"],
+    }
+    assert body["runtime_turn"]["turn_status"] == "completed"
+    assert body["runtime_turn"]["continuation_state"] == continuation
+    assert body["event"]["event_payload_json"] == {
+        "request_id": scope["request_id"], "turn_status": "completed",
+        "continuation_state": continuation, "session_transition": "pause",
+    }
+    thread = repo.resolve_thread(
+        owner_id=scope["owner_id"], conversation_id=scope["conversation_id"],
+    )
+    assert thread.state == "idle" and thread.revision == 2
+    assert thread.active_runtime_session_id is thread.active_runtime_turn_id is None
+    assert thread.active_surface is None
+    assert repo.diagnostics(completion["runtime_session_id"]).active_turn is None
+    assert len([e for e in repo.list_events_for_tests(completion["runtime_session_id"])
+                if e.event_type == "turn_completed"]) == 1
+
+
+@pytest.mark.parametrize("transition", ["omitted", None])
+def test_timing_wait_and_default_completion_do_not_pause_session(tmp_path, transition):
+    _, repo, _, completion = _pause_scope(tmp_path, timing_policy="pause_or_wait")
+    if transition == "omitted":
+        completion.pop("session_transition")
+    else:
+        completion["session_transition"] = transition
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runtime_session"]["status"] == "active"
+    assert body["runtime_turn"]["timing_policy"] == "pause_or_wait"
+    assert body["event"]["event_payload_json"] == {
+        "request_id": completion["request_id"], "turn_status": "completed",
+        "continuation_state": None,
+    }
+    assert "resumed_from_pause" not in repo.list_events_for_tests(
+        completion["runtime_session_id"],
+    )[1].event_payload_json
+
+
+def test_pause_completion_replay_is_idempotent_without_duplicate_events(tmp_path):
+    db_path, repo, _, completion = _pause_scope(tmp_path, continuation_state="deferred_expansion")
+    client = TestClient(app)
+    first = client.post("/v1/runtime/turns/complete", json=completion)
+    before = _runtime_rows(db_path)
+    retry = client.post("/v1/runtime/turns/complete", json=completion)
+    assert first.status_code == retry.status_code == 200
+    assert first.json() == retry.json()
+    assert _runtime_rows(db_path) == before
+    assert repo.session_by_id(completion["runtime_session_id"]).status == "paused"
+
+
+@pytest.mark.parametrize("changes", [
+    {"session_transition": None}, {"request_id": "another-request"},
+    {"turn_status": "abandoned"}, {"continuation_state": "waiting"},
+])
+def test_conflicting_pause_replays_cannot_change_state(tmp_path, changes):
+    db_path, repo, _, completion = _pause_scope(tmp_path)
+    repo.complete_turn(**completion)
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json={**completion, **changes})
+    assert response.status_code in {400, 409, 422}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("next_outcome", ["active", "completed", "paused"])
+def test_delayed_pause_replay_never_repauses_resumed_session(tmp_path, next_outcome):
+    db_path, repo, scope, completion = _pause_scope(tmp_path)
+    repo.complete_turn(**completion)
+    session, turn, _ = repo.start_turn(**{**scope, "request_id": "next-request"})
+    if next_outcome != "active":
+        repo.complete_turn(
+            request_id="next-request", runtime_session_id=session.runtime_session_id,
+            runtime_turn_id=turn.runtime_turn_id, turn_status="completed",
+            session_transition="pause" if next_outcome == "paused" else None,
+        )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code == 409
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("terminal", ["completed", "abandoned"])
+def test_terminal_turn_cannot_be_converted_into_pause(tmp_path, terminal):
+    db_path, repo, _, completion = _pause_scope(tmp_path)
+    repo.complete_turn(**{**completion, "session_transition": None, "turn_status": terminal})
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code == 409
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("changes", [
+    {"request_id": "wrong-request"}, {"runtime_session_id": "missing-session"},
+    {"runtime_turn_id": "missing-turn"}, {"continuation_state": "different"},
+    {"runtime_session_id": "foreign-session"}, {"runtime_turn_id": "foreign-turn"},
+])
+def test_pause_rejects_wrong_context_without_mutation(tmp_path, changes):
+    db_path, repo, _, completion = _pause_scope(tmp_path)
+    session, turn, _ = repo.start_turn(
+        request_id="foreign-request", owner_id="other-owner",
+        conversation_id="other-conversation", surface="alexa",
+    )
+    changes = dict(changes)
+    if changes.get("runtime_session_id") == "foreign-session":
+        changes["runtime_session_id"] = session.runtime_session_id
+    if changes.get("runtime_turn_id") == "foreign-turn":
+        changes["runtime_turn_id"] = turn.runtime_turn_id
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json={**completion, **changes})
+    assert response.status_code in {400, 404, 409}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("fault", [
+    "missing_start", "duplicate_start", "malformed_start", "wrong_start_request",
+    "wrong_start_session", "wrong_thread_request", "missing_thread", "contended_thread",
+    "closed_session", "wrong_start_input", "wrong_start_status",
+])
+def test_pause_requires_intact_original_admission_provenance(tmp_path, fault):
+    db_path, repo, _, completion = _pause_scope(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        if fault == "missing_start":
+            conn.execute(
+                "DELETE FROM conversation_runtime_events WHERE event_type = 'turn_started'",
+            )
+        elif fault == "duplicate_start":
+            repo._record_event(
+                conn, runtime_session_id=completion["runtime_session_id"],
+                runtime_turn_id=completion["runtime_turn_id"], event_type="turn_started",
+                event_payload_json={"request_id": completion["request_id"]},
+            )
+        elif fault in {"malformed_start", "wrong_start_request"}:
+            conn.execute(
+                "UPDATE conversation_runtime_events SET event_payload_json = ? "
+                "WHERE event_type = 'turn_started'",
+                ("not-json" if fault == "malformed_start" else '{"request_id":"wrong"}',),
+            )
+        elif fault == "wrong_start_session":
+            conn.execute("UPDATE conversation_runtime_events SET runtime_session_id = 'wrong' "
+                         "WHERE event_type = 'turn_started'")
+        elif fault in {"wrong_start_input", "wrong_start_status"}:
+            payload = dict(request_id=completion["request_id"], turn_status="received",
+                           input_message_id=None)
+            payload["input_message_id" if fault == "wrong_start_input" else "turn_status"] = "wrong"
+            conn.execute("UPDATE conversation_runtime_events SET event_payload_json = ? "
+                         "WHERE event_type = 'turn_started'", (json.dumps(payload),))
+        elif fault == "wrong_thread_request":
+            conn.execute("UPDATE conversation_runtime_threads SET active_request_id = 'wrong'")
+        elif fault == "missing_thread":
+            conn.execute("DELETE FROM conversation_runtime_threads")
+        elif fault == "contended_thread":
+            conn.execute("UPDATE conversation_runtime_threads SET state = 'contended'")
+        else:
+            conn.execute("UPDATE conversation_runtime_sessions SET status = 'closed', "
+                         "closed_at = last_activity_at")
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code in {409, 503}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("transition", ["resume", "", True, 1, [], {}, "pause "])
+def test_pause_transition_rejects_malformed_values(tmp_path, transition):
+    db_path, _, _, completion = _pause_scope(tmp_path)
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post(
+        "/v1/runtime/turns/complete", json={**completion, "session_transition": transition},
+    )
+    assert response.status_code == 422
+    assert _runtime_rows(db_path) == before
+
+
+def test_abandonment_cannot_request_pause_in_http_or_repository(tmp_path):
+    db_path, repo, _, completion = _pause_scope(tmp_path)
+    before = _runtime_rows(db_path)
+    invalid = {**completion, "turn_status": "abandoned"}
+    assert TestClient(app).post("/v1/runtime/turns/complete", json=invalid).status_code == 422
+    with pytest.raises(RuntimeError, match="runtime_session_transition_invalid"):
+        repo.complete_turn(**invalid)
+    with pytest.raises(RuntimeError, match="runtime_session_transition_invalid"):
+        repo.complete_turn(**{**completion, "session_transition": "resume"})
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("intent,message", [
+    ("information_request", "ordinary-question"), ("continuation", "continue-request"),
+])
+def test_new_authorized_turn_automatically_resumes_with_same_admission_semantics(
+    tmp_path, intent, message,
+):
+    db_path, repo, scope, completion = _pause_scope(tmp_path)
+    repo.complete_turn(**completion)
+    request = {**scope, "request_id": "next-request", "intent_class": intent,
+               "input_message_id": message, "expected_thread_revision": 2}
+    client = TestClient(app)
+    response = client.post("/v1/runtime/turns/start", json=request)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runtime_session"]["runtime_session_id"] == completion["runtime_session_id"]
+    assert body["runtime_session"]["status"] == "active"
+    assert body["runtime_turn"]["runtime_turn_id"] != completion["runtime_turn_id"]
+    assert body["runtime_turn"]["turn_status"] == "received"
+    assert body["event"]["event_payload_json"]["resumed_from_pause"] is True
+    assert repo.turn_by_id(completion["runtime_turn_id"]).turn_status == "completed"
+    before = _runtime_rows(db_path)
+    assert client.post("/v1/runtime/turns/start", json=request).json() == body
+    assert _runtime_rows(db_path) == before
+    assert repo.resolve_thread(owner_id=scope["owner_id"],
+                               conversation_id=scope["conversation_id"]).revision == 3
+
+
+@pytest.mark.parametrize("obstacle", ["stale_revision", "competing_turn"])
+def test_rejected_admission_cannot_resume_paused_surface(tmp_path, obstacle):
+    db_path, repo, scope, completion = _pause_scope(tmp_path)
+    repo.complete_turn(**completion)
+    request = {**scope, "request_id": "new-request", "expected_thread_revision": 1}
+    if obstacle == "competing_turn":
+        repo.start_turn(**{**scope, "request_id": "other-request", "surface": "alexa"})
+        request["expected_thread_revision"] = 3
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/start", json=request)
+    assert response.status_code == 409
+    assert _runtime_rows(db_path) == before
+    assert repo.session_by_id(completion["runtime_session_id"]).status == "paused"
+
+
+def test_pause_survives_restart_and_other_surface_continuation_without_replay(tmp_path):
+    db_path, repo, scope, completion = _pause_scope(tmp_path)
+    other = repo.resolve_session(**{**scope, "request_id": "other-session", "surface": "alexa"})
+    repo.complete_turn(**completion)
+    paused = repo.session_by_id(completion["runtime_session_id"])
+    assert repo.session_by_id(other.runtime_session_id) == other
+    before = _runtime_rows(db_path)
+    reopened = RuntimeStateRepository(db_path)
+    assert reopened.reconcile_interrupted_turns(request_id="restart") == 0
+    assert _runtime_rows(db_path) == before
+    assert reopened.session_by_id(paused.runtime_session_id) == paused
+    session, turn, event = reopened.start_turn(
+        **{**scope, "request_id": "other-turn", "surface": "alexa"}, expected_thread_revision=2,
+    )
+    assert session.runtime_session_id == other.runtime_session_id
+    assert "resumed_from_pause" not in event.event_payload_json
+    assert reopened.session_by_id(paused.runtime_session_id) == paused
+    active = _runtime_rows(db_path)
+    assert TestClient(app).post("/v1/runtime/turns/complete", json=completion).status_code == 200
+    assert _runtime_rows(db_path) == active  # Replay cannot change the other surface's turn.
+    assert reopened.reconcile_interrupted_turns(request_id="second-restart") == 1
+    assert reopened.turn_by_id(turn.runtime_turn_id).turn_status == "abandoned"
+    assert reopened.session_by_id(paused.runtime_session_id) == paused
+    resumed, fresh, event = reopened.start_turn(
+        **{**scope, "request_id": "fresh-request"}, expected_thread_revision=4,
+    )
+    assert resumed.status == "active" and resumed.runtime_session_id == paused.runtime_session_id
+    assert fresh.runtime_turn_id != completion["runtime_turn_id"]
+    assert event.event_payload_json["resumed_from_pause"] is True
+    with sqlite3.connect(db_path) as conn:
+        # Lifecycle transitions do not even initialize the action authority store.
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'capability_confirmation_challenges'",
+        ).fetchone() is None
+    assert all(e.event_type in {"session_resolved", "turn_started", "turn_completed"}
+               for e in reopened.list_events_for_tests(paused.runtime_session_id))
+
+
+@pytest.mark.parametrize("operation", ["pause", "resume"])
+@pytest.mark.parametrize("error", [
+    sqlite3.OperationalError("private disk failure"), CancelledError(),
+])
+def test_pause_and_resume_event_failure_rolls_back_whole_transaction(
+    tmp_path, monkeypatch, operation, error,
+):
+    db_path, repo, scope, completion = _pause_scope(tmp_path)
+    if operation == "resume":
+        repo.complete_turn(**completion)
+    before = _runtime_rows(db_path)
+
+    def fail_event(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(repo, "_record_event", fail_event)
+    with pytest.raises(type(error)):
+        if operation == "pause":
+            repo.complete_turn(**completion)
+        else:
+            repo.start_turn(**{**scope, "request_id": "resume-request"})
+    assert _runtime_rows(db_path) == before
+
+
+def test_pause_thread_release_failure_is_atomic_and_http_error_is_bounded(tmp_path):
+    db_path, _, _, completion = _pause_scope(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TRIGGER reject_release BEFORE UPDATE ON conversation_runtime_threads "
+            "WHEN NEW.state = 'idle' BEGIN SELECT RAISE(ABORT, 'private disk failure'); END",
+        )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _runtime_rows(db_path) == before
+
+
+def test_concurrent_resume_admits_one_turn_and_records_one_resume(tmp_path):
+    db_path, repo, scope, completion = _pause_scope(tmp_path)
+    repo.complete_turn(**completion)
+    barrier = threading.Barrier(2)
+
+    def admit(index):
+        independent = RuntimeStateRepository(db_path)
+        barrier.wait()
+        try:
+            return independent.start_turn(
+                **{**scope, "request_id": f"resume-{index}"}, expected_thread_revision=2,
+            )
+        except RuntimeError as error:
+            return str(error)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(admit, range(2)))
+    assert sum(isinstance(result, tuple) for result in results) == 1
+    assert results.count("runtime_thread_contended") == 1
+    events = repo.list_events_for_tests(completion["runtime_session_id"])
+    assert sum(e.event_payload_json.get("resumed_from_pause") is True for e in events) == 1
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM conversation_runtime_turns WHERE completed_at IS NULL",
+        ).fetchone()[0] == 1
+
+
+def test_automatic_resume_preserves_independent_attention_and_runtime_state(tmp_path):
+    db_path, repo, scope, completion = _pause_scope(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE conversation_runtime_sessions SET attention_state = 'paused', "
+            "attention_focus_json = ?, active_scene = 'planning', interaction_mode = 'coding', "
+            "temporary_constraints_json = ?",
+            (json.dumps({"status": "paused"}), json.dumps(["do_not_personalize"])),
+        )
+    state = repo.resolve_state(**{k: scope[k] for k in ["owner_id", "conversation_id", "surface"]})
+    repo.complete_turn(**completion)
+    session, _, _ = repo.start_turn(**{**scope, "request_id": "new-question"})
+    assert session.status == "active" and session.attention_state == "paused"
+    resumed_state = repo.runtime_state_by_session_id(session.runtime_session_id)
+    assert resumed_state.model_dump(exclude={"updated_at"}) == state.model_dump(
+        exclude={"updated_at"},
+    )
+    assert resumed_state.updated_at >= state.updated_at
+
+
+@pytest.mark.parametrize("request_id", ["", " "])
+def test_pause_requires_nonblank_original_request(tmp_path, request_id):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    session, turn, _ = repo.start_turn(
+        request_id=request_id, owner_id="owner", conversation_id="conversation", surface="web",
+    )
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json={
+        "request_id": request_id, "runtime_session_id": session.runtime_session_id,
+        "runtime_turn_id": turn.runtime_turn_id, "session_transition": "pause",
+    })
+    assert response.status_code == 409
+    assert _runtime_rows(db_path) == before

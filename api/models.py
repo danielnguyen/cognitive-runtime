@@ -891,6 +891,13 @@ class RuntimeTurnCompleteRequest(BaseModel):
     runtime_turn_id: str = Field(max_length=120)
     turn_status: Literal["completed", "abandoned"] = "completed"
     continuation_state: str | None = Field(default=None, max_length=64)
+    session_transition: Literal["pause"] | None = None
+
+    @model_validator(mode="after")
+    def validate_pause_completion(self) -> "RuntimeTurnCompleteRequest":
+        if self.session_transition == "pause" and self.turn_status != "completed":
+            raise ValueError("pause_requires_completed_turn")
+        return self
 
 
 class RuntimeTurnsReconcileRequest(BaseModel):
