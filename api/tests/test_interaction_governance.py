@@ -1261,7 +1261,7 @@ async def test_governance_event_projects_exact_clarification_permission(text, ki
 @pytest.mark.parametrize("marker", ["continue", "go on", "keep going", "tell me more",
                                     "more detail", "more details"])
 @pytest.mark.parametrize("case,expected", [("return", "continuation"),
-                                          ("below", "low_confidence_unclear"),
+                                          ("below", "continuation"),
                                           ("abandoned", "low_confidence_unclear"),
                                           ("malformed", "low_confidence_unclear"),
                                           ("wrong_turn", "low_confidence_unclear")])
@@ -1315,7 +1315,10 @@ _INTERRUPTION_MARKERS = [
 ]
 
 
-def _interruption_turn(monkeypatch, gap=60, prior_status="completed", surface="web"):
+def _interruption_turn(
+    monkeypatch, gap=60, prior_status="completed", surface="web", *,
+    prior_surface=None, prior_continuation_state=None,
+):
     from datetime import UTC, datetime, timedelta
 
     import services.runtime_state as runtime_module
@@ -1325,9 +1328,12 @@ def _interruption_turn(monkeypatch, gap=60, prior_status="completed", surface="w
     repo = runtime_state_repository()
     scope = dict(owner_id="owner", conversation_id="interruption", surface=surface)
     if prior_status is not None:
-        session, prior, _ = repo.start_turn(request_id="prior", **scope)
+        session, prior, _ = repo.start_turn(
+            request_id="prior", **{**scope, "surface": prior_surface or surface},
+        )
         repo.complete_turn(request_id="prior", runtime_session_id=session.runtime_session_id,
-                           runtime_turn_id=prior.runtime_turn_id, turn_status=prior_status)
+                           runtime_turn_id=prior.runtime_turn_id, turn_status=prior_status,
+                           continuation_state=prior_continuation_state)
     clock[0] += timedelta(seconds=gap)
     session, turn, event = repo.start_turn(request_id="current", **scope)
     return repo, session, turn, event, {
@@ -1502,3 +1508,192 @@ async def test_sqlite_timing_governance_keeps_two_durable_transactions(monkeypat
     assert diagnostics.latest_turn.intent_class == "information_request"
     assert sum(e.event_type == "interaction_governance_evaluated" for e in diagnostics.events) == 1
     assert "What does this function do?" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", ["continue", "go on", "keep going", "tell me more",
+                                    "more detail", "more details"])
+@pytest.mark.parametrize("gap", [0, 60, 299, 300, 301])
+@pytest.mark.parametrize("surface", ["web", "alexa"])
+async def test_continuation_uses_completed_turn_without_client_history(
+    monkeypatch, marker, gap, surface,
+):
+    repo, session, turn, event, scope = _interruption_turn(monkeypatch, gap, surface=surface)
+    snapshot = event.event_payload_json["return_after_gap"]
+    assert snapshot["status"] == ("below_threshold" if gap < 300 else "eligible")
+    assert snapshot["prior_terminal_turn_id"] is not None
+    before = repo.diagnostics(session.runtime_session_id)
+    response = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "current_user_text": marker + ".", "recent_messages": [],
+    })
+    assert response.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "continuation"
+    result = response.json()["result"]
+    assert result["action_allowed"] is False
+    assert result["requires_confirmation"] is False
+    assert result["history_followup_policy"]["status"] == "not_applicable"
+    after = repo.diagnostics(session.runtime_session_id)
+    assert after.runtime_session == before.runtime_session
+    assert len(after.events) == len(before.events) + 1
+    events = [e for e in after.events if e.runtime_turn_id == turn.runtime_turn_id
+              and e.event_type == "interaction_governance_evaluated"]
+    assert len(events) == 1
+    assert events[0].event_payload_json["request_id"] == scope["request_id"]
+    assert "current_user_text" not in events[0].event_payload_json
+    assert after.latest_turn.timing_policy is None
+    assert after.latest_turn.continuation_state is None
+    with repo._connect() as conn:
+        count = conn.execute(
+            "SELECT count(*) FROM capability_confirmation_challenges",
+        ).fetchone()[0]
+        assert count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gap", [0, 60, 299, 300, 301])
+@pytest.mark.parametrize("cross_surface", [False, True])
+async def test_continuation_preserves_restraint_timing_and_surface_boundaries(
+    monkeypatch, gap, cross_surface,
+):
+    repo, session, turn, _, scope = _interruption_turn(
+        monkeypatch, gap, surface="alexa", prior_surface="telegram" if cross_surface else None,
+        prior_continuation_state="deferred_expansion",
+    )
+    governance = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "current_user_text": "Tell me more.",
+    })
+    assert governance.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "continuation"
+    restraint = await _post("/v1/runtime/restraint/evaluate", {
+        **scope, "current_user_text": "Tell me more.", "interaction_kind": "ambiguous",
+    })
+    assert restraint.status_code == 200
+    bounded = restraint.json()["result"]
+    assert bounded["restraint_policy"] == "answer_normally"
+    assert bounded["retrieval_suppressed"] is False
+    assert "continuation_context_requested" in bounded["reason_summary"]
+    assert bounded["personalization_suppressed"] is True
+    assert bounded["proactive_output_suppressed"] is True
+    assert governance.json()["result"]["action_allowed"] is False
+    presence = await _post("/v1/runtime/presence/evaluate", scope)
+    assert presence.status_code == 200
+    assert presence.json()["result"]["presence_state"] == (
+        "active_conversation" if gap < 300 else "returning_after_gap"
+    )
+    timing = await _post("/v1/runtime/timing/evaluate", {
+        **scope, "spoken_output": True, "active_task_mode": False,
+        "requested_detail": "expanded", "latency_budget_class": "voice_provider_dispatch",
+        "dependency_state": "ready",
+    })
+    assert timing.status_code == 200
+    policy = timing.json()["result"]
+    assert policy["timing_policy"] == ("answer_now" if gap < 300 else "resume_previous_thread")
+    assert policy["reason_codes"] == (
+        ["ordinary_ready"] if gap < 300 else ["return_deferred_continuation"]
+    )
+    diagnostics = repo.diagnostics(session.runtime_session_id)
+    for kind in ("interaction_governance_evaluated", "restraint_evaluated", "timing_evaluated"):
+        assert sum(e.event_type == kind for e in diagnostics.events
+                   if e.runtime_turn_id == turn.runtime_turn_id) == 1
+    assert diagnostics.runtime_session.status == "active"
+    assert repo.turn_by_id(turn.runtime_turn_id).turn_status == "received"
+    assert not any(e.event_type.startswith(("capability_", "action_"))
+                   for e in diagnostics.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["first", "abandoned", "missing", "malformed", "wrong_event",
+                                   "forged_prior", "forged_owner", "forged_conversation",
+                                   "forged_elapsed", "forged_status", "abandoned_prior"])
+async def test_continuation_snapshot_faults_never_grant_intent(monkeypatch, fault):
+    import json
+
+    repo, session, turn, event, scope = _interruption_turn(
+        monkeypatch, prior_status=(None if fault == "first" else
+                                  "abandoned" if fault == "abandoned" else "completed"),
+    )
+    payload = event.event_payload_json.copy()
+    if fault == "missing":
+        del payload["return_after_gap"]
+    elif fault == "malformed":
+        payload["return_after_gap"]["threshold_met"] = "false"
+    elif fault == "forged_prior":
+        payload["return_after_gap"]["prior_terminal_turn_id"] = "fabricated"
+    elif fault in {"forged_owner", "forged_conversation"}:
+        other, foreign, _ = repo.start_turn(
+            request_id="foreign", owner_id="other-owner" if fault == "forged_owner" else "owner",
+            conversation_id="other-thread", surface="web",
+        )
+        repo.complete_turn(request_id="foreign", runtime_session_id=other.runtime_session_id,
+                           runtime_turn_id=foreign.runtime_turn_id, turn_status="completed")
+        payload["return_after_gap"]["prior_terminal_turn_id"] = foreign.runtime_turn_id
+    elif fault == "forged_elapsed":
+        payload["return_after_gap"]["elapsed_seconds"] = 0
+    elif fault == "forged_status":
+        payload["return_after_gap"]["status"] = "eligible"
+    elif fault == "abandoned_prior":
+        with repo._connect() as conn:
+            conn.execute("UPDATE conversation_runtime_turns SET turn_status='abandoned' "
+                         "WHERE runtime_turn_id=?", (
+                             payload["return_after_gap"]["prior_terminal_turn_id"],
+                         ))
+    with repo._connect() as conn:
+        conn.execute("UPDATE conversation_runtime_events SET event_payload_json=?, "
+                     "runtime_turn_id=? WHERE event_id=?", (json.dumps(payload),
+                     "wrong-turn" if fault == "wrong_event" else turn.runtime_turn_id,
+                     event.event_id))
+    if fault not in {"first", "abandoned"}:
+        assert repo.return_after_gap_snapshot(
+            session.runtime_session_id, turn.runtime_turn_id,
+        ) is None
+    response = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "current_user_text": "Tell me more.", "recent_messages": [],
+    })
+    assert response.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class == "low_confidence_unclear"
+    assert response.json()["result"]["action_allowed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["owner", "conversation", "surface", "session", "turn",
+                                   "completed", "abandoned", "stale"])
+async def test_continuation_invalid_current_binding_never_writes(monkeypatch, fault):
+    repo, session, turn, _, scope = _interruption_turn(monkeypatch)
+    if fault in {"owner", "conversation", "surface", "session", "turn"}:
+        scope[{"owner": "owner_id", "conversation": "conversation_id", "surface": "surface",
+               "session": "runtime_session_id", "turn": "runtime_turn_id"}[fault]] = "wrong"
+    else:
+        repo.complete_turn(request_id="current", runtime_session_id=session.runtime_session_id,
+                           runtime_turn_id=turn.runtime_turn_id,
+                           turn_status="abandoned" if fault == "abandoned" else "completed")
+        if fault == "stale":
+            repo.start_turn(request_id="new-current", owner_id="owner",
+                            conversation_id="interruption", surface="web")
+    before = repo.diagnostics(session.runtime_session_id).model_dump()
+    if fault in {"completed", "abandoned", "stale"}:
+        with pytest.raises(RuntimeError):
+            await _post("/v1/runtime/interaction-governance/evaluate", {
+                **scope, "current_user_text": "Tell me more.",
+            })
+    else:
+        response = await _post("/v1/runtime/interaction-governance/evaluate", {
+            **scope, "current_user_text": "Tell me more.",
+        })
+        assert response.status_code == (404 if fault in {"session", "turn"} else 400)
+    assert repo.diagnostics(session.runtime_session_id).model_dump() == before
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class != "continuation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["tell me more about restarting the server", "please continue",
+                                   "continue the deployment", "keep going until it fails",
+                                   "fix this", "what next", "pause", "pause the job"])
+async def test_immediate_continuation_does_not_expand_marker_set(monkeypatch, text):
+    repo, _, turn, _, scope = _interruption_turn(monkeypatch)
+    response = await _post("/v1/runtime/interaction-governance/evaluate", {
+        **scope, "current_user_text": text,
+    })
+    assert response.status_code == 200
+    assert repo.turn_by_id(turn.runtime_turn_id).intent_class not in {
+        "continuation", "interruption",
+    }
