@@ -352,7 +352,11 @@ def _is_continuation(text: str, body: InteractionGovernanceEvaluateRequest) -> b
         snapshot = runtime_state_repository().return_after_gap_snapshot(
             body.runtime_session_id, body.runtime_turn_id,
         )
-        return snapshot is not None and snapshot.status == "eligible"
+        return snapshot is not None and (
+            snapshot.status == "eligible"
+            or (snapshot.status == "below_threshold"
+                and snapshot.prior_terminal_turn_id is not None)
+        )
     return False
 
 
