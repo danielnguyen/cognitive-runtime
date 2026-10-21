@@ -560,3 +560,46 @@ def test_scene_selection_across_requests_preserves_saved_choice_and_identity():
     transient = compile_request("scene-transient", requested_scene="planning")
     assert transient["scene_id"] == "planning"
     assert compile_request("scene-after-transient")["scene_id"] == "work_triage"
+
+
+@pytest.mark.parametrize(
+    ("requested", "saved", "mode", "expected", "source"),
+    [
+        ("work_triage", "planning", "coding", "work_triage", "requested_scene"),
+        ("invalid", "planning", "coding", "general", "fallback_general"),
+        (None, "planning", "coding", "planning", "runtime_state"),
+        (None, "invalid", "coding", "general", "fallback_general"),
+        (None, None, "coding", "coding_build", "runtime_interaction_mode"),
+        (None, None, "planning", "planning", "runtime_interaction_mode"),
+        (None, None, "work_triage", "work_triage", "runtime_interaction_mode"),
+        (None, None, "driving", "general", "general"),
+    ],
+)
+def test_bound_companion_compile_preserves_scene_precedence_and_read_only_state(
+    requested, saved, mode, expected, source,
+):
+    client = TestClient(app)
+    started = client.post("/v1/runtime/turns/start", json=_base())
+    assert started.status_code == 200
+    binding = {
+        "runtime_session_id": started.json()["runtime_session"]["runtime_session_id"],
+        "runtime_turn_id": started.json()["runtime_turn"]["runtime_turn_id"],
+    }
+    updated = client.post(
+        "/v1/runtime/state/update",
+        json={**_base(), "updates": {"active_scene": saved, "interaction_mode": mode}},
+    )
+    before = updated.json()["runtime_state"]
+    request = {**_base(), **binding, "requested_scene": requested}
+    first = client.post("/v1/companion/profile/compile", json=request)
+    repeat = client.post("/v1/companion/policy/compile", json=request)
+    legacy = client.post(
+        "/v1/companion/profile/compile", json={**_base(), "requested_scene": requested},
+    )
+    assert first.status_code == repeat.status_code == legacy.status_code == 200
+    assert first.json() == repeat.json() == legacy.json()
+    assert first.json()["scene_id"] == expected
+    assert first.json()["scene_source"] == source
+    assert first.json()["runtime_state"] == before
+    assert client.post("/v1/runtime/state/resolve", json=_base()).json()["runtime_state"] == before
+    assert companion_contracts_repository().list_scene_resolution_events_for_tests() == []

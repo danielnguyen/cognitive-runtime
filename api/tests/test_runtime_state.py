@@ -6583,3 +6583,219 @@ def test_sqlite_timing_invalid_sql_preserves_native_exception(monkeypatch, caplo
         invalid(request_id="malformed")
     assert str(observed.value) == str(baseline.value)
     assert "private_missing_column" not in json.dumps(_sqlite_timing_events(caplog))
+
+
+@pytest.mark.parametrize("defect", [
+    "missing_thread", "contended", "unavailable", "idle", "wrong_active_turn",
+    "wrong_active_session", "wrong_active_surface", "wrong_active_request", "invalid_revision",
+    "missing_admission", "duplicate_admission",
+    "wrong_admission_request", "wrong_admission_session",
+    "malformed_admission", "closed_session", "completion_timestamp", "competing_turn",
+])
+def test_bound_scene_rejects_corrupt_authority_without_repair(tmp_path, defect):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    response = _start(
+        client, request_id="scene-current", owner_id="scene-owner",
+        conversation_id="scene-conversation", surface="dev",
+    )
+    assert response.status_code == 200
+    session = response.json()["runtime_session"]["runtime_session_id"]
+    turn = response.json()["runtime_turn"]["runtime_turn_id"]
+    with sqlite3.connect(db_path) as conn:
+        if defect == "missing_thread":
+            conn.execute("DELETE FROM conversation_runtime_threads")
+        elif defect in {"contended", "unavailable", "idle"}:
+            conn.execute("UPDATE conversation_runtime_threads SET state = ?", (defect,))
+        elif defect.startswith("wrong_active_"):
+            column = {
+                "wrong_active_turn": "active_runtime_turn_id",
+                "wrong_active_session": "active_runtime_session_id",
+                "wrong_active_surface": "active_surface",
+                "wrong_active_request": "active_request_id",
+            }[defect]
+            conn.execute(f"UPDATE conversation_runtime_threads SET {column} = 'wrong'")
+        elif defect == "invalid_revision":
+            conn.execute("UPDATE conversation_runtime_threads SET revision = 'invalid'")
+        elif defect == "missing_admission":
+            conn.execute(
+                "DELETE FROM conversation_runtime_events WHERE event_type = 'turn_started'",
+            )
+        elif defect == "duplicate_admission":
+            conn.execute(
+                """INSERT INTO conversation_runtime_events
+                   (event_id, runtime_session_id, runtime_turn_id, event_type,
+                    event_payload_json, created_at)
+                   SELECT 'duplicate', runtime_session_id, runtime_turn_id, event_type,
+                          event_payload_json, created_at FROM conversation_runtime_events
+                   WHERE event_type = 'turn_started'""",
+            )
+        elif defect in {"wrong_admission_request", "malformed_admission"}:
+            payload = '{}' if defect == "wrong_admission_request" else '[]'
+            conn.execute(
+                "UPDATE conversation_runtime_events SET event_payload_json = ? "
+                "WHERE event_type = 'turn_started'", (payload,),
+            )
+        elif defect == "wrong_admission_session":
+            conn.execute(
+                "UPDATE conversation_runtime_events SET runtime_session_id = 'wrong' "
+                "WHERE event_type = 'turn_started'",
+            )
+        elif defect == "closed_session":
+            conn.execute("UPDATE conversation_runtime_sessions SET status = 'closed'")
+        elif defect == "completion_timestamp":
+            conn.execute("UPDATE conversation_runtime_turns SET completed_at = created_at")
+        elif defect == "competing_turn":
+            conn.execute(
+                """INSERT INTO conversation_runtime_turns
+                   (runtime_turn_id, runtime_session_id, turn_status, created_at, updated_at)
+                   SELECT 'competing', runtime_session_id, 'received', created_at, updated_at
+                   FROM conversation_runtime_turns WHERE runtime_turn_id = ?""", (turn,),
+            )
+    before = _runtime_rows(db_path)
+    scene_events = companion_contracts_repository().list_scene_resolution_events_for_tests()
+    for endpoint in (
+        "/v1/companion/scene/resolve", "/v1/companion/profile/compile",
+        "/v1/companion/policy/compile",
+    ):
+        denied = client.post(endpoint, json={
+            "request_id": "scene-current", "owner_id": "scene-owner",
+            "conversation_id": "scene-conversation", "surface": "dev",
+            "runtime_session_id": session, "runtime_turn_id": turn,
+        })
+        assert denied.status_code in {400, 409, 503}, denied.json()
+        assert set(denied.json()) == {"detail"}
+        assert _runtime_rows(db_path) == before
+        assert (
+            companion_contracts_repository().list_scene_resolution_events_for_tests()
+            == scene_events
+        )
+
+
+def test_bound_scene_rejects_stale_and_other_existing_turns(tmp_path):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    scope = dict(request_id="original", owner_id="owner", conversation_id="conv", surface="dev")
+    session, old_turn, _ = repo.start_turn(**scope)
+    repo.complete_turn(
+        request_id="finish", runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=old_turn.runtime_turn_id, turn_status="completed",
+    )
+    _, current, _ = repo.start_turn(**{**scope, "request_id": "current"})
+    other_session, other_turn, _ = repo.start_turn(
+        request_id="other", owner_id="other-owner", conversation_id="other-conv", surface="web",
+    )
+    before = _runtime_rows(db_path)
+    for request, session_id, turn_id in (
+        ("original", session.runtime_session_id, old_turn.runtime_turn_id),
+        ("current", session.runtime_session_id, other_turn.runtime_turn_id),
+        ("current", other_session.runtime_session_id, other_turn.runtime_turn_id),
+    ):
+        with pytest.raises(RuntimeError):
+            with repo.current_turn_state(
+                **{**scope, "request_id": request}, runtime_session_id=session_id,
+                runtime_turn_id=turn_id,
+            ):
+                pytest.fail("invalid authority yielded scene state")
+    assert _runtime_rows(db_path) == before
+    with repo.current_turn_state(
+        **{**scope, "request_id": "current"}, runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=current.runtime_turn_id,
+    ) as state:
+        assert state.owner_id == "owner"
+        assert state.conversation_id == "conv"
+
+
+@pytest.mark.parametrize("endpoint", [
+    "/v1/companion/scene/resolve", "/v1/companion/profile/compile", "/v1/companion/policy/compile",
+])
+def test_bound_scene_guard_covers_compilation_and_event_recording(tmp_path, monkeypatch, endpoint):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    response = _start(
+        client, request_id="scene-guard", owner_id="owner", conversation_id="conv", surface="dev",
+    )
+    session = response.json()["runtime_session"]["runtime_session_id"]
+    turn = response.json()["runtime_turn"]["runtime_turn_id"]
+    before = _runtime_rows(db_path)
+    target = companion_contracts_repository() if endpoint.endswith("resolve") else main_module
+    name = "record_scene_resolution_event" if endpoint.endswith("resolve") else "compile_policy"
+    original = getattr(target, name)
+    observed = []
+
+    def check_guard(**kwargs):
+        with sqlite3.connect(db_path, timeout=0) as competing:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                competing.execute("BEGIN IMMEDIATE;")
+        observed.append(True)
+        return original(**kwargs)
+
+    monkeypatch.setattr(target, name, check_guard)
+    result = client.post(endpoint, json={
+        "request_id": "scene-guard", "owner_id": "owner", "conversation_id": "conv",
+        "surface": "dev", "runtime_session_id": session, "runtime_turn_id": turn,
+    })
+    assert result.status_code == 200
+    assert observed == [True]
+    assert _runtime_rows(db_path) == before
+    assert _complete(
+        client, request_id="finish", runtime_session_id=session, runtime_turn_id=turn,
+    ).status_code == 200
+
+
+def test_current_turn_state_serializes_completion_without_duplicate_authority(tmp_path):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    scope = dict(request_id="scene-guard", owner_id="owner", conversation_id="conv", surface="dev")
+    session, turn, _ = repo.start_turn(**scope)
+    entered = threading.Event()
+    release = threading.Event()
+    finishing = threading.Event()
+    binding = dict(
+        runtime_session_id=session.runtime_session_id, runtime_turn_id=turn.runtime_turn_id,
+    )
+
+    def guarded_read():
+        with repo.current_turn_state(**scope, **binding) as state:
+            entered.set()
+            assert release.wait(5)
+            return state
+
+    def finish():
+        finishing.set()
+        return repo.complete_turn(request_id="finish", **binding, turn_status="completed")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        read = executor.submit(guarded_read)
+        try:
+            assert entered.wait(5)
+            completion = executor.submit(finish)
+            assert finishing.wait(5)
+            with sqlite3.connect(db_path, timeout=0) as competing:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    competing.execute("BEGIN IMMEDIATE;")
+            assert not completion.done()
+        finally:
+            release.set()
+        assert read.result().owner_id == "owner"
+        completion.result()
+    with pytest.raises(RuntimeError, match="runtime_turn_not_current"):
+        with repo.current_turn_state(**scope, **binding):
+            pytest.fail("completed turn yielded scene state")
+
+
+@pytest.mark.parametrize("error", [RuntimeError("consumer failed"), CancelledError()])
+def test_current_turn_state_releases_guard_on_failure_or_cancellation(tmp_path, error):
+    db_path = _use_database(tmp_path)
+    repo = RuntimeStateRepository(db_path)
+    scope = dict(request_id="scene-guard", owner_id="owner", conversation_id="conv", surface="dev")
+    session, turn, _ = repo.start_turn(**scope)
+    binding = dict(
+        runtime_session_id=session.runtime_session_id, runtime_turn_id=turn.runtime_turn_id,
+    )
+    before = _runtime_rows(db_path)
+    with pytest.raises(type(error)):
+        with repo.current_turn_state(**scope, **binding):
+            raise error
+    assert _runtime_rows(db_path) == before
+    repo.complete_turn(request_id="finish", **binding, turn_status="completed")

@@ -4551,6 +4551,16 @@ class InteractionContractTrace(BaseModel):
 
 class CompanionPolicyCompileRequest(RuntimeStateResolveRequest):
     requested_scene: BoundedScene | None = None
+    runtime_session_id: str | None = Field(default=None, min_length=1, max_length=120, strict=True)
+    runtime_turn_id: str | None = Field(default=None, min_length=1, max_length=120, strict=True)
+
+    @model_validator(mode="after")
+    def validate_turn_binding(self) -> "CompanionPolicyCompileRequest":
+        if {"runtime_session_id", "runtime_turn_id"} & self.model_fields_set and (
+            self.runtime_session_id is None or self.runtime_turn_id is None
+        ):
+            raise ValueError("runtime_turn_binding_required")
+        return self
 
 
 class CompanionProfileActiveResponse(BaseModel):
@@ -4759,8 +4769,8 @@ class ScenePolicyDetail(BaseModel):
     format_policy_json: dict[str, Any] = Field(default_factory=dict)
 
 
-class SceneResolveRequest(RuntimeStateResolveRequest):
-    requested_scene: BoundedScene | None = None
+class SceneResolveRequest(CompanionPolicyCompileRequest):
+    pass
 
 
 class SceneResolveResponse(BaseModel):

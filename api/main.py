@@ -127,6 +127,7 @@ from services.claim_calibration import evaluate_claim_calibration, evaluate_clai
 from services.companion_contracts import companion_contracts_repository
 from services.companion_policy import (
     active_profile,
+    companion_policy_state,
     compile_policy,
     resolve_interaction_contract,
     resolve_scene,
@@ -1164,41 +1165,42 @@ async def companion_profile_active() -> CompanionProfileActiveResponse:
 
 @app.post("/v1/companion/scene/resolve", response_model=SceneResolveResponse)
 async def companion_scene_resolve(body: SceneResolveRequest) -> SceneResolveResponse:
-    state = resolve_state(
-        owner_id=body.owner_id,
-        conversation_id=body.conversation_id,
-        surface=body.surface,
-    )
-    resolution = resolve_scene(
-        requested_scene=body.requested_scene,
-        runtime_scene=state.active_scene,
-        runtime_interaction_mode=state.interaction_mode,
-    )
-    companion_contracts_repository().record_scene_resolution_event(
-        request_id=body.request_id,
-        owner_id=body.owner_id,
-        conversation_id=body.conversation_id,
-        surface=body.surface,
-        requested_scene=body.requested_scene,
-        runtime_scene=state.active_scene,
-        resolved_scene_id=resolution.scene.scene_id,
-        confidence=resolution.confidence,
-        source=resolution.source,
-        signals_json=resolution.signals_json,
-        used_fallback=resolution.used_fallback,
-        used_default_scene=resolution.used_default_scene,
-    )
-    return SceneResolveResponse(
-        scene_id=resolution.scene.scene_id,
-        scene_version=resolution.scene.version,
-        scene_confidence=resolution.confidence,
-        scene_source=resolution.source,
-        warnings=resolution.warnings,
-        signals_json=resolution.signals_json,
-        used_fallback=resolution.used_fallback,
-        used_default_scene=resolution.used_default_scene,
-        policy=_scene_policy_detail(resolution.scene),
-    )
+    try:
+        with companion_policy_state(body) as state:
+            resolution = resolve_scene(
+                requested_scene=body.requested_scene,
+                runtime_scene=state.active_scene,
+                runtime_interaction_mode=state.interaction_mode,
+            )
+            companion_contracts_repository().record_scene_resolution_event(
+                request_id=body.request_id,
+                owner_id=body.owner_id,
+                conversation_id=body.conversation_id,
+                surface=body.surface,
+                requested_scene=body.requested_scene,
+                runtime_scene=state.active_scene,
+                resolved_scene_id=resolution.scene.scene_id,
+                confidence=resolution.confidence,
+                source=resolution.source,
+                signals_json=resolution.signals_json,
+                used_fallback=resolution.used_fallback,
+                used_default_scene=resolution.used_default_scene,
+            )
+            return SceneResolveResponse(
+                scene_id=resolution.scene.scene_id,
+                scene_version=resolution.scene.version,
+                scene_confidence=resolution.confidence,
+                scene_source=resolution.source,
+                warnings=resolution.warnings,
+                signals_json=resolution.signals_json,
+                used_fallback=resolution.used_fallback,
+                used_default_scene=resolution.used_default_scene,
+                policy=_scene_policy_detail(resolution.scene),
+            )
+    except Exception as exc:
+        if body.runtime_session_id is None:
+            raise
+        raise _runtime_state_http_error(exc) from None
 
 
 @app.get("/v1/companion/scene/{scene_id}", response_model=ScenePolicyDetail)
@@ -1297,14 +1299,15 @@ async def companion_repair_simulate(body: RepairSimulateRequest) -> RepairSimula
 def _compile_companion_profile(
     body: CompanionPolicyCompileRequest,
 ) -> CompanionPolicyCompileResponse:
-    state = resolve_state(
-        owner_id=body.owner_id,
-        conversation_id=body.conversation_id,
-        surface=body.surface,
-    )
-    return CompanionPolicyCompileResponse(
-        **compile_policy(state=state, requested_scene=body.requested_scene)
-    )
+    try:
+        with companion_policy_state(body) as state:
+            return CompanionPolicyCompileResponse(
+                **compile_policy(state=state, requested_scene=body.requested_scene)
+            )
+    except Exception as exc:
+        if body.runtime_session_id is None:
+            raise
+        raise _runtime_state_http_error(exc) from None
 
 
 @app.post("/v1/companion/profile/compile", response_model=CompanionPolicyCompileResponse)
