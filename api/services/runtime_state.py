@@ -2114,6 +2114,7 @@ class RuntimeStateRepository:
                     "turn_status": "received",
                     "input_message_id": input_message_id,
                     "return_after_gap": return_snapshot,
+                    **({"resumed_from_pause": True} if session.status == "paused" else {}),
                 },
             )
             thread_update = conn.execute(
@@ -2225,6 +2226,7 @@ class RuntimeStateRepository:
         runtime_turn_id: str,
         turn_status: str,
         continuation_state: str | None = None,
+        session_transition: str | None = None,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         now = _now()
         with self._connect("turn_complete") as conn:
@@ -2236,6 +2238,7 @@ class RuntimeStateRepository:
                 runtime_turn_id=runtime_turn_id,
                 turn_status=turn_status,
                 continuation_state=continuation_state,
+                session_transition=session_transition,
                 now=now,
             )
 
@@ -2248,8 +2251,13 @@ class RuntimeStateRepository:
         runtime_turn_id: str,
         turn_status: str,
         continuation_state: str | None = None,
+        session_transition: str | None = None,
         now: str,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
+        if session_transition is not None and (
+            session_transition != "pause" or turn_status != "completed"
+        ):
+            raise RuntimeError("runtime_session_transition_invalid")
         session = self._session_by_id(conn, runtime_session_id)
         if session is None:
             raise RuntimeError("runtime_session_not_found")
@@ -2258,6 +2266,32 @@ class RuntimeStateRepository:
             raise RuntimeError("runtime_turn_not_found")
         if turn.runtime_session_id != runtime_session_id:
             raise RuntimeError("runtime_turn_session_mismatch")
+        if session_transition == "pause":
+            # Pause is explicit current-request control, not a timing inference.
+            started = conn.execute(
+                "SELECT runtime_session_id, event_payload_json FROM conversation_runtime_events "
+                "WHERE runtime_turn_id = ? AND event_type = 'turn_started' ORDER BY id LIMIT 2;",
+                (runtime_turn_id,),
+            ).fetchall()
+            try:
+                admission = (
+                    json.loads(started[0]["event_payload_json"]) if len(started) == 1 else None
+                )
+            except (TypeError, ValueError):
+                admission = None
+            if (
+                not isinstance(admission, dict)
+                or started[0]["runtime_session_id"] != runtime_session_id
+                or admission.get("request_id") != request_id
+                or admission.get("turn_status") != "received"
+                or admission.get("input_message_id") != turn.input_message_id
+                or not request_id.strip()
+                or turn.turn_status == "abandoned"
+            ):
+                raise RuntimeError("runtime_turn_not_current")
+            if continuation_state is not None and continuation_state != turn.continuation_state:
+                raise RuntimeError("runtime_session_transition_invalid")
+            continuation_state = turn.continuation_state
         if turn.turn_status in _TERMINAL_TURN_STATUSES:
             event = self._turn_event(
                 conn,
@@ -2271,11 +2305,34 @@ class RuntimeStateRepository:
                 and event is not None
                 and event.event_payload_json.get("continuation_state")
                 == continuation_state
+                and event.event_payload_json.get("session_transition") == session_transition
             ):
+                if session_transition == "pause":
+                    latest = conn.execute(
+                        "SELECT runtime_turn_id FROM conversation_runtime_turns "
+                        "WHERE runtime_session_id = ? ORDER BY id DESC LIMIT 1;",
+                        (runtime_session_id,),
+                    ).fetchone()
+                    if (session.status != "paused" or session.closed_at is not None
+                            or latest["runtime_turn_id"] != runtime_turn_id):
+                        raise RuntimeError("runtime_turn_not_current")
                 return session, turn, event
             raise RuntimeError("runtime_turn_not_current")
 
+        if session_transition == "pause":
+            inspection = self._inspect_continuation_thread(
+                conn, owner_id=session.owner_id, conversation_id=session.conversation_id,
+            )
+            if inspection["state"] == "contended":
+                raise RuntimeError("runtime_thread_contended")
+            if inspection["state"] != "active":
+                raise RuntimeError("runtime_thread_unavailable")
         thread = self._validate_current_turn(conn, session=session, turn=turn)
+        if session_transition == "pause" and (
+            thread["active_request_id"] != request_id
+            or session.status != "active" or session.closed_at is not None
+        ):
+            raise RuntimeError("runtime_turn_not_current")
         self._update_turn_row(
             conn,
             runtime_turn_id,
@@ -2290,7 +2347,7 @@ class RuntimeStateRepository:
             conn,
             runtime_session_id,
             {
-                "status": "active",
+                "status": "paused" if session_transition == "pause" else "active",
                 "last_activity_at": now,
                 "updated_at": now,
             },
@@ -2304,6 +2361,7 @@ class RuntimeStateRepository:
                 "request_id": request_id,
                 "turn_status": turn_status,
                 "continuation_state": continuation_state,
+                **({"session_transition": "pause"} if session_transition == "pause" else {}),
             },
         )
         thread_update = conn.execute(
@@ -3158,6 +3216,7 @@ def complete_turn(
     runtime_turn_id: str,
     turn_status: str,
     continuation_state: str | None = None,
+    session_transition: str | None = None,
 ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
     return runtime_state_repository().complete_turn(
         request_id=request_id,
@@ -3165,6 +3224,7 @@ def complete_turn(
         runtime_turn_id=runtime_turn_id,
         turn_status=turn_status,
         continuation_state=continuation_state,
+        session_transition=session_transition,
     )
 
 

@@ -305,6 +305,7 @@ _EVIDENCE_SHAPE_ERROR_STATUS = {
 _RUNTIME_STATE_ERROR_STATUS = {
     "runtime_timing_inputs_invalid": 503,
     "runtime_session_mismatch": 400,
+    "runtime_session_transition_invalid": 400,
     "runtime_retirement_reservation_conflict": 409,
     "runtime_retirement_reservation_invariant_conflict": 409,
     "runtime_retirement_reservation_not_found": 404,
@@ -531,6 +532,7 @@ async def runtime_turn_complete(body: RuntimeTurnCompleteRequest) -> RuntimeTurn
             runtime_turn_id=body.runtime_turn_id,
             turn_status=body.turn_status,
             continuation_state=body.continuation_state,
+            session_transition=body.session_transition,
         )
     except Exception as exc:
         raise _runtime_state_http_error(exc) from None
