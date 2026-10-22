@@ -7190,3 +7190,313 @@ def test_pause_requires_nonblank_original_request(tmp_path, request_id):
     })
     assert response.status_code == 409
     assert _runtime_rows(db_path) == before
+
+
+_ASSISTANT_MESSAGE_ID = "12345678-1234-1234-1234-123456789abc"
+
+
+def _message_association_scope(tmp_path):
+    db_path, repo, scope, completion = _pause_scope(tmp_path)
+    completion.update(session_transition=None, assistant_message_id=_ASSISTANT_MESSAGE_ID)
+    return db_path, repo, scope, completion
+
+
+@pytest.mark.parametrize("surface", ["web", "alexa"])
+@pytest.mark.parametrize("gap", [0, 299, 300, 301])
+@pytest.mark.parametrize("pause", [False, True])
+def test_completed_message_survives_restart_and_next_admission(
+    tmp_path, monkeypatch, surface, gap, pause,
+):
+    import services.runtime_state as module
+
+    clock = [datetime(2026, 1, 1, tzinfo=UTC)]
+    monkeypatch.setattr(module, "_now", lambda: clock[0].isoformat())
+    db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    completion["session_transition"] = "pause" if pause else None
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code == 200
+    original = response.json()
+    assert original["event"]["event_payload_json"]["assistant_message_id"] == _ASSISTANT_MESSAGE_ID
+    assert original["runtime_turn"]["turn_status"] == "completed"
+    assert original["runtime_session"]["status"] == ("paused" if pause else "active")
+    reopened = RuntimeStateRepository(db_path)
+    before = _runtime_rows(db_path)
+    assert reopened.complete_turn(**completion)[2].model_dump() == original["event"]
+    assert _runtime_rows(db_path) == before
+    clock[0] += timedelta(seconds=gap)
+    session, turn, event = reopened.start_turn(
+        **{**scope, "request_id": "next-turn", "surface": surface},
+    )
+    snapshot = event.event_payload_json["return_after_gap"]
+    assert snapshot["status"] == ("below_threshold" if gap < 300 else "eligible")
+    assert snapshot["prior_terminal_turn_id"] == completion["runtime_turn_id"]
+    assert "assistant_message_id" not in snapshot  # The existing snapshot schema is unchanged.
+    assert event.event_payload_json["prior_assistant_message"] == {
+        "status": "available", "assistant_message_id": _ASSISTANT_MESSAGE_ID,
+    }
+    assert session.owner_id == scope["owner_id"]
+    assert session.conversation_id == scope["conversation_id"] and session.surface == surface
+    assert turn.turn_status == "received" and session.status == "active"
+    assert (session.runtime_session_id == completion["runtime_session_id"]) == (surface == "web")
+    after = _runtime_rows(db_path)
+    assert reopened.start_turn(
+        **{**scope, "request_id": "next-turn", "surface": surface},
+    )[2] == event
+    assert _runtime_rows(db_path) == after
+    if pause and surface == "web":
+        with pytest.raises(RuntimeError, match="runtime_turn_not_current"):
+            reopened.complete_turn(**completion)
+    else:
+        assert reopened.complete_turn(**completion)[2].model_dump() == original["event"]
+    assert _runtime_rows(db_path) == after  # A delayed replay cannot change the new active turn.
+    assert all(e.event_type in {"session_resolved", "turn_started", "turn_completed"}
+               for e in reopened.list_events_for_tests(session.runtime_session_id))
+
+
+@pytest.mark.parametrize("message_id", [None, "87654321-4321-4321-4321-cba987654321"])
+def test_message_association_uses_specific_latest_completed_turn(tmp_path, message_id):
+    _, repo, scope, completion = _message_association_scope(tmp_path)
+    repo.complete_turn(**completion)
+    session, turn, _ = repo.start_turn(**{**scope, "request_id": "second"})
+    _, _, second = repo.complete_turn(
+        request_id="second", runtime_session_id=session.runtime_session_id,
+        runtime_turn_id=turn.runtime_turn_id, turn_status="completed",
+        assistant_message_id=message_id,
+    )
+    if message_id is None:
+        assert "assistant_message_id" not in second.event_payload_json
+    _, _, following = repo.start_turn(**{**scope, "request_id": "third"})
+    assert following.event_payload_json["return_after_gap"]["prior_terminal_turn_id"] == (
+        turn.runtime_turn_id
+    )
+    assert following.event_payload_json["prior_assistant_message"] == {
+        "status": "unavailable" if message_id is None else "available",
+        "assistant_message_id": message_id,
+    }  # Never substitute the older associated answer for an unassociated latest turn.
+
+
+@pytest.mark.parametrize("existing,replay", [
+    (_ASSISTANT_MESSAGE_ID, None), (None, _ASSISTANT_MESSAGE_ID),
+    (_ASSISTANT_MESSAGE_ID, "87654321-4321-4321-4321-cba987654321"),
+])
+def test_message_association_replay_cannot_replace_or_attach(tmp_path, existing, replay):
+    db_path, repo, _, completion = _message_association_scope(tmp_path)
+    repo.complete_turn(**{**completion, "assistant_message_id": existing})
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post(
+        "/v1/runtime/turns/complete", json={**completion, "assistant_message_id": replay},
+    )
+    assert response.status_code == 409
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("message_id", ["", "not-a-uuid", _ASSISTANT_MESSAGE_ID.upper(),
+                                       _ASSISTANT_MESSAGE_ID.replace("-", ""),
+                                       " " + _ASSISTANT_MESSAGE_ID, True, 1, [], {}])
+def test_message_association_rejects_noncanonical_ids(tmp_path, message_id):
+    db_path, repo, _, completion = _message_association_scope(tmp_path)
+    invalid = {**completion, "assistant_message_id": message_id}
+    before = _runtime_rows(db_path)
+    assert TestClient(app).post("/v1/runtime/turns/complete", json=invalid).status_code == 422
+    with pytest.raises(RuntimeError):
+        repo.complete_turn(**invalid)
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("change", ["request", "session", "turn", "abandon", "terminal",
+                                  "stale", "thread_request", "contended", "unavailable"])
+def test_message_association_rejects_invalid_current_context(tmp_path, change):
+    db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    if change in {"terminal", "stale"}:
+        repo.complete_turn(**{**completion, "assistant_message_id": None})
+        if change == "stale":
+            repo.start_turn(**{**scope, "request_id": "new-turn"})
+    elif change in {"thread_request", "contended", "unavailable"}:
+        with sqlite3.connect(db_path) as conn:
+            if change == "thread_request":
+                conn.execute("UPDATE conversation_runtime_threads SET active_request_id='wrong'")
+            else:
+                conn.execute("UPDATE conversation_runtime_threads SET state=?", (change,))
+    elif change == "abandon":
+        completion["turn_status"] = "abandoned"
+    else:
+        completion[{"request": "request_id", "session": "runtime_session_id",
+                    "turn": "runtime_turn_id"}[change]] = "wrong"
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code in {400, 404, 409, 422, 503}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed", "duplicate", "request", "session",
+                                  "input", "status", "forged_request"])
+@pytest.mark.parametrize("historical", [False, True])
+def test_message_association_requires_original_admission(tmp_path, fault, historical):
+    db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    if historical:
+        repo.complete_turn(**completion)
+    foreign = repo.resolve_session(request_id="foreign", owner_id="other-owner",
+                                   conversation_id="other-conversation", surface="web")
+    with repo._connect() as conn:
+        if fault == "duplicate":
+            repo._record_event(conn, runtime_session_id=completion["runtime_session_id"],
+                               runtime_turn_id=completion["runtime_turn_id"],
+                               event_type="turn_started", event_payload_json={})
+        elif fault == "missing":
+            conn.execute("DELETE FROM conversation_runtime_events WHERE event_type='turn_started'")
+        elif fault == "malformed":
+            conn.execute("UPDATE conversation_runtime_events SET event_payload_json='not-json' "
+                         "WHERE event_type='turn_started'")
+        elif fault == "session":
+            conn.execute("UPDATE conversation_runtime_events SET runtime_session_id=? "
+                         "WHERE event_type='turn_started'", (foreign.runtime_session_id,))
+        else:
+            payload = dict(request_id=completion["request_id"], turn_status="received",
+                           input_message_id=None)
+            payload[{"request": "request_id", "forged_request": "request_id",
+                     "input": "input_message_id", "status": "turn_status"}[fault]] = "wrong"
+            conn.execute("UPDATE conversation_runtime_events SET event_payload_json=? "
+                         "WHERE event_type='turn_started'", (json.dumps(payload),))
+            if fault == "forged_request":
+                # Matching forged request fields still cannot change deterministic turn identity.
+                if not historical:
+                    conn.execute("UPDATE conversation_runtime_threads "
+                                 "SET active_request_id='wrong' "
+                                 "WHERE conversation_id=?", (scope["conversation_id"],))
+                completion["request_id"] = "wrong"
+    before = _runtime_rows(db_path)
+    assert TestClient(app).post("/v1/runtime/turns/complete", json=completion).status_code == 409
+    assert _runtime_rows(db_path) == before
+    if historical:
+        _, _, event = repo.start_turn(**{**scope, "request_id": "next"})
+        assert event.event_payload_json["prior_assistant_message"] == {
+            "status": "unavailable", "assistant_message_id": None,
+        }
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed", "duplicate", "request", "session",
+                                  "id", "status", "continuation", "transition", "missing_state"])
+def test_prior_message_association_rejects_corrupt_completion_events(tmp_path, fault):
+    db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    _, _, completed = repo.complete_turn(**completion)
+    foreign = repo.resolve_session(request_id="foreign", owner_id="other-owner",
+                                   conversation_id="other-conversation", surface="web")
+    with repo._connect() as conn:
+        if fault == "duplicate":
+            repo._record_event(conn, runtime_session_id=completion["runtime_session_id"],
+                               runtime_turn_id=completion["runtime_turn_id"],
+                               event_type="turn_completed",
+                               event_payload_json=completed.event_payload_json)
+        elif fault == "missing":
+            conn.execute("DELETE FROM conversation_runtime_events "
+                         "WHERE event_type='turn_completed'")
+        elif fault == "session":
+            conn.execute("UPDATE conversation_runtime_events SET runtime_session_id=? "
+                         "WHERE event_type='turn_completed'", (foreign.runtime_session_id,))
+        else:
+            payload = completed.event_payload_json.copy()
+            if fault == "missing_state":
+                del payload["continuation_state"]
+            elif fault != "malformed":
+                payload[{"request": "request_id", "id": "assistant_message_id",
+                         "status": "turn_status", "continuation": "continuation_state",
+                         "transition": "session_transition"}[fault]] = "wrong"
+            conn.execute("UPDATE conversation_runtime_events SET event_payload_json=? "
+                         "WHERE event_type='turn_completed'",
+                         ("not-json" if fault == "malformed" else json.dumps(payload),))
+    before = _runtime_rows(db_path)
+    with pytest.raises((RuntimeError, ValueError)):
+        repo.complete_turn(**completion)
+    assert _runtime_rows(db_path) == before
+    _, _, event = repo.start_turn(**{**scope, "request_id": "next"})
+    assert event.event_payload_json["prior_assistant_message"] == {
+        "status": "unavailable", "assistant_message_id": None,
+    }
+
+
+@pytest.mark.parametrize("operation", ["complete", "admit"])
+def test_message_association_failure_is_atomic(tmp_path, monkeypatch, operation):
+    db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    if operation == "admit":
+        repo.complete_turn(**completion)
+    before = _runtime_rows(db_path)
+
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError("private storage error")
+
+    monkeypatch.setattr(repo, "_record_event", unavailable)
+    with pytest.raises(sqlite3.OperationalError):
+        if operation == "complete":
+            repo.complete_turn(**completion)
+        else:
+            repo.start_turn(**{**scope, "request_id": "next"})
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("owner,conversation", [
+    ("other-owner", "conversation-pause"), ("owner-pause", "other-conversation"),
+])
+def test_prior_message_reference_never_crosses_owner_or_conversation(tmp_path, owner, conversation):
+    _, repo, _, completion = _message_association_scope(tmp_path)
+    repo.complete_turn(**completion)
+    with repo._connect() as conn:
+        assert repo._prior_assistant_message(
+            conn, owner_id=owner, conversation_id=conversation,
+            prior_runtime_turn_id=completion["runtime_turn_id"],
+        ) == {"status": "unavailable", "assistant_message_id": None}
+
+
+@pytest.mark.parametrize("status", ["completed", "abandoned"])
+def test_legacy_null_completion_and_first_turn_are_unchanged(tmp_path, status):
+    db_path, repo, _, completion = _message_association_scope(tmp_path)
+    started = next(e for e in repo.list_events_for_tests(completion["runtime_session_id"])
+                   if e.event_type == "turn_started")
+    assert "prior_assistant_message" not in started.event_payload_json
+    legacy = {**completion, "assistant_message_id": None, "turn_status": status}
+    result = TestClient(app).post("/v1/runtime/turns/complete", json=legacy)
+    assert result.status_code == 200
+    assert result.json()["event"]["event_payload_json"] == {
+        "request_id": completion["request_id"], "turn_status": status, "continuation_state": None,
+    }
+    before = _runtime_rows(db_path)
+    if status == "abandoned":
+        assert TestClient(app).post(
+            "/v1/runtime/turns/complete", json=completion,
+        ).status_code == 409
+    else:
+        legacy.pop("assistant_message_id")
+        assert TestClient(app).post(
+            "/v1/runtime/turns/complete", json=legacy,
+        ).json() == result.json()
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("obstacle", ["revision", "contention"])
+def test_rejected_admission_cannot_publish_message_provenance(tmp_path, obstacle):
+    db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    repo.complete_turn(**completion)
+    kwargs = {**scope, "request_id": "next"}
+    if obstacle == "revision":
+        kwargs["expected_thread_revision"] = 0
+    else:
+        repo.start_turn(**{**scope, "request_id": "competing", "surface": "alexa"})
+    before = _runtime_rows(db_path)
+    with pytest.raises(RuntimeError, match="runtime_thread_(revision_conflict|contended)"):
+        repo.start_turn(**kwargs)
+    assert _runtime_rows(db_path) == before
+
+
+def test_message_association_unavailable_database_returns_bounded_failure(tmp_path, monkeypatch):
+    import services.runtime_state as module
+
+    db_path, _, _, completion = _message_association_scope(tmp_path)
+    before = _runtime_rows(db_path)
+
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError("private storage error")
+
+    monkeypatch.setattr(module.RuntimeStateRepository, "_connect", unavailable)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _runtime_rows(db_path) == before
