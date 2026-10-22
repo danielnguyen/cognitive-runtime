@@ -885,6 +885,9 @@ class RuntimeTurnUpdateRequest(BaseModel):
     continuation_state: str | None = Field(default=None, max_length=64)
 
 
+ResponseContinuationState = Literal["abbreviated", "expandable"]
+
+
 class RuntimeTurnCompleteRequest(BaseModel):
     request_id: str = Field(max_length=120)
     runtime_session_id: str = Field(max_length=120)
@@ -896,6 +899,10 @@ class RuntimeTurnCompleteRequest(BaseModel):
         default=None, strict=True, min_length=36, max_length=36,
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
+    response_continuation_state: ResponseContinuationState | None = Field(
+        default=None,
+        description="Caller-declared response shaping intent, not timing state or delivery proof.",
+    )
 
     @model_validator(mode="after")
     def validate_pause_completion(self) -> "RuntimeTurnCompleteRequest":
@@ -903,6 +910,10 @@ class RuntimeTurnCompleteRequest(BaseModel):
             raise ValueError("pause_requires_completed_turn")
         if self.assistant_message_id is not None and self.turn_status != "completed":
             raise ValueError("assistant_message_requires_completed_turn")
+        if self.response_continuation_state is not None and (
+            self.turn_status != "completed" or self.assistant_message_id is None
+        ):
+            raise ValueError("response_continuation_requires_completed_message")
         return self
 
 
