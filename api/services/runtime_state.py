@@ -26,6 +26,7 @@ from models import (
     ContinuationSelectionResult,
     HistoryFollowupIntent,
     PersonaSelectionDecision,
+    ResponseContinuationState,
     RestraintPolicy,
     RetirementReservationCancelRequest,
     RetirementReservationCancelResponse,
@@ -663,6 +664,28 @@ class RuntimeStateRepository:
         if event is not None:
             result.update(status="available",
                           assistant_message_id=event.event_payload_json["assistant_message_id"])
+        return result
+
+    def _prior_response_continuation(
+        self, conn: sqlite3.Connection, *, owner_id: str, conversation_id: str,
+        prior_runtime_turn_id: str | None,
+    ) -> dict[str, Any]:
+        # Declaration only: no content, publication, retrieval or timing authority.
+        result = {"status": "unavailable", "response_continuation_state": None}
+        if prior_runtime_turn_id is None:
+            return result
+        turn = self._turn_by_id(conn, prior_runtime_turn_id)
+        if turn is None:
+            return result
+        session = self._session_by_id(conn, turn.runtime_session_id)
+        if (session is None or session.owner_id != owner_id
+                or session.conversation_id != conversation_id):
+            return result
+        event = self._completed_turn_message_event(conn, turn)
+        if event is not None:
+            state = event.event_payload_json.get("response_continuation_state")
+            if state in get_args(ResponseContinuationState):
+                result.update(status="available", response_continuation_state=state)
         return result
 
     def _turn_return_snapshot(
@@ -2144,6 +2167,10 @@ class RuntimeStateRepository:
                 conn, owner_id=owner_id, conversation_id=conversation_id,
                 prior_runtime_turn_id=return_snapshot["prior_terminal_turn_id"],
             )
+            prior_response_continuation = self._prior_response_continuation(
+                conn, owner_id=owner_id, conversation_id=conversation_id,
+                prior_runtime_turn_id=return_snapshot["prior_terminal_turn_id"],
+            )
             session = self._resolve_session_in_transaction(
                 conn,
                 request_id=request_id,
@@ -2209,6 +2236,8 @@ class RuntimeStateRepository:
                     "input_message_id": input_message_id,
                     "return_after_gap": return_snapshot,
                     **({"prior_assistant_message": prior_assistant_message}
+                       if return_snapshot["prior_terminal_turn_id"] is not None else {}),
+                    **({"prior_response_continuation": prior_response_continuation}
                        if return_snapshot["prior_terminal_turn_id"] is not None else {}),
                     **({"resumed_from_pause": True} if session.status == "paused" else {}),
                 },
@@ -2324,6 +2353,7 @@ class RuntimeStateRepository:
         continuation_state: str | None = None,
         session_transition: str | None = None,
         assistant_message_id: str | None = None,
+        response_continuation_state: ResponseContinuationState | None = None,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         now = _now()
         with self._connect("turn_complete") as conn:
@@ -2337,6 +2367,7 @@ class RuntimeStateRepository:
                 continuation_state=continuation_state,
                 session_transition=session_transition,
                 assistant_message_id=assistant_message_id,
+                response_continuation_state=response_continuation_state,
                 now=now,
             )
 
@@ -2351,6 +2382,7 @@ class RuntimeStateRepository:
         continuation_state: str | None = None,
         session_transition: str | None = None,
         assistant_message_id: str | None = None,
+        response_continuation_state: ResponseContinuationState | None = None,
         now: str,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         if session_transition is not None and (
@@ -2359,6 +2391,11 @@ class RuntimeStateRepository:
             raise RuntimeError("runtime_session_transition_invalid")
         if assistant_message_id is not None and (
             turn_status != "completed" or not _canonical_assistant_message_id(assistant_message_id)
+        ):
+            raise RuntimeError("runtime_turn_not_current")
+        if response_continuation_state is not None and (
+            response_continuation_state not in get_args(ResponseContinuationState)
+            or turn_status != "completed" or assistant_message_id is None
         ):
             raise RuntimeError("runtime_turn_not_current")
         session = self._session_by_id(conn, runtime_session_id)
@@ -2400,6 +2437,8 @@ class RuntimeStateRepository:
                 == continuation_state
                 and event.event_payload_json.get("session_transition") == session_transition
                 and event.event_payload_json.get("assistant_message_id") == assistant_message_id
+                and event.event_payload_json.get("response_continuation_state")
+                == response_continuation_state
             ):
                 if assistant_message_id is not None and (
                     self._completed_turn_message_event(conn, turn) != event
@@ -2467,6 +2506,8 @@ class RuntimeStateRepository:
                 **({"session_transition": "pause"} if session_transition == "pause" else {}),
                 **({"assistant_message_id": assistant_message_id}
                    if assistant_message_id is not None else {}),
+                **({"response_continuation_state": response_continuation_state}
+                   if response_continuation_state is not None else {}),
             },
         )
         thread_update = conn.execute(
@@ -3323,6 +3364,7 @@ def complete_turn(
     continuation_state: str | None = None,
     session_transition: str | None = None,
     assistant_message_id: str | None = None,
+    response_continuation_state: ResponseContinuationState | None = None,
 ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
     return runtime_state_repository().complete_turn(
         request_id=request_id,
@@ -3332,6 +3374,7 @@ def complete_turn(
         continuation_state=continuation_state,
         session_transition=session_transition,
         assistant_message_id=assistant_message_id,
+        response_continuation_state=response_continuation_state,
     )
 
 

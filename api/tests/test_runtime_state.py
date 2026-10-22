@@ -7204,20 +7204,27 @@ def _message_association_scope(tmp_path):
 @pytest.mark.parametrize("surface", ["web", "alexa"])
 @pytest.mark.parametrize("gap", [0, 299, 300, 301])
 @pytest.mark.parametrize("pause", [False, True])
+@pytest.mark.parametrize("response_state", [None, "abbreviated", "expandable"])
 def test_completed_message_survives_restart_and_next_admission(
-    tmp_path, monkeypatch, surface, gap, pause,
+    tmp_path, monkeypatch, surface, gap, pause, response_state,
 ):
     import services.runtime_state as module
 
     clock = [datetime(2026, 1, 1, tzinfo=UTC)]
     monkeypatch.setattr(module, "_now", lambda: clock[0].isoformat())
     db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    completion["response_continuation_state"] = response_state
     completion["session_transition"] = "pause" if pause else None
     response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
     assert response.status_code == 200
     original = response.json()
     assert original["event"]["event_payload_json"]["assistant_message_id"] == _ASSISTANT_MESSAGE_ID
     assert original["runtime_turn"]["turn_status"] == "completed"
+    if response_state is None:
+        assert "response_continuation_state" not in original["event"]["event_payload_json"]
+    else:
+        assert (original["event"]["event_payload_json"]["response_continuation_state"]
+                == response_state)
     assert original["runtime_session"]["status"] == ("paused" if pause else "active")
     reopened = RuntimeStateRepository(db_path)
     before = _runtime_rows(db_path)
@@ -7234,6 +7241,11 @@ def test_completed_message_survives_restart_and_next_admission(
     assert event.event_payload_json["prior_assistant_message"] == {
         "status": "available", "assistant_message_id": _ASSISTANT_MESSAGE_ID,
     }
+    assert event.event_payload_json["prior_response_continuation"] == {
+        "status": "available" if response_state else "unavailable",
+        "response_continuation_state": response_state,
+    }
+    assert "response_continuation_state" not in snapshot
     assert session.owner_id == scope["owner_id"]
     assert session.conversation_id == scope["conversation_id"] and session.surface == surface
     assert turn.turn_status == "received" and session.status == "active"
@@ -7254,8 +7266,12 @@ def test_completed_message_survives_restart_and_next_admission(
 
 
 @pytest.mark.parametrize("message_id", [None, "87654321-4321-4321-4321-cba987654321"])
-def test_message_association_uses_specific_latest_completed_turn(tmp_path, message_id):
+@pytest.mark.parametrize("response_state", [None, "abbreviated", "expandable"])
+def test_message_association_uses_specific_latest_completed_turn(
+    tmp_path, response_state, message_id,
+):
     _, repo, scope, completion = _message_association_scope(tmp_path)
+    completion["response_continuation_state"] = response_state
     repo.complete_turn(**completion)
     session, turn, _ = repo.start_turn(**{**scope, "request_id": "second"})
     _, _, second = repo.complete_turn(
@@ -7273,6 +7289,9 @@ def test_message_association_uses_specific_latest_completed_turn(tmp_path, messa
         "status": "unavailable" if message_id is None else "available",
         "assistant_message_id": message_id,
     }  # Never substitute the older associated answer for an unassociated latest turn.
+    assert following.event_payload_json["prior_response_continuation"] == {
+        "status": "unavailable", "response_continuation_state": None,
+    }  # Neither an older marker nor timing state substitutes for a missing declaration.
 
 
 @pytest.mark.parametrize("existing,replay", [
@@ -7331,8 +7350,12 @@ def test_message_association_rejects_invalid_current_context(tmp_path, change):
 @pytest.mark.parametrize("fault", ["missing", "malformed", "duplicate", "request", "session",
                                   "input", "status", "forged_request"])
 @pytest.mark.parametrize("historical", [False, True])
-def test_message_association_requires_original_admission(tmp_path, fault, historical):
+@pytest.mark.parametrize("response_state", [None, "abbreviated", "expandable"])
+def test_message_association_requires_original_admission(
+    tmp_path, response_state, fault, historical,
+):
     db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    completion["response_continuation_state"] = response_state
     if historical:
         repo.complete_turn(**completion)
     foreign = repo.resolve_session(request_id="foreign", owner_id="other-owner",
@@ -7372,12 +7395,19 @@ def test_message_association_requires_original_admission(tmp_path, fault, histor
         assert event.event_payload_json["prior_assistant_message"] == {
             "status": "unavailable", "assistant_message_id": None,
         }
+        assert event.event_payload_json["prior_response_continuation"] == {
+            "status": "unavailable", "response_continuation_state": None,
+        }
 
 
 @pytest.mark.parametrize("fault", ["missing", "malformed", "duplicate", "request", "session",
                                   "id", "status", "continuation", "transition", "missing_state"])
-def test_prior_message_association_rejects_corrupt_completion_events(tmp_path, fault):
+@pytest.mark.parametrize("response_state", [None, "abbreviated", "expandable"])
+def test_prior_message_association_rejects_corrupt_completion_events(
+    tmp_path, response_state, fault,
+):
     db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    completion["response_continuation_state"] = response_state
     _, _, completed = repo.complete_turn(**completion)
     foreign = repo.resolve_session(request_id="foreign", owner_id="other-owner",
                                    conversation_id="other-conversation", surface="web")
@@ -7412,11 +7442,16 @@ def test_prior_message_association_rejects_corrupt_completion_events(tmp_path, f
     assert event.event_payload_json["prior_assistant_message"] == {
         "status": "unavailable", "assistant_message_id": None,
     }
+    assert event.event_payload_json["prior_response_continuation"] == {
+        "status": "unavailable", "response_continuation_state": None,
+    }
 
 
 @pytest.mark.parametrize("operation", ["complete", "admit"])
-def test_message_association_failure_is_atomic(tmp_path, monkeypatch, operation):
+@pytest.mark.parametrize("response_state", [None, "abbreviated", "expandable"])
+def test_message_association_failure_is_atomic(tmp_path, response_state, monkeypatch, operation):
     db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    completion["response_continuation_state"] = response_state
     if operation == "admit":
         repo.complete_turn(**completion)
     before = _runtime_rows(db_path)
@@ -7436,14 +7471,22 @@ def test_message_association_failure_is_atomic(tmp_path, monkeypatch, operation)
 @pytest.mark.parametrize("owner,conversation", [
     ("other-owner", "conversation-pause"), ("owner-pause", "other-conversation"),
 ])
-def test_prior_message_reference_never_crosses_owner_or_conversation(tmp_path, owner, conversation):
+@pytest.mark.parametrize("response_state", [None, "abbreviated", "expandable"])
+def test_prior_message_reference_never_crosses_owner_or_conversation(
+    tmp_path, response_state, owner, conversation,
+):
     _, repo, _, completion = _message_association_scope(tmp_path)
+    completion["response_continuation_state"] = response_state
     repo.complete_turn(**completion)
     with repo._connect() as conn:
         assert repo._prior_assistant_message(
             conn, owner_id=owner, conversation_id=conversation,
             prior_runtime_turn_id=completion["runtime_turn_id"],
         ) == {"status": "unavailable", "assistant_message_id": None}
+        assert repo._prior_response_continuation(
+            conn, owner_id=owner, conversation_id=conversation,
+            prior_runtime_turn_id=completion["runtime_turn_id"],
+        ) == {"status": "unavailable", "response_continuation_state": None}
 
 
 @pytest.mark.parametrize("status", ["completed", "abandoned"])
@@ -7472,8 +7515,10 @@ def test_legacy_null_completion_and_first_turn_are_unchanged(tmp_path, status):
 
 
 @pytest.mark.parametrize("obstacle", ["revision", "contention"])
-def test_rejected_admission_cannot_publish_message_provenance(tmp_path, obstacle):
+@pytest.mark.parametrize("response_state", [None, "abbreviated", "expandable"])
+def test_rejected_admission_cannot_publish_message_provenance(tmp_path, response_state, obstacle):
     db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    completion["response_continuation_state"] = response_state
     repo.complete_turn(**completion)
     kwargs = {**scope, "request_id": "next"}
     if obstacle == "revision":
@@ -7486,10 +7531,14 @@ def test_rejected_admission_cannot_publish_message_provenance(tmp_path, obstacle
     assert _runtime_rows(db_path) == before
 
 
-def test_message_association_unavailable_database_returns_bounded_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize("response_state", [None, "abbreviated", "expandable"])
+def test_message_association_unavailable_database_returns_bounded_failure(
+    tmp_path, response_state, monkeypatch,
+):
     import services.runtime_state as module
 
     db_path, _, _, completion = _message_association_scope(tmp_path)
+    completion["response_continuation_state"] = response_state
     before = _runtime_rows(db_path)
 
     def unavailable(*args, **kwargs):
@@ -7499,4 +7548,143 @@ def test_message_association_unavailable_database_returns_bounded_failure(tmp_pa
     response = TestClient(app).post("/v1/runtime/turns/complete", json=completion)
     assert response.status_code == 503
     assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("state", ["none", "suppressed", "deferred_expansion", "waiting", "",
+                                 "abbreviated ", "ABBREVIATED", True, 1, [], {}])
+def test_response_continuation_rejects_unbounded_or_timing_values(tmp_path, state):
+    db_path, repo, _, completion = _message_association_scope(tmp_path)
+    invalid = {**completion, "response_continuation_state": state}
+    before = _runtime_rows(db_path)
+    response = TestClient(app).post("/v1/runtime/turns/complete", json=invalid)
+    assert response.status_code == 422
+    with pytest.raises(RuntimeError, match="runtime_turn_not_current"):
+        repo.complete_turn(**invalid)
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("state", ["abbreviated", "expandable"])
+@pytest.mark.parametrize("fault", ["missing_message", "invalid_message", "abandoned"])
+def test_response_continuation_requires_completed_assistant_association(tmp_path, state, fault):
+    db_path, repo, _, completion = _message_association_scope(tmp_path)
+    invalid = {**completion, "response_continuation_state": state}
+    invalid.update({
+        "missing_message": {"assistant_message_id": None},
+        "invalid_message": {"assistant_message_id": "not-a-uuid"},
+        "abandoned": {"turn_status": "abandoned"},
+    }[fault])
+    before = _runtime_rows(db_path)
+    assert TestClient(app).post("/v1/runtime/turns/complete", json=invalid).status_code == 422
+    with pytest.raises(RuntimeError, match="runtime_turn_not_current"):
+        repo.complete_turn(**invalid)
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("existing,replay", [
+    (None, "abbreviated"), (None, "expandable"), ("abbreviated", None),
+    ("expandable", None), ("abbreviated", "expandable"), ("expandable", "abbreviated"),
+])
+def test_response_continuation_replay_cannot_attach_remove_or_replace(tmp_path, existing, replay):
+    db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    repo.complete_turn(**completion, response_continuation_state=existing)
+    before = _runtime_rows(db_path)
+    denied = {**completion, "response_continuation_state": replay}
+    assert TestClient(app).post("/v1/runtime/turns/complete", json=denied).status_code == 409
+    assert _runtime_rows(db_path) == before
+    repo.start_turn(**{**scope, "request_id": "next"})
+    before = _runtime_rows(db_path)
+    with pytest.raises(RuntimeError, match="runtime_turn_not_current"):
+        repo.complete_turn(**denied)
+    assert _runtime_rows(db_path) == before
+
+
+@pytest.mark.parametrize("value", [None, "none", "suppressed", "deferred_expansion", "wrong",
+                                  True, [], {}, {"state": "abbreviated"}])
+def test_corrupt_response_marker_is_unavailable_without_losing_valid_message(tmp_path, value):
+    _, repo, scope, completion = _message_association_scope(tmp_path)
+    _, _, event = repo.complete_turn(**completion, response_continuation_state="abbreviated")
+    with repo._connect() as conn:
+        payload = {**event.event_payload_json, "response_continuation_state": value}
+        conn.execute("UPDATE conversation_runtime_events SET event_payload_json=? "
+                     "WHERE event_type='turn_completed'", (json.dumps(payload),))
+    _, _, admitted = repo.start_turn(**{**scope, "request_id": "next"})
+    assert admitted.event_payload_json["prior_response_continuation"] == {
+        "status": "unavailable", "response_continuation_state": None,
+    }
+    assert admitted.event_payload_json["prior_assistant_message"] == {
+        "status": "available", "assistant_message_id": _ASSISTANT_MESSAGE_ID,
+    }  # Response shaping never changes the independent exact-message association.
+
+
+@pytest.mark.parametrize("state", ["abbreviated", "expandable"])
+@pytest.mark.parametrize("timing_state", get_args(RuntimeTimingContinuationState))
+def test_response_continuation_is_distinct_from_timing_and_session_state(
+    tmp_path, state, timing_state, monkeypatch, caplog,
+):
+    monkeypatch.setenv("SQLITE_TRANSACTION_TIMING_ENABLED", "true")
+    caplog.set_level("INFO", logger="uvicorn.error")
+    _, repo, scope, completion = _message_association_scope(tmp_path)
+    _, completed, event = repo.complete_turn(
+        **completion, continuation_state=timing_state, response_continuation_state=state,
+    )
+    assert completed.continuation_state == timing_state
+    assert "response_continuation_state" not in completed.model_dump()
+    assert event.event_payload_json["continuation_state"] == timing_state
+    session, turn, admitted = repo.start_turn(**{**scope, "request_id": "next"})
+    assert (admitted.event_payload_json["return_after_gap"]["prior_continuation_state"]
+            == timing_state)
+    assert admitted.event_payload_json["prior_response_continuation"] == {
+        "status": "available", "response_continuation_state": state,
+    }
+    assert turn.continuation_state is None  # A declaration cannot choose the new turn's timing.
+    assert "response_continuation_state" not in session.model_dump()
+    assert "prior_response_continuation" not in repo.resolve_state(
+        owner_id=scope["owner_id"], conversation_id=scope["conversation_id"],
+        surface=scope["surface"],
+    ).model_dump()
+    projection = json.dumps(admitted.event_payload_json["prior_response_continuation"])
+    assert _ASSISTANT_MESSAGE_ID not in projection
+    assert scope["conversation_id"] not in projection and scope["owner_id"] not in projection
+    assert _ASSISTANT_MESSAGE_ID not in caplog.text
+    assert "response_continuation_state" not in caplog.text
+
+
+def test_incomplete_or_abandoned_turn_cannot_supply_response_marker(tmp_path):
+    db_path, repo, scope, completion = _message_association_scope(tmp_path)
+    before = _runtime_rows(db_path)
+    with pytest.raises(RuntimeError, match="runtime_thread_contended"):
+        repo.start_turn(**{**scope, "request_id": "cannot-admit"})
+    assert _runtime_rows(db_path) == before
+    repo.complete_turn(
+        **{**completion, "turn_status": "abandoned", "assistant_message_id": None},
+    )
+    # Even fabricated response metadata on an abandoned event grants no projection.
+    with repo._connect() as conn:
+        conn.execute("UPDATE conversation_runtime_events SET event_payload_json=? "
+                     "WHERE event_type='turn_completed'", (json.dumps({
+                         "request_id": completion["request_id"], "turn_status": "completed",
+                         "continuation_state": None, "assistant_message_id": _ASSISTANT_MESSAGE_ID,
+                         "response_continuation_state": "expandable",
+                     }),))
+        assert repo._prior_response_continuation(
+            conn, owner_id=scope["owner_id"], conversation_id=scope["conversation_id"],
+            prior_runtime_turn_id=completion["runtime_turn_id"],
+        ) == {"status": "unavailable", "response_continuation_state": None}
+    _, _, next_turn = repo.start_turn(**{**scope, "request_id": "after-abandon"})
+    assert next_turn.event_payload_json["return_after_gap"]["prior_terminal_turn_id"] is None
+    assert "prior_response_continuation" not in next_turn.event_payload_json
+
+
+def test_null_response_marker_preserves_legacy_completion_event(tmp_path):
+    db_path, _, _, completion = _message_association_scope(tmp_path)
+    client = TestClient(app)
+    omitted = client.post("/v1/runtime/turns/complete", json=completion)
+    before = _runtime_rows(db_path)
+    explicit_null = client.post("/v1/runtime/turns/complete", json={
+        **completion, "response_continuation_state": None,
+    })
+    assert omitted.status_code == explicit_null.status_code == 200
+    assert explicit_null.json() == omitted.json()
+    assert "response_continuation_state" not in omitted.json()["event"]["event_payload_json"]
     assert _runtime_rows(db_path) == before
