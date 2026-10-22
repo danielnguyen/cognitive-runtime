@@ -533,6 +533,7 @@ async def runtime_turn_complete(body: RuntimeTurnCompleteRequest) -> RuntimeTurn
             turn_status=body.turn_status,
             continuation_state=body.continuation_state,
             session_transition=body.session_transition,
+            assistant_message_id=body.assistant_message_id,
         )
     except Exception as exc:
         raise _runtime_state_http_error(exc) from None

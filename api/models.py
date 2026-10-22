@@ -892,11 +892,17 @@ class RuntimeTurnCompleteRequest(BaseModel):
     turn_status: Literal["completed", "abandoned"] = "completed"
     continuation_state: str | None = Field(default=None, max_length=64)
     session_transition: Literal["pause"] | None = None
+    assistant_message_id: str | None = Field(
+        default=None, strict=True, min_length=36, max_length=36,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
 
     @model_validator(mode="after")
     def validate_pause_completion(self) -> "RuntimeTurnCompleteRequest":
         if self.session_transition == "pause" and self.turn_status != "completed":
             raise ValueError("pause_requires_completed_turn")
+        if self.assistant_message_id is not None and self.turn_status != "completed":
+            raise ValueError("assistant_message_requires_completed_turn")
         return self
 
 

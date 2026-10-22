@@ -13,7 +13,7 @@ from hashlib import sha256
 from pathlib import Path
 from time import perf_counter_ns
 from typing import Any, Iterator, get_args
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from models import (
     RUNTIME_TIMING_BUDGET_MS,
@@ -375,6 +375,13 @@ def _turn_id(runtime_session_id: str, request_id: str, created_at: str) -> str:
     return _digest("rtturn", f"{runtime_session_id}:{request_id}:{created_at}")
 
 
+def _canonical_assistant_message_id(value: Any) -> bool:
+    try:
+        return isinstance(value, str) and len(value) == 36 and str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
 def _event_id(runtime_session_id: str, event_type: str, created_at: str, ordinal: int) -> str:
     return _digest("rtevent", f"{runtime_session_id}:{event_type}:{created_at}:{ordinal}")
 
@@ -574,6 +581,89 @@ class RuntimeStateRepository:
                 "not_applicable": "no_completed_turn",
             }[status],
         ).model_dump(mode="json")
+
+    def _turn_admission_request(
+        self, conn: sqlite3.Connection, turn: RuntimeTurn,
+    ) -> str | None:
+        rows = conn.execute(
+            "SELECT runtime_session_id, event_payload_json "
+            "FROM conversation_runtime_events WHERE runtime_turn_id = ? "
+            "AND event_type = 'turn_started' ORDER BY id LIMIT 2;",
+            (turn.runtime_turn_id,),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            payload = json.loads(rows[0]["event_payload_json"])
+            if not isinstance(payload, dict):
+                return None
+            request_id = payload.get("request_id")
+            if (
+                not isinstance(request_id, str) or not 1 <= len(request_id) <= 120
+                or not request_id.strip()
+                or rows[0]["runtime_session_id"] != turn.runtime_session_id
+                or payload.get("turn_status") != "received"
+                or "input_message_id" not in payload
+                or payload.get("input_message_id") != turn.input_message_id
+                or _turn_id(turn.runtime_session_id, request_id, turn.created_at)
+                != turn.runtime_turn_id
+            ):
+                return None
+            return request_id
+        except (TypeError, ValueError):
+            return None
+
+    def _completed_turn_message_event(
+        self, conn: sqlite3.Connection, turn: RuntimeTurn,
+    ) -> RuntimeEvent | None:
+        """Validate CO's association, not BMS publication or content authority."""
+        if turn.turn_status != "completed" or turn.completed_at is None:
+            return None
+        request_id = self._turn_admission_request(conn, turn)
+        rows = conn.execute(
+            "SELECT * FROM conversation_runtime_events WHERE runtime_turn_id = ? "
+            "AND event_type = 'turn_completed' ORDER BY id LIMIT 2;",
+            (turn.runtime_turn_id,),
+        ).fetchall()
+        if request_id is None or len(rows) != 1:
+            return None
+        try:
+            event = self._event_from_row(rows[0])
+            payload = event.event_payload_json
+            if (
+                not {"request_id", "turn_status", "continuation_state", "assistant_message_id"}
+                <= payload.keys()
+                or event.runtime_session_id != turn.runtime_session_id
+                or payload.get("request_id") != request_id
+                or payload.get("turn_status") != "completed"
+                or payload.get("continuation_state") != turn.continuation_state
+                or payload.get("session_transition") not in {None, "pause"}
+                or not _canonical_assistant_message_id(payload.get("assistant_message_id"))
+            ):
+                return None
+            return event
+        except (TypeError, ValueError, ValidationError):
+            return None
+
+    def _prior_assistant_message(
+        self, conn: sqlite3.Connection, *, owner_id: str, conversation_id: str,
+        prior_runtime_turn_id: str | None,
+    ) -> dict[str, Any]:
+        result = {"status": "unavailable", "assistant_message_id": None}
+        if prior_runtime_turn_id is None:
+            return result
+        turn = self._turn_by_id(conn, prior_runtime_turn_id)
+        if turn is None:
+            return result
+        session = self._session_by_id(conn, turn.runtime_session_id)
+        if (session is None or session.owner_id != owner_id
+                or session.conversation_id != conversation_id):
+            return result
+        event = self._completed_turn_message_event(conn, turn)
+        if event is not None:
+            result.update(status="available",
+                          assistant_message_id=event.event_payload_json["assistant_message_id"])
+        return result
 
     def _turn_return_snapshot(
         self,
@@ -2050,6 +2140,10 @@ class RuntimeStateRepository:
 
             created_at = _now()
             return_snapshot = self._return_snapshot(conn, thread, created_at)
+            prior_assistant_message = self._prior_assistant_message(
+                conn, owner_id=owner_id, conversation_id=conversation_id,
+                prior_runtime_turn_id=return_snapshot["prior_terminal_turn_id"],
+            )
             session = self._resolve_session_in_transaction(
                 conn,
                 request_id=request_id,
@@ -2114,6 +2208,8 @@ class RuntimeStateRepository:
                     "turn_status": "received",
                     "input_message_id": input_message_id,
                     "return_after_gap": return_snapshot,
+                    **({"prior_assistant_message": prior_assistant_message}
+                       if return_snapshot["prior_terminal_turn_id"] is not None else {}),
                     **({"resumed_from_pause": True} if session.status == "paused" else {}),
                 },
             )
@@ -2227,6 +2323,7 @@ class RuntimeStateRepository:
         turn_status: str,
         continuation_state: str | None = None,
         session_transition: str | None = None,
+        assistant_message_id: str | None = None,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         now = _now()
         with self._connect("turn_complete") as conn:
@@ -2239,6 +2336,7 @@ class RuntimeStateRepository:
                 turn_status=turn_status,
                 continuation_state=continuation_state,
                 session_transition=session_transition,
+                assistant_message_id=assistant_message_id,
                 now=now,
             )
 
@@ -2252,12 +2350,17 @@ class RuntimeStateRepository:
         turn_status: str,
         continuation_state: str | None = None,
         session_transition: str | None = None,
+        assistant_message_id: str | None = None,
         now: str,
     ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
         if session_transition is not None and (
             session_transition != "pause" or turn_status != "completed"
         ):
             raise RuntimeError("runtime_session_transition_invalid")
+        if assistant_message_id is not None and (
+            turn_status != "completed" or not _canonical_assistant_message_id(assistant_message_id)
+        ):
+            raise RuntimeError("runtime_turn_not_current")
         session = self._session_by_id(conn, runtime_session_id)
         if session is None:
             raise RuntimeError("runtime_session_not_found")
@@ -2266,33 +2369,23 @@ class RuntimeStateRepository:
             raise RuntimeError("runtime_turn_not_found")
         if turn.runtime_session_id != runtime_session_id:
             raise RuntimeError("runtime_turn_session_mismatch")
-        if session_transition == "pause":
-            # Pause is explicit current-request control, not a timing inference.
-            started = conn.execute(
-                "SELECT runtime_session_id, event_payload_json FROM conversation_runtime_events "
-                "WHERE runtime_turn_id = ? AND event_type = 'turn_started' ORDER BY id LIMIT 2;",
-                (runtime_turn_id,),
-            ).fetchall()
-            try:
-                admission = (
-                    json.loads(started[0]["event_payload_json"]) if len(started) == 1 else None
-                )
-            except (TypeError, ValueError):
-                admission = None
+        if session_transition == "pause" or assistant_message_id is not None:
+            # Explicit controls and message associations require original admission provenance.
             if (
-                not isinstance(admission, dict)
-                or started[0]["runtime_session_id"] != runtime_session_id
-                or admission.get("request_id") != request_id
-                or admission.get("turn_status") != "received"
-                or admission.get("input_message_id") != turn.input_message_id
-                or not request_id.strip()
+                self._turn_admission_request(conn, turn) != request_id
                 or turn.turn_status == "abandoned"
             ):
                 raise RuntimeError("runtime_turn_not_current")
+        if session_transition == "pause":
             if continuation_state is not None and continuation_state != turn.continuation_state:
                 raise RuntimeError("runtime_session_transition_invalid")
             continuation_state = turn.continuation_state
         if turn.turn_status in _TERMINAL_TURN_STATUSES:
+            if conn.execute(
+                "SELECT count(*) FROM conversation_runtime_events WHERE runtime_turn_id = ? "
+                "AND event_type = 'turn_completed';", (runtime_turn_id,),
+            ).fetchone()[0] != 1:
+                raise RuntimeError("runtime_turn_not_current")
             event = self._turn_event(
                 conn,
                 runtime_turn_id=runtime_turn_id,
@@ -2306,7 +2399,12 @@ class RuntimeStateRepository:
                 and event.event_payload_json.get("continuation_state")
                 == continuation_state
                 and event.event_payload_json.get("session_transition") == session_transition
+                and event.event_payload_json.get("assistant_message_id") == assistant_message_id
             ):
+                if assistant_message_id is not None and (
+                    self._completed_turn_message_event(conn, turn) != event
+                ):
+                    raise RuntimeError("runtime_turn_not_current")
                 if session_transition == "pause":
                     latest = conn.execute(
                         "SELECT runtime_turn_id FROM conversation_runtime_turns "
@@ -2319,7 +2417,7 @@ class RuntimeStateRepository:
                 return session, turn, event
             raise RuntimeError("runtime_turn_not_current")
 
-        if session_transition == "pause":
+        if session_transition == "pause" or assistant_message_id is not None:
             inspection = self._inspect_continuation_thread(
                 conn, owner_id=session.owner_id, conversation_id=session.conversation_id,
             )
@@ -2328,10 +2426,15 @@ class RuntimeStateRepository:
             if inspection["state"] != "active":
                 raise RuntimeError("runtime_thread_unavailable")
         thread = self._validate_current_turn(conn, session=session, turn=turn)
-        if session_transition == "pause" and (
+        if (session_transition == "pause" or assistant_message_id is not None) and (
             thread["active_request_id"] != request_id
             or session.status != "active" or session.closed_at is not None
         ):
+            raise RuntimeError("runtime_turn_not_current")
+        if assistant_message_id is not None and conn.execute(
+            "SELECT 1 FROM conversation_runtime_events WHERE runtime_turn_id = ? "
+            "AND event_type = 'turn_completed' LIMIT 1;", (runtime_turn_id,),
+        ).fetchone() is not None:
             raise RuntimeError("runtime_turn_not_current")
         self._update_turn_row(
             conn,
@@ -2362,6 +2465,8 @@ class RuntimeStateRepository:
                 "turn_status": turn_status,
                 "continuation_state": continuation_state,
                 **({"session_transition": "pause"} if session_transition == "pause" else {}),
+                **({"assistant_message_id": assistant_message_id}
+                   if assistant_message_id is not None else {}),
             },
         )
         thread_update = conn.execute(
@@ -3217,6 +3322,7 @@ def complete_turn(
     turn_status: str,
     continuation_state: str | None = None,
     session_transition: str | None = None,
+    assistant_message_id: str | None = None,
 ) -> tuple[RuntimeSession, RuntimeTurn, RuntimeEvent]:
     return runtime_state_repository().complete_turn(
         request_id=request_id,
@@ -3225,6 +3331,7 @@ def complete_turn(
         turn_status=turn_status,
         continuation_state=continuation_state,
         session_transition=session_transition,
+        assistant_message_id=assistant_message_id,
     )
 
 
