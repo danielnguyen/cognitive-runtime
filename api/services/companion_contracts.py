@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
+
+if TYPE_CHECKING:
+    from models import RuntimeState
+    from services.scene_resolution import SceneResolutionResult
 
 DEFAULT_DB_PATH = "./data/companion_contracts.sqlite3"
 DEFAULT_PROFILE_ID = "default_companion_profile"
@@ -869,12 +873,15 @@ class CompanionContractsRepository:
         signals_json: dict[str, Any],
         used_fallback: bool,
         used_default_scene: bool,
+        connection: sqlite3.Connection | None = None,
+        attached: bool = False,
     ) -> None:
         created_at = datetime.now(UTC).isoformat()
-        with self._connect() as conn:
+        table = "scene_contracts.scene_resolution_events" if attached else "scene_resolution_events"
+        with self._connect() if connection is None else nullcontext(connection) as conn:
             conn.execute(
-                """
-                INSERT INTO scene_resolution_events (
+                f"""
+                INSERT INTO {table} (
                     request_id, owner_id, conversation_id, surface, requested_scene,
                     runtime_scene, resolved_scene_id, confidence, source,
                     signals_json, used_fallback, used_default_scene, created_at
@@ -895,6 +902,96 @@ class CompanionContractsRepository:
                     int(used_default_scene),
                     created_at,
                 ),
+            )
+
+    def record_scene_transition(
+        self, *, request_id: str, state: RuntimeState,
+        runtime_session_id: str, runtime_turn_id: str,
+        resolution: SceneResolutionResult, previous_scene: ScenePolicyRecord | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        """Append only changed effective policies to the existing scene history.
+
+        Diagnostic resolve calls retain their per-call records. Applied, bound
+        decisions carry a transition only when scene identity/version changes.
+        No second current-scene store is introduced.
+        """
+        def snapshot(scene: ScenePolicyRecord) -> dict[str, Any]:
+            return {
+                "content": scene.content,
+                "constraints": scene.constraints_json,
+                "initiative": scene.initiative_policy_json,
+                "interrupt": scene.interrupt_policy_json,
+                "recall": scene.recall_policy_json,
+                "format": scene.format_policy_json,
+            }
+
+        baseline = previous_scene or self.default_scene_policy()
+        table = (
+            "scene_resolution_events" if connection is None
+            else "scene_contracts.scene_resolution_events"
+        )
+        with self._connect() if connection is None else nullcontext(connection) as conn:
+            if connection is None:
+                conn.execute("BEGIN IMMEDIATE;")
+            row = conn.execute(
+                f"""SELECT * FROM {table}
+                   WHERE owner_id = ? AND conversation_id = ? AND surface = ?
+                     AND json_extract(signals_json, '$.runtime_session_id') = ?
+                     AND json_type(signals_json, '$.transition') IS NOT NULL
+                   ORDER BY id DESC LIMIT 1;""",
+                (state.owner_id, state.conversation_id, state.surface, runtime_session_id),
+            ).fetchone()
+            previous_id, previous_version = baseline.scene_id, baseline.version
+            previous_policy = snapshot(baseline)
+            if row is not None:
+                signals = json.loads(row["signals_json"])
+                previous_id = row["resolved_scene_id"]
+                previous_version = signals["scene_version"]
+                previous_policy = signals["policy_snapshot"]
+                if not isinstance(previous_policy, dict) or not isinstance(
+                    signals["transition"], dict,
+                ):
+                    raise RuntimeError("scene_history_unavailable")
+            scene = resolution.scene
+            if (previous_id, previous_version) == (scene.scene_id, scene.version):
+                return
+            current_policy = snapshot(scene)
+            delta = {
+                key: {"previous": previous_policy.get(key), "current": value}
+                for key, value in current_policy.items()
+                if previous_policy.get(key) != value
+            }
+            # Only registry-owned policy and bounded structural decisions belong
+            # in transition traces, never unrecognized input labels or user text.
+            self.record_scene_resolution_event(
+                request_id=request_id, owner_id=state.owner_id,
+                conversation_id=state.conversation_id, surface=state.surface,
+                requested_scene=scene.scene_id if resolution.source == "requested_scene" else None,
+                runtime_scene=(
+                    state.active_scene if self.scene_policy(state.active_scene or "") else None
+                ),
+                resolved_scene_id=scene.scene_id, confidence=resolution.confidence,
+                source=resolution.source, used_fallback=resolution.used_fallback,
+                used_default_scene=resolution.used_default_scene,
+                signals_json={
+                    "runtime_session_id": runtime_session_id,
+                    "runtime_turn_id": runtime_turn_id,
+                    "scene_version": scene.version,
+                    "policy_snapshot": current_policy,
+                    "transition": {
+                        "previous_scene_id": previous_id,
+                        "scene_id": scene.scene_id,
+                        "previous_scene_version": previous_version,
+                        "scene_version": scene.version,
+                        "source": resolution.source,
+                        "policy_delta": delta,
+                        "fallback_reason": (
+                            resolution.warnings[0] if resolution.used_fallback else None
+                        ),
+                    },
+                },
+                connection=conn, attached=connection is not None,
             )
 
     @contextmanager

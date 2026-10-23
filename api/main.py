@@ -95,6 +95,8 @@ from models import (
     RuntimeTurnsReconcileResponse,
     RuntimeTurnStartRequest,
     RuntimeTurnUpdateRequest,
+    SceneOverrideRequest,
+    SceneOverrideResponse,
     ScenePolicyDetail,
     SceneResolveRequest,
     SceneResolveResponse,
@@ -182,6 +184,7 @@ from services.runtime_state import (
     resolve_runtime_session,
     resolve_runtime_thread,
     resolve_state,
+    runtime_state_repository,
     select_runtime_continuation,
     start_turn,
     update_state,
@@ -1207,6 +1210,42 @@ async def companion_scene_resolve(body: SceneResolveRequest) -> SceneResolveResp
         raise _runtime_state_http_error(exc) from None
 
 
+@app.post("/v1/companion/scene/override", response_model=SceneOverrideResponse)
+async def companion_scene_override(body: SceneOverrideRequest) -> SceneOverrideResponse:
+    try:
+        with runtime_state_repository().scene_override(**body.model_dump()) as (
+            previous, state, connection,
+        ):
+            resolution = resolve_scene(
+                requested_scene=None, runtime_scene=state.active_scene,
+                runtime_interaction_mode=state.interaction_mode,
+            )
+            previous_resolution = resolve_scene(
+                requested_scene=None, runtime_scene=previous.active_scene,
+                runtime_interaction_mode=previous.interaction_mode,
+            )
+            companion_contracts_repository().record_scene_transition(
+                request_id=body.request_id, state=state,
+                runtime_session_id=body.runtime_session_id, runtime_turn_id=body.runtime_turn_id,
+                resolution=resolution, previous_scene=previous_resolution.scene,
+                connection=connection,
+            )
+            return SceneOverrideResponse(
+                scene_id=resolution.scene.scene_id, scene_version=resolution.scene.version,
+                scene_confidence=resolution.confidence, scene_source=resolution.source,
+                warnings=resolution.warnings, signals_json=resolution.signals_json,
+                used_fallback=resolution.used_fallback,
+                used_default_scene=resolution.used_default_scene,
+                policy=_scene_policy_detail(resolution.scene), runtime_state=state,
+            )
+    except ValueError as exc:
+        if str(exc) == "unknown_scene_override":
+            raise HTTPException(status_code=400, detail="unknown_scene_override") from None
+        raise _runtime_state_http_error(exc) from None
+    except Exception as exc:
+        raise _runtime_state_http_error(exc) from None
+
+
 @app.get("/v1/companion/scene/{scene_id}", response_model=ScenePolicyDetail)
 async def companion_scene_detail(scene_id: str) -> ScenePolicyDetail:
     scene = companion_contracts_repository().scene_policy(scene_id)
@@ -1305,9 +1344,21 @@ def _compile_companion_profile(
 ) -> CompanionPolicyCompileResponse:
     try:
         with companion_policy_state(body) as state:
-            return CompanionPolicyCompileResponse(
+            response = CompanionPolicyCompileResponse(
                 **compile_policy(state=state, requested_scene=body.requested_scene)
             )
+            if body.runtime_session_id is not None:
+                resolution = resolve_scene(
+                    requested_scene=body.requested_scene, runtime_scene=state.active_scene,
+                    runtime_interaction_mode=state.interaction_mode,
+                )
+                companion_contracts_repository().record_scene_transition(
+                    request_id=body.request_id, state=state,
+                    runtime_session_id=body.runtime_session_id,
+                    runtime_turn_id=body.runtime_turn_id,
+                    resolution=resolution,
+                )
+            return response
     except Exception as exc:
         if body.runtime_session_id is None:
             raise

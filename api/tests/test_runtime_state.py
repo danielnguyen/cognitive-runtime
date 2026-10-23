@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import subprocess
+import sys
 import threading
 from asyncio import CancelledError
 from concurrent.futures import ThreadPoolExecutor
@@ -6656,12 +6658,13 @@ def test_bound_scene_rejects_corrupt_authority_without_repair(tmp_path, defect):
     scene_events = companion_contracts_repository().list_scene_resolution_events_for_tests()
     for endpoint in (
         "/v1/companion/scene/resolve", "/v1/companion/profile/compile",
-        "/v1/companion/policy/compile",
+        "/v1/companion/policy/compile", "/v1/companion/scene/override",
     ):
         denied = client.post(endpoint, json={
             "request_id": "scene-current", "owner_id": "scene-owner",
             "conversation_id": "scene-conversation", "surface": "dev",
             "runtime_session_id": session, "runtime_turn_id": turn,
+            **({"scene_id": "planning"} if endpoint.endswith("override") else {}),
         })
         assert denied.status_code in {400, 409, 503}, denied.json()
         assert set(denied.json()) == {"detail"}
@@ -6708,6 +6711,7 @@ def test_bound_scene_rejects_stale_and_other_existing_turns(tmp_path):
 
 @pytest.mark.parametrize("endpoint", [
     "/v1/companion/scene/resolve", "/v1/companion/profile/compile", "/v1/companion/policy/compile",
+    "/v1/companion/scene/override",
 ])
 def test_bound_scene_guard_covers_compilation_and_event_recording(tmp_path, monkeypatch, endpoint):
     db_path = _use_database(tmp_path)
@@ -6718,8 +6722,13 @@ def test_bound_scene_guard_covers_compilation_and_event_recording(tmp_path, monk
     session = response.json()["runtime_session"]["runtime_session_id"]
     turn = response.json()["runtime_turn"]["runtime_turn_id"]
     before = _runtime_rows(db_path)
-    target = companion_contracts_repository() if endpoint.endswith("resolve") else main_module
-    name = "record_scene_resolution_event" if endpoint.endswith("resolve") else "compile_policy"
+    target = (
+        main_module if endpoint.endswith("compile") else companion_contracts_repository()
+    )
+    name = {
+        "resolve": "record_scene_resolution_event", "compile": "compile_policy",
+        "override": "record_scene_transition",
+    }[endpoint.rsplit("/", 1)[1]]
     original = getattr(target, name)
     observed = []
 
@@ -6734,6 +6743,7 @@ def test_bound_scene_guard_covers_compilation_and_event_recording(tmp_path, monk
     result = client.post(endpoint, json={
         "request_id": "scene-guard", "owner_id": "owner", "conversation_id": "conv",
         "surface": "dev", "runtime_session_id": session, "runtime_turn_id": turn,
+        **({"scene_id": None} if endpoint.endswith("override") else {}),
     })
     assert result.status_code == 200
     assert observed == [True]
@@ -6741,6 +6751,193 @@ def test_bound_scene_guard_covers_compilation_and_event_recording(tmp_path, monk
     assert _complete(
         client, request_id="finish", runtime_session_id=session, runtime_turn_id=turn,
     ).status_code == 200
+
+
+def _scene_override_request(client):
+    scope = dict(
+        request_id="scene-override", owner_id="owner", conversation_id="conv", surface="dev",
+    )
+    started = _start(client, **scope)
+    assert started.status_code == 200
+    return {
+        **scope,
+        "runtime_session_id": started.json()["runtime_session"]["runtime_session_id"],
+        "runtime_turn_id": started.json()["runtime_turn"]["runtime_turn_id"],
+        "scene_id": "planning",
+    }
+
+
+@pytest.mark.parametrize("fields,status", [
+    ({"scene_id": "unknown"}, 400),
+    ({"scene_id": ""}, 422),
+    ({"scene_id": " planning "}, 400),
+    ({"scene_id": "x" * 65}, 422),
+    ({"scene_id": {"scene": "planning"}}, 422),
+    ({"scene_id": ["planning"]}, 422),
+    ({"scene_id": True}, 422),
+    ({"scene_id": 123}, 422),
+    ({"requested_scene": "work_triage"}, 422),
+    ({"owner_id": "other"}, 400),
+    ({"conversation_id": "other"}, 400),
+    ({"surface": "web"}, 400),
+    ({"request_id": "other"}, 409),
+    ({"runtime_session_id": "missing"}, 404),
+    ({"runtime_turn_id": "missing"}, 404),
+    ({"runtime_turn_id": None}, 422),
+])
+def test_scene_override_rejects_invalid_input_and_binding_without_mutation(
+    tmp_path, fields, status,
+):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    request = _scene_override_request(client)
+    before = _runtime_rows(db_path)
+    events = companion_contracts_repository().list_scene_resolution_events_for_tests()
+    response = client.post("/v1/companion/scene/override", json={**request, **fields})
+    assert response.status_code == status, response.json()
+    assert _runtime_rows(db_path) == before
+    assert companion_contracts_repository().list_scene_resolution_events_for_tests() == events
+
+
+@pytest.mark.parametrize("missing", ["scene_id", "runtime_session_id", "runtime_turn_id"])
+def test_scene_override_requires_explicit_choice_and_complete_binding(tmp_path, missing):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    request = _scene_override_request(client)
+    del request[missing]
+    before = _runtime_rows(db_path)
+    response = client.post("/v1/companion/scene/override", json=request)
+    assert response.status_code == 422
+    assert _runtime_rows(db_path) == before
+
+
+def test_scene_override_does_not_change_other_runtime_authority_or_owner(tmp_path):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    request = _scene_override_request(client)
+    assert _start(client, request_id="other", owner_id="other-owner",
+                  conversation_id="conv", surface="web").status_code == 200
+    before = _runtime_rows(db_path)
+    response = client.post("/v1/companion/scene/override", json=request)
+    assert response.status_code == 200
+    after = _runtime_rows(db_path)
+    # Only the selected session's saved scene and activity timestamps may change.
+    with sqlite3.connect(db_path) as conn:
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(conversation_runtime_sessions)")
+        ]
+    for original, current in zip(before[0], after[0]):
+        differences = {key for key, a, b in zip(columns, original, current) if a != b}
+        if original[columns.index("runtime_session_id")] == request["runtime_session_id"]:
+            assert "active_scene" in differences
+            assert differences <= {"active_scene", "updated_at", "last_activity_at"}
+        else:
+            assert not differences
+    assert after[1:] == before[1:]
+    before = after
+    assert client.post("/v1/companion/scene/override", json=request).status_code == 200
+    assert _runtime_rows(db_path) == before
+    assert len(companion_contracts_repository().list_scene_resolution_events_for_tests()) == 1
+    assert _complete(client, request_id="finish", runtime_session_id=request["runtime_session_id"],
+                     runtime_turn_id=request["runtime_turn_id"]).status_code == 200
+    before = _runtime_rows(db_path)
+    assert client.post("/v1/companion/scene/override", json={
+        **request, "scene_id": None,
+    }).status_code == 409
+    assert _runtime_rows(db_path) == before
+
+
+def test_scene_override_and_transition_history_survive_restart(tmp_path, monkeypatch):
+    import services.companion_contracts as contracts_module
+    import services.runtime_state as runtime_module
+
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    request = _scene_override_request(client)
+    assert client.post("/v1/runtime/state/update", json={
+        **{k: request[k] for k in ("request_id", "owner_id", "conversation_id", "surface")},
+        "updates": {"interaction_mode": "work_triage"},
+    }).status_code == 200
+    original = client.post("/v1/companion/scene/override", json=request)
+    assert original.status_code == 200
+    profile = client.post("/v1/companion/profile/compile", json={
+        k: v for k, v in request.items() if k != "scene_id"
+    }).json()
+    assert _complete(client, request_id="finish", runtime_session_id=request["runtime_session_id"],
+                     runtime_turn_id=request["runtime_turn_id"]).status_code == 200
+    state = runtime_module.runtime_state_repository().runtime_state_by_session_id(
+        request["runtime_session_id"],
+    )
+    before = _runtime_rows(db_path)
+    events = companion_contracts_repository().list_scene_resolution_events_for_tests()
+    restarted = subprocess.run([
+        sys.executable, "-c",
+        "from services.runtime_state import RuntimeStateRepository; from pathlib import Path; "
+        "from services.companion_policy import compile_policy; "
+        "from models import CompanionPolicyCompileResponse; import sys; "
+        "repo = RuntimeStateRepository(Path(sys.argv[2])); "
+        "state = repo.runtime_state_by_session_id(sys.argv[1]); "
+        "print(CompanionPolicyCompileResponse(**compile_policy(state=state)).model_dump_json())",
+        request["runtime_session_id"], str(db_path),
+    ], check=True, capture_output=True, text=True, timeout=30)
+    fresh_process = json.loads(restarted.stdout)
+    assert fresh_process["runtime_state"] == state.model_dump()
+    assert fresh_process["scene_id"] == "planning"
+    assert fresh_process["overlays"] == profile["overlays"]
+    # Reopen both durable repositories, just as an ordinary service restart does.
+    monkeypatch.setattr(runtime_module, "_RUNTIME_REPOSITORY", RuntimeStateRepository(db_path))
+    monkeypatch.setattr(
+        contracts_module, "_REPOSITORY", contracts_module.CompanionContractsRepository(
+            companion_contracts_repository().db_path,
+        ),
+    )
+    assert runtime_module.runtime_state_repository().runtime_state_by_session_id(
+        request["runtime_session_id"],
+    ) == state
+    assert _runtime_rows(db_path) == before
+    assert companion_contracts_repository().list_scene_resolution_events_for_tests() == events
+    scope = {k: request[k] for k in ("request_id", "owner_id", "conversation_id", "surface")}
+    started = _start(client, **{**scope, "request_id": "after-restart"})
+    binding = {
+        **scope, "request_id": "after-restart", "runtime_session_id": request["runtime_session_id"],
+        "runtime_turn_id": started.json()["runtime_turn"]["runtime_turn_id"],
+    }
+    resumed = client.post("/v1/companion/profile/compile", json=binding)
+    assert resumed.status_code == 200
+    assert resumed.json()["scene_id"] == "planning"
+    assert resumed.json()["profile_id"] == profile["profile_id"]
+    assert resumed.json()["profile_version"] == profile["profile_version"]
+    assert resumed.json()["overlays"] == profile["overlays"]
+    assert companion_contracts_repository().list_scene_resolution_events_for_tests() == events
+    cleared = client.post("/v1/companion/scene/override", json={**binding, "scene_id": None})
+    assert cleared.status_code == 200
+    assert cleared.json()["scene_id"] == "work_triage"
+    assert len(companion_contracts_repository().list_scene_resolution_events_for_tests()) == 2
+
+
+@pytest.mark.parametrize("after_write", [False, True])
+def test_scene_override_rolls_back_when_transition_recording_fails(
+    tmp_path, monkeypatch, after_write,
+):
+    db_path = _use_database(tmp_path)
+    client = TestClient(app)
+    request = _scene_override_request(client)
+    before = _runtime_rows(db_path)
+
+    repository = companion_contracts_repository()
+    original = repository.record_scene_resolution_event
+
+    def unavailable(**kwargs):
+        if after_write:
+            original(**kwargs)
+        raise sqlite3.OperationalError("private-storage-diagnostic")
+
+    monkeypatch.setattr(repository, "record_scene_resolution_event", unavailable)
+    response = client.post("/v1/companion/scene/override", json=request)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime_state_persistence_unavailable"}
+    assert _runtime_rows(db_path) == before
+    assert companion_contracts_repository().list_scene_resolution_events_for_tests() == []
 
 
 def test_current_turn_state_serializes_completion_without_duplicate_authority(tmp_path):

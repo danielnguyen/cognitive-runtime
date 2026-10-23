@@ -9,6 +9,7 @@ from services.companion_contracts import (
     CONTRACT_RULES,
     DEFAULT_CONTRACT_ID,
     DEFAULT_CONTRACT_VERSION,
+    DEFAULT_PROFILE_VERSION,
     companion_contracts_repository,
 )
 from services.companion_policy import compile_policy, resolve_interaction_contract
@@ -36,7 +37,7 @@ def test_compile_returns_bounded_ordered_policy_overlays():
     assert response.status_code == 200
     body = response.json()
     assert body["profile_id"] == "default_companion_profile"
-    assert body["profile_version"] == 1
+    assert body["profile_version"] == DEFAULT_PROFILE_VERSION
     assert body["contract_id"] == "default_interaction_contract"
     assert body["contract_version"] == 2
     assert body["scene_id"] == "general"
@@ -309,7 +310,7 @@ def test_active_profile_endpoint_returns_seeded_default_record():
     assert response.status_code == 200
     body = response.json()
     assert body["profile_id"] == "default_companion_profile"
-    assert body["profile_version"] == 1
+    assert body["profile_version"] == DEFAULT_PROFILE_VERSION
     assert body["scope"] == "global_default"
     assert body["source"] == "seeded_default"
     assert body["status"] == "active"
@@ -342,7 +343,7 @@ def test_compile_uses_seeded_general_scene_for_unknown_scene():
     assert body["scene_id"] == "general"
     assert body["scene_source"] == "fallback_general"
     assert "Scene policy: use the general operating mode" in body["overlays"][2]["content"]
-    assert body["profile_version"] == 1
+    assert body["profile_version"] == DEFAULT_PROFILE_VERSION
     assert body["contract_version"] == 2
 
 
@@ -602,4 +603,215 @@ def test_bound_companion_compile_preserves_scene_precedence_and_read_only_state(
     assert first.json()["scene_source"] == source
     assert first.json()["runtime_state"] == before
     assert client.post("/v1/runtime/state/resolve", json=_base()).json()["runtime_state"] == before
-    assert companion_contracts_repository().list_scene_resolution_events_for_tests() == []
+    events = companion_contracts_repository().list_scene_resolution_events_for_tests()
+    assert len(events) == (0 if expected == "general" else 1)
+    if events:
+        assert events[0]["resolved_scene_id"] == expected
+        assert json.loads(events[0]["signals_json"])["transition"]["previous_scene_id"] == "general"
+
+
+def _scene_turn(client, **scope):
+    request = {**_base(), **scope}
+    started = client.post("/v1/runtime/turns/start", json=request)
+    assert started.status_code == 200, started.json()
+    return {
+        **request,
+        "runtime_session_id": started.json()["runtime_session"]["runtime_session_id"],
+        "runtime_turn_id": started.json()["runtime_turn"]["runtime_turn_id"],
+    }
+
+
+def _scene_transitions():
+    return [
+        json.loads(event["signals_json"])["transition"]
+        for event in companion_contracts_repository().list_scene_resolution_events_for_tests()
+        if "transition" in json.loads(event["signals_json"])
+    ]
+
+
+def test_persistent_scene_override_composes_policy_and_transitions_mid_session():
+    client = TestClient(app)
+    request = _scene_turn(client)
+    assert client.post("/v1/runtime/state/update", json={
+        **_base(), "updates": {"temporary_constraints": ["do_not_personalize"]},
+    }).status_code == 200
+    original = client.post("/v1/companion/profile/compile", json=request).json()
+    assert original["scene_id"] == "general"
+    assert _scene_transitions() == []
+
+    planning = client.post("/v1/companion/scene/override", json={
+        **request, "scene_id": "planning",
+    })
+    assert planning.status_code == 200
+    assert planning.json()["runtime_state"]["active_scene"] == "planning"
+    saved_state = planning.json()["runtime_state"]
+    assert client.post("/v1/companion/scene/override", json={
+        **request, "scene_id": "planning",
+    }).json() == planning.json()
+    assert len(_scene_transitions()) == 1
+    assert client.post("/v1/runtime/state/update", json={
+        **_base(), "updates": {"interaction_mode": "work_triage"},
+    }).status_code == 200
+    compiled = client.post("/v1/companion/policy/compile", json=request).json()
+    assert compiled["scene_id"] == "planning"
+    assert compiled["scene_source"] == "runtime_state"
+    assert "Scene policy: planning" in compiled["overlays"][2]["content"]
+    assert len(_scene_transitions()) == 1
+
+    # Complete this turn, then clear the choice on a later turn in the same session.
+    assert client.post("/v1/runtime/turns/complete", json={
+        "request_id": "finish-planning", "runtime_session_id": request["runtime_session_id"],
+        "runtime_turn_id": request["runtime_turn_id"],
+    }).status_code == 200
+    next_request = _scene_turn(client, request_id="next-scene")
+    assert next_request["runtime_session_id"] == request["runtime_session_id"]
+    cleared = client.post("/v1/companion/scene/override", json={
+        **next_request, "scene_id": None,
+    })
+    assert cleared.status_code == 200
+    assert cleared.json()["scene_id"] == "work_triage"
+    assert cleared.json()["scene_source"] == "runtime_interaction_mode"
+    triage = client.post("/v1/companion/policy/compile", json=next_request).json()
+    assert "Scene policy: work triage" in triage["overlays"][2]["content"]
+    assert client.post("/v1/runtime/state/update", json={
+        **_base(), "updates": {"interaction_mode": "ordinary"},
+    }).status_code == 200
+    general = client.post("/v1/companion/profile/compile", json=next_request).json()
+    assert general["scene_id"] == "general"
+    assert general["scene_source"] == "general"
+    assert general["overlays"] == original["overlays"]
+    assert general["runtime_state"]["active_scene"] is None
+    for body in (compiled, triage, general):
+        assert (body["profile_id"], body["profile_version"]) == (
+            original["profile_id"], original["profile_version"],
+        )
+        assert body["interaction_contract"] == original["interaction_contract"]
+        assert all(
+            a["content"] == b["content"]
+            for a, b in zip(body["overlays"][:2], original["overlays"][:2])
+        )
+        for key in ("owner_id", "conversation_id", "surface", "runtime_state_id",
+                    "temporary_constraints", "attention_focus", "trace_refs", "reset_after_turn"):
+            assert body["runtime_state"][key] == saved_state[key]
+    transitions = _scene_transitions()
+    assert [(t["previous_scene_id"], t["scene_id"], t["source"]) for t in transitions] == [
+        ("general", "planning", "runtime_state"),
+        ("planning", "work_triage", "runtime_interaction_mode"),
+        ("work_triage", "general", "general"),
+    ]
+    assert all(t["previous_scene_version"] == t["scene_version"] == 1 for t in transitions)
+    assert all(set(t["policy_delta"]) == {"content"} for t in transitions)
+    assert all(t["fallback_reason"] is None for t in transitions)
+    events = companion_contracts_repository().list_scene_resolution_events_for_tests()
+    assert [json.loads(e["signals_json"])["runtime_turn_id"] for e in events] == [
+        request["runtime_turn_id"],
+        next_request["runtime_turn_id"], next_request["runtime_turn_id"],
+    ]
+    assert all(e["owner_id"] == "owner" and e["conversation_id"] == "conv-1"
+               and e["surface"] == "dev" for e in events)
+
+
+@pytest.mark.parametrize("mode,expected", [("coding", "coding_build"), ("driving", "general")])
+@pytest.mark.parametrize("saved", ["planning", "general"])
+def test_temporary_selection_preserves_override_and_clear_restores_inference(mode, expected, saved):
+    client = TestClient(app)
+    request = _scene_turn(client)
+    assert client.post("/v1/runtime/state/update", json={
+        **_base(), "updates": {"interaction_mode": mode},
+    }).status_code == 200
+    assert client.post("/v1/companion/scene/override", json={
+        **request, "scene_id": saved,
+    }).status_code == 200
+    temporary = client.post("/v1/companion/policy/compile", json={
+        **request, "requested_scene": "work_triage",
+    })
+    assert temporary.json()["scene_id"] == "work_triage"
+    assert temporary.json()["runtime_state"]["active_scene"] == saved
+    restored = client.post("/v1/companion/profile/compile", json=request)
+    assert restored.json()["scene_id"] == saved
+    cleared = client.post("/v1/companion/scene/override", json={**request, "scene_id": None})
+    assert cleared.status_code == 200
+    assert cleared.json()["scene_id"] == expected
+    assert cleared.json()["runtime_state"]["interaction_mode"] == mode
+    assert cleared.json()["runtime_state"]["active_scene"] is None
+    before = _scene_transitions()
+    assert client.post("/v1/companion/scene/override", json={
+        **request, "scene_id": None,
+    }).json() == cleared.json()
+    assert _scene_transitions() == before
+
+
+@pytest.mark.parametrize("unknown_source", ["requested_scene", "runtime_scene"])
+def test_bound_scene_fallback_transition_records_reason_without_unknown_input(unknown_source):
+    client = TestClient(app)
+    request = _scene_turn(client)
+    client.post("/v1/companion/scene/override", json={**request, "scene_id": "planning"})
+    fields = {"requested_scene": "unrecognized-private-label"}
+    if unknown_source == "runtime_scene":
+        assert client.post("/v1/runtime/state/update", json={
+            **_base(), "updates": {"active_scene": "unrecognized-private-label"},
+        }).status_code == 200
+        fields = {}
+    response = client.post("/v1/companion/policy/compile", json={**request, **fields})
+    assert response.status_code == 200
+    assert response.json()["scene_id"] == "general"
+    assert response.json()["runtime_state"]["active_scene"] == (
+        "planning" if fields else "unrecognized-private-label"
+    )
+    transition = _scene_transitions()[-1]
+    assert (transition["previous_scene_id"], transition["scene_id"]) == ("planning", "general")
+    assert transition["fallback_reason"] == "unknown_" + unknown_source
+    assert transition["source"] == "fallback_general"
+    assert "unrecognized-private-label" not in json.dumps(
+        companion_contracts_repository().list_scene_resolution_events_for_tests(),
+    )
+
+
+def test_scene_transition_reports_only_changed_registered_policy_dimensions():
+    client = TestClient(app)
+    request = _scene_turn(client)
+    with sqlite3.connect(os.environ["COMPANION_CONTRACTS_DB_PATH"]) as conn:
+        conn.execute("UPDATE scene_policies SET format_policy_json = ? WHERE scene_id = ?",
+                     (json.dumps({"format": "steps"}), "planning"))
+    response = client.post("/v1/companion/scene/override", json={**request, "scene_id": "planning"})
+    assert response.status_code == 200
+    delta = _scene_transitions()[-1]["policy_delta"]
+    assert set(delta) == {"content", "format"}
+    assert delta["format"] == {"previous": {}, "current": {"format": "steps"}}
+    assert delta["content"]["current"] == response.json()["policy"]["content"]
+
+
+def test_diagnostic_scene_resolutions_do_not_become_applied_transitions():
+    client = TestClient(app)
+    request = _scene_turn(client)
+    for _ in range(2):
+        assert client.post("/v1/companion/scene/resolve", json={
+            **request, "requested_scene": "planning",
+        }).status_code == 200
+    compiled = client.post("/v1/companion/policy/compile", json=request)
+    assert compiled.status_code == 200
+    assert compiled.json()["scene_id"] == "general"
+    assert _scene_transitions() == []
+    assert client.post("/v1/companion/scene/override", json={
+        **request, "scene_id": "planning",
+    }).status_code == 200
+    assert client.post("/v1/companion/scene/resolve", json={
+        **request, "requested_scene": "work_triage",
+    }).status_code == 200
+    before = _scene_transitions()
+    assert client.post("/v1/companion/policy/compile", json=request).status_code == 200
+    assert _scene_transitions() == before
+
+
+def test_scene_override_persists_canonical_registered_alias():
+    client = TestClient(app)
+    request = _scene_turn(client)
+    response = client.post("/v1/companion/scene/override", json={**request, "scene_id": "coding"})
+    assert response.status_code == 200
+    assert response.json()["scene_id"] == "coding_build"
+    assert response.json()["runtime_state"]["active_scene"] == "coding_build"
+    before = _scene_transitions()
+    assert client.post("/v1/companion/scene/override", json={
+        **request, "scene_id": "coding_build_mode",
+    }).json() == response.json()
+    assert _scene_transitions() == before
