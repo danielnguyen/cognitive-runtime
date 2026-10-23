@@ -2848,8 +2848,16 @@ class RuntimeStateRepository:
             if (thread is None or latest is None or latest[0] != body.runtime_turn_id
                     or thread["state"] not in {"active", "idle"}):
                 raise RuntimeError("surface_presence_binding_invalid")
+            try:
+                age = (datetime.now(UTC) - datetime.fromisoformat(turn.updated_at)).total_seconds()
+                fresh = 0 <= age <= 300
+            except (TypeError, ValueError):
+                fresh = False
+            if not fresh:
+                raise RuntimeError("surface_presence_binding_invalid")
             if body.stage == "processing":
-                if body.state != "thinking" or rows or turn.turn_status in _TERMINAL_TURN_STATUSES:
+                if (body.state != "thinking" or rows or turn.completed_at is not None
+                        or turn.turn_status in _TERMINAL_TURN_STATUSES):
                     raise RuntimeError("surface_presence_transition_invalid")
                 self._validate_current_turn(conn, session=session, turn=turn)
                 if thread["active_request_id"] != body.request_id or session.status != "active":
@@ -2860,12 +2868,25 @@ class RuntimeStateRepository:
                     request_id=body.request_id, turn_status=turn.turn_status,
                 )
                 if (body.state == "thinking" or turn.turn_status not in _TERMINAL_TURN_STATUSES
-                        or completion is None or thread["state"] != "idle"
-                        or thread["active_runtime_turn_id"] is not None
+                        or completion is None
+                        or completion.runtime_session_id != session.runtime_session_id
+                        or thread["state"] != "idle"
+                        or turn.completed_at is None
+                        or any(thread[key] is not None for key in (
+                            "active_runtime_turn_id", "active_runtime_session_id",
+                            "active_request_id", "active_surface",
+                        ))
+                        or self._non_terminal_turn_rows(
+                            conn, owner_id=body.owner_id, conversation_id=body.conversation_id,
+                        )
+                        or conn.execute(
+                            "SELECT count(*) FROM conversation_runtime_events "
+                            "WHERE runtime_turn_id=? AND event_type='turn_completed';",
+                            (turn.runtime_turn_id,),
+                        ).fetchone()[0] != 1
                         or (turn.turn_status == "abandoned" and body.state != "unavailable")
-                        or (body.state != "unavailable" and not _canonical_assistant_message_id(
-                            completion.event_payload_json.get("assistant_message_id"),
-                        ))):
+                        or (body.state != "unavailable"
+                            and self._completed_turn_message_event(conn, turn) is None)):
                     raise RuntimeError("surface_presence_transition_invalid")
             cursor = "pe_" + uuid4().hex
             self._record_event(
@@ -2967,10 +2988,19 @@ class RuntimeStateRepository:
                         event_type="turn_completed", request_id=data["request_id"],
                         turn_status=latest_turn["turn_status"],
                     )
-                    valid = bool(completion and (data["state"] == "unavailable"
-                        or _canonical_assistant_message_id(
-                            completion.event_payload_json.get("assistant_message_id"),
-                        )))
+                    saved_turn = self._turn_by_id(conn, latest_turn["runtime_turn_id"])
+                    completion_count = conn.execute(
+                        "SELECT count(*) FROM conversation_runtime_events "
+                        "WHERE runtime_turn_id=? AND event_type='turn_completed';",
+                        (latest_turn["runtime_turn_id"],),
+                    ).fetchone()[0]
+                    association_valid = data["state"] == "unavailable" or (
+                        saved_turn is not None
+                        and self._completed_turn_message_event(conn, saved_turn) is not None
+                    )
+                    valid = bool(completion
+                        and completion.runtime_session_id == session.runtime_session_id
+                        and completion_count == 1 and association_valid)
                 if conn.execute(
                     "SELECT 1 FROM conversation_runtime_retirement_reservations "
                     "WHERE owner_id=? AND conversation_id=?;",

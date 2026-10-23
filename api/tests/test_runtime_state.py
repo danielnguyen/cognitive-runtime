@@ -257,7 +257,7 @@ def test_surface_presence_corrupt_or_incomplete_read_does_not_repair(tmp_path, f
         assert count == before
 
 
-@pytest.mark.parametrize("fault", ["missing", "request", "assistant"])
+@pytest.mark.parametrize("fault", ["missing", "request", "assistant", "duplicate"])
 def test_surface_presence_current_requires_intact_completion_receipt(tmp_path, fault):
     from models import SurfacePresenceReadRequest
 
@@ -269,6 +269,12 @@ def test_surface_presence_current_requires_intact_completion_receipt(tmp_path, f
         if fault == "missing":
             conn.execute("DELETE FROM conversation_runtime_events "
                          "WHERE event_type='turn_completed'")
+        elif fault == "duplicate":
+            conn.execute("INSERT INTO conversation_runtime_events "
+                         "(event_id,runtime_session_id,runtime_turn_id,event_type,"
+                         "event_payload_json,created_at) SELECT 'duplicate',runtime_session_id,"
+                         "runtime_turn_id,event_type,event_payload_json,created_at "
+                         "FROM conversation_runtime_events WHERE event_type='turn_completed'")
         else:
             row = conn.execute("SELECT id,event_payload_json FROM conversation_runtime_events "
                                "WHERE event_type='turn_completed'").fetchone()
@@ -279,6 +285,62 @@ def test_surface_presence_current_requires_intact_completion_receipt(tmp_path, f
     assert repo.read_surface_presence(SurfacePresenceReadRequest(
         owner_id=body.owner_id, conversation_id=body.conversation_id, surface=body.surface,
     )).current is None
+
+
+@pytest.mark.parametrize("fault", [
+    "active_runtime_session_id", "active_runtime_turn_id", "active_request_id", "active_surface",
+    "orphan", "completed_at", "duplicate_receipt",
+])
+def test_surface_presence_publication_rejects_inconsistent_terminal_records(tmp_path, fault):
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    if fault == "orphan":
+        _, orphan, _ = repo.start_turn(
+            request_id="other", owner_id="other", conversation_id="presence-conversation",
+            surface="web",
+        )
+    body = _presence_turn(repo)
+    repo.publish_surface_presence(body)
+    terminal = _presence_complete(repo, body)
+    with repo._connect() as conn:
+        if fault.startswith("active_"):
+            conn.execute(f"UPDATE conversation_runtime_threads SET {fault}='wrong'")
+        elif fault == "completed_at":
+            conn.execute("UPDATE conversation_runtime_turns SET completed_at=NULL")
+        elif fault == "orphan":
+            conn.execute("UPDATE conversation_runtime_turns SET runtime_session_id=? "
+                         "WHERE runtime_turn_id=?",
+                         (body.runtime_session_id, orphan.runtime_turn_id))
+        else:
+            conn.execute("INSERT INTO conversation_runtime_events "
+                         "(event_id,runtime_session_id,runtime_turn_id,event_type,"
+                         "event_payload_json,created_at) SELECT 'duplicate',runtime_session_id,"
+                         "runtime_turn_id,event_type,event_payload_json,created_at "
+                         "FROM conversation_runtime_events WHERE event_type='turn_completed'")
+        before = list(conn.iterdump())
+    with pytest.raises(RuntimeError, match="surface_presence_transition_invalid"):
+        repo.publish_surface_presence(terminal)
+    with repo._connect() as conn:
+        assert list(conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("fault", ["completed_at", "stale", "future", "malformed"])
+def test_surface_presence_processing_rejects_contradictory_or_stale_timestamp(tmp_path, fault):
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    with repo._connect() as conn:
+        if fault == "completed_at":
+            conn.execute("UPDATE conversation_runtime_turns SET completed_at=?",
+                         (datetime.now(UTC).isoformat(),))
+        else:
+            offset = -301 if fault == "stale" else 301
+            stamp = ("malformed" if fault == "malformed" else
+                     (datetime.now(UTC) + timedelta(seconds=offset)).isoformat())
+            conn.execute("UPDATE conversation_runtime_turns SET updated_at=?", (stamp,))
+        before = list(conn.iterdump())
+    with pytest.raises(RuntimeError, match="surface_presence_(binding|transition)_invalid"):
+        repo.publish_surface_presence(body)
+    with repo._connect() as conn:
+        assert list(conn.iterdump()) == before
 
 
 def test_surface_presence_concurrent_terminal_conflict_has_one_winner(tmp_path):
