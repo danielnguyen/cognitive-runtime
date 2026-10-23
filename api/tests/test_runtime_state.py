@@ -44,6 +44,236 @@ from services.companion_contracts import companion_contracts_repository
 from services.runtime_state import RuntimeStateRepository, clear_states_for_tests
 
 
+def _presence_turn(repo, request="presence-request", owner="presence-owner", surface="web"):
+    from models import SurfacePresencePublishRequest
+
+    session, turn, _ = repo.start_turn(
+        request_id=request, owner_id=owner, conversation_id="presence-conversation",
+        surface=surface,
+    )
+    return SurfacePresencePublishRequest(
+        request_id=request, owner_id=owner, conversation_id="presence-conversation",
+        surface=surface,
+        runtime_session_id=session.runtime_session_id, runtime_turn_id=turn.runtime_turn_id,
+        stage="processing", state="thinking",
+    )
+
+
+def _presence_complete(repo, body, state="idle", abandoned=False):
+    repo.complete_turn(
+        request_id=body.request_id, runtime_session_id=body.runtime_session_id,
+        runtime_turn_id=body.runtime_turn_id, turn_status="abandoned" if abandoned else "completed",
+        assistant_message_id=None if abandoned else "12345678-1234-4234-8234-123456789abc",
+    )
+    return body.model_copy(update={"stage": "terminal", "state": state})
+
+
+def test_surface_presence_order_restart_idempotency_and_read_only(tmp_path):
+    from models import SurfacePresenceReadRequest
+
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    scope = SurfacePresenceReadRequest(owner_id=body.owner_id, conversation_id=body.conversation_id,
+                                       surface=body.surface)
+    empty = repo.read_surface_presence(scope)
+    assert empty.current is None and empty.events == [] and empty.cursor.startswith("p0_")
+    first = repo.publish_surface_presence(body)
+    assert repo.publish_surface_presence(body) == first
+    assert repo.read_surface_presence(scope).current == first.event
+    terminal = _presence_complete(repo, body, state="briefing")
+    # Missing terminal publication must not leave an active thinking claim.
+    assert repo.read_surface_presence(scope).current is None
+    last = repo.publish_surface_presence(terminal)
+    assert repo.publish_surface_presence(terminal) == last
+    restarted = RuntimeStateRepository(repo.db_path)
+    replay = restarted.read_surface_presence(scope.model_copy(update={"after": empty.cursor}))
+    assert replay.events == [first.event, last.event]
+    assert replay.current == last.event and replay.cursor == last.event.cursor
+    assert restarted.read_surface_presence(scope.model_copy(
+        update={"after": first.event.cursor},
+    )).events == [last.event]
+    assert restarted.read_surface_presence(scope.model_copy(
+        update={"after": last.event.cursor},
+    )).events == []
+    with repo._connect() as conn:
+        before = conn.total_changes
+        repo.read_surface_presence(scope)
+        assert conn.total_changes == before
+        assert conn.execute("SELECT count(*) FROM conversation_runtime_events "
+                            "WHERE event_type='surface_presence_published'").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("field", [
+    "owner_id", "conversation_id", "surface", "runtime_session_id", "runtime_turn_id", "request_id",
+])
+def test_surface_presence_rejects_wrong_binding_without_mutation(tmp_path, field):
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    with pytest.raises(RuntimeError, match="surface_presence_binding_invalid"):
+        repo.publish_surface_presence(body.model_copy(update={field: "wrong"}))
+    with repo._connect() as conn:
+        assert conn.execute("SELECT count(*) FROM conversation_runtime_events "
+                            "WHERE event_type='surface_presence_published'").fetchone()[0] == 0
+
+
+def test_surface_presence_rejects_phase_conflict_stale_turn_and_closed_session(tmp_path):
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    for bad in (body.model_copy(update={"state": "alerting"}),
+                body.model_copy(update={"stage": "terminal", "state": "idle"})):
+        with pytest.raises(RuntimeError, match="surface_presence_transition_invalid"):
+            repo.publish_surface_presence(bad)
+    first = repo.publish_surface_presence(body)
+    with pytest.raises(RuntimeError, match="surface_presence_conflict"):
+        repo.publish_surface_presence(body.model_copy(update={"state": "idle"}))
+    terminal = _presence_complete(repo, body)
+    second = _presence_turn(repo, request="new-request")
+    repo.publish_surface_presence(second)
+    with pytest.raises(RuntimeError, match="surface_presence_binding_invalid"):
+        repo.publish_surface_presence(terminal)
+    assert repo.publish_surface_presence(body) == first  # immutable retry, not a new transition
+    with repo._connect() as conn:
+        conn.execute("UPDATE conversation_runtime_sessions SET status='closed',closed_at=?",
+                     (datetime.now(UTC).isoformat(),))
+    with pytest.raises(RuntimeError, match="surface_presence_binding_invalid"):
+        repo.publish_surface_presence(second)
+
+
+@pytest.mark.parametrize("state", [
+    "idle", "briefing", "alerting", "awaiting_confirmation", "suppressed", "fallback",
+    "unavailable",
+])
+def test_surface_presence_trusted_terminal_projection_allowlist(tmp_path, state):
+    from models import SurfacePresenceReadRequest
+
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    repo.publish_surface_presence(body)
+    event = repo.publish_surface_presence(_presence_complete(repo, body, state=state))
+    result = repo.read_surface_presence(SurfacePresenceReadRequest(
+        owner_id=body.owner_id, conversation_id=body.conversation_id, surface=body.surface,
+    ))
+    assert result.current == event.event
+    assert set(event.event.model_dump()) == {"state", "cursor"}
+
+
+def test_surface_presence_concurrent_duplicate_conflict_and_restart_failure(tmp_path):
+    from models import SurfacePresenceReadRequest
+
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        events = list(pool.map(lambda _: repo.publish_surface_presence(body), range(16)))
+    assert all(e == events[0] for e in events)
+    repo.complete_turn(request_id=body.request_id, runtime_session_id=body.runtime_session_id,
+                       runtime_turn_id=body.runtime_turn_id, turn_status="abandoned")
+    scope = SurfacePresenceReadRequest(owner_id=body.owner_id, conversation_id=body.conversation_id,
+                                       surface=body.surface, after=events[0].event.cursor)
+    assert RuntimeStateRepository(repo.db_path).read_surface_presence(scope).current is None
+    with pytest.raises(RuntimeError):
+        repo.publish_surface_presence(body.model_copy(
+            update={"stage": "terminal", "state": "idle"},
+        ))
+    event = repo.publish_surface_presence(body.model_copy(
+        update={"stage": "terminal", "state": "unavailable"},
+    ))
+    assert repo.read_surface_presence(scope).events == [event.event]
+
+
+def test_surface_presence_scope_cursor_unknown_stale_and_snapshot_race(tmp_path):
+    from models import SurfacePresenceReadRequest
+
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    first = repo.publish_surface_presence(body)
+    scope = SurfacePresenceReadRequest(owner_id=body.owner_id, conversation_id=body.conversation_id,
+                                       surface=body.surface)
+    snapshot = repo.read_surface_presence(scope)
+    last = repo.publish_surface_presence(_presence_complete(repo, body))
+    replay = repo.read_surface_presence(scope.model_copy(update={"after": snapshot.cursor}))
+    assert replay.events == [last.event]
+    foreign = _presence_turn(repo, owner="foreign-owner")
+    other = repo.publish_surface_presence(foreign)
+    for cursor in (other.event.cursor, "pe_" + "0" * 32):
+        with pytest.raises(RuntimeError, match="surface_presence_cursor_invalid"):
+            repo.read_surface_presence(scope.model_copy(update={"after": cursor}))
+    for i in range(100):
+        current = _presence_turn(repo, request=f"request-{i}")
+        repo.publish_surface_presence(current)
+        repo.publish_surface_presence(_presence_complete(repo, current))
+    with pytest.raises(RuntimeError, match="surface_presence_cursor_invalid"):
+        repo.read_surface_presence(scope.model_copy(update={"after": first.event.cursor}))
+    with repo._connect() as conn:
+        conn.execute("UPDATE conversation_runtime_turns SET updated_at=?",
+                     ((datetime.now(UTC) - timedelta(seconds=301)).isoformat(),))
+    assert repo.read_surface_presence(scope).current is None
+
+
+def test_surface_presence_api_rejects_extra_content_listening_and_malformed_cursor():
+    client = TestClient(app)
+    base = {"owner_id": "owner", "conversation_id": "conversation", "surface": "web"}
+    for patch in ({"after": "bad"}, {"after": 1}, {"limit": 51}, {"content": "private"}):
+        response = client.post("/v1/runtime/surface-presence/read", json={**base, **patch})
+        assert response.status_code == 422
+    publication = {**base, "request_id": "request", "runtime_session_id": "session",
+                   "runtime_turn_id": "turn", "stage": "processing", "state": "listening"}
+    assert client.post("/v1/runtime/surface-presence/publish", json=publication).status_code == 422
+
+
+@pytest.mark.parametrize("fault", ["payload", "request", "thread", "closed", "missing"])
+def test_surface_presence_corrupt_or_incomplete_read_does_not_repair(tmp_path, fault):
+    from models import SurfacePresenceReadRequest
+
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    repo.publish_surface_presence(body)
+    scope = SurfacePresenceReadRequest(owner_id=body.owner_id, conversation_id=body.conversation_id,
+                                       surface=body.surface)
+    with repo._connect() as conn:
+        if fault in {"payload", "request"}:
+            row = conn.execute("SELECT id,event_payload_json FROM conversation_runtime_events "
+                               "WHERE event_type='surface_presence_published'").fetchone()
+            data = json.loads(row["event_payload_json"])
+            data["private"] = "must-not-be-exposed" if fault == "payload" else None
+            if fault == "request":
+                del data["private"]
+                data["request_id"] = "wrong"
+            conn.execute("UPDATE conversation_runtime_events SET event_payload_json=? WHERE id=?",
+                         (json.dumps(data), row["id"]))
+        elif fault == "thread":
+            conn.execute("UPDATE conversation_runtime_threads SET active_request_id='wrong'")
+        elif fault == "closed":
+            conn.execute("UPDATE conversation_runtime_sessions SET status='closed',closed_at='now'")
+        else:
+            scope = scope.model_copy(update={"surface": "missing"})
+        before = conn.execute("SELECT count(*) FROM conversation_runtime_events").fetchone()[0]
+    if fault in {"payload", "request", "missing"}:
+        with pytest.raises(RuntimeError):
+            repo.read_surface_presence(scope)
+    else:
+        assert repo.read_surface_presence(scope).current is None
+    with repo._connect() as conn:
+        count = conn.execute("SELECT count(*) FROM conversation_runtime_events").fetchone()[0]
+        assert count == before
+
+
+def test_surface_presence_concurrent_terminal_conflict_has_one_winner(tmp_path):
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    repo.publish_surface_presence(body)
+    terminal = _presence_complete(repo, body)
+
+    def publish(state):
+        try:
+            return repo.publish_surface_presence(terminal.model_copy(update={"state": state}))
+        except RuntimeError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(publish, ("idle", "fallback")))
+    assert sum(r is not None for r in results) == 1
+
+
 def setup_function():
     clear_states_for_tests()
 

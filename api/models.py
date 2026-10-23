@@ -127,6 +127,7 @@ RuntimeTurnStatus = Literal[
     "abandoned",
 ]
 RuntimeEventType = Literal[
+    "surface_presence_published",
     "session_resolved",
     "turn_started",
     "turn_updated",
@@ -370,6 +371,56 @@ class RuntimeEvent(BaseModel):
     event_type: RuntimeEventType
     event_payload_json: dict[str, Any] = Field(default_factory=dict)
     created_at: str
+
+
+SurfacePresentationState = Literal[
+    "thinking", "idle", "briefing", "alerting", "awaiting_confirmation",
+    "suppressed", "fallback", "unavailable",
+]
+PresenceCursor = Annotated[str, Field(pattern=r"^p[0e]_[a-f0-9]{32}$", max_length=35)]
+
+
+class SurfacePresenceScope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    owner_id: str = Field(min_length=1, max_length=120, pattern=r"^\S+$")
+    conversation_id: str = Field(min_length=1, max_length=120, pattern=r"^\S+$")
+    surface: str = Field(min_length=1, max_length=64, pattern=r"^\S+$")
+
+
+class SurfacePresencePublishRequest(SurfacePresenceScope):
+    request_id: str = Field(min_length=1, max_length=120, pattern=r"^\S+$")
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    runtime_turn_id: str = Field(min_length=1, max_length=120)
+    stage: Literal["processing", "terminal"]
+    state: SurfacePresentationState
+
+
+class SurfacePresentationEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    cursor: PresenceCursor
+    state: SurfacePresentationState
+
+
+class SurfacePresencePublishResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    binding: SurfacePresencePublishRequest
+    event: SurfacePresentationEvent
+
+
+class SurfacePresenceReadRequest(SurfacePresenceScope):
+    after: PresenceCursor | None = None
+    limit: int = Field(default=50, ge=1, le=50)
+
+
+class SurfacePresenceReadResponse(SurfacePresenceScope):
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    current: SurfacePresentationEvent | None
+    cursor: PresenceCursor
+    events: list[SurfacePresentationEvent] = Field(max_length=50)
+    has_more: bool
 
 
 class RuntimeSessionResolveRequest(RuntimeStateResolveRequest):

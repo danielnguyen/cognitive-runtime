@@ -108,6 +108,10 @@ from models import (
     SocialContextItemUpsertRequest,
     SocialContextUsageEventRecordRequest,
     SocialContextUsageEventResponse,
+    SurfacePresencePublishRequest,
+    SurfacePresencePublishResponse,
+    SurfacePresenceReadRequest,
+    SurfacePresenceReadResponse,
     WorldStateClaimResponse,
     WorldStateClaimUpsertRequest,
     WorldStateClaimVerifyRequest,
@@ -204,6 +208,32 @@ from services.world_state import (
 )
 
 app = FastAPI(title="Cognitive Runtime", version="0.1.0")
+
+
+@app.post("/v1/runtime/surface-presence/publish", response_model=SurfacePresencePublishResponse)
+async def publish_surface_presence(body: SurfacePresencePublishRequest):
+    from services.runtime_state import runtime_state_repository
+
+    try:
+        return runtime_state_repository().publish_surface_presence(body)
+    except Exception as exc:
+        status = 409 if isinstance(exc, RuntimeError) else 503
+        raise HTTPException(status_code=status,
+                            detail="surface_presence_publication_rejected") from None
+
+
+@app.post("/v1/runtime/surface-presence/read", response_model=SurfacePresenceReadResponse)
+async def read_surface_presence(body: SurfacePresenceReadRequest):
+    from services.runtime_state import runtime_state_repository
+
+    try:
+        return runtime_state_repository().read_surface_presence(body)
+    except RuntimeError as exc:
+        status = 400 if str(exc) == "surface_presence_cursor_invalid" else 503
+        raise HTTPException(status_code=status, detail=str(exc) if status == 400
+                            else "surface_presence_unavailable") from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="surface_presence_unavailable") from None
 
 
 _RELATIONSHIP_DOMAIN_ERROR_STATUS = {

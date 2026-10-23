@@ -50,6 +50,11 @@ from models import (
     RuntimeTimingEvaluateResponse,
     RuntimeTimingResult,
     RuntimeTurn,
+    SurfacePresencePublishRequest,
+    SurfacePresencePublishResponse,
+    SurfacePresenceReadRequest,
+    SurfacePresenceReadResponse,
+    SurfacePresentationEvent,
 )
 from pydantic import ValidationError
 from services.companion_contracts import companion_contracts_repository
@@ -502,6 +507,8 @@ class RuntimeStateRepository:
                     FOREIGN KEY(owner_id, conversation_id)
                         REFERENCES conversation_runtime_threads(owner_id, conversation_id)
                 );
+                CREATE INDEX IF NOT EXISTS runtime_events_by_session_kind
+                    ON conversation_runtime_events(runtime_session_id, event_type, id);
                 """
             )
 
@@ -2793,6 +2800,191 @@ class RuntimeStateRepository:
             elif containment_payload is not None:
                 raise ValueError("persona_selection_binding_required")
             return session, revision, events
+
+    def publish_surface_presence(
+        self, body: SurfacePresencePublishRequest,
+    ) -> SurfacePresencePublishResponse:
+        # Internal-network trust only. Binding is not caller authentication.
+        with self._connect("runtime_event") as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            self._raise_if_retirement_reserved(
+                conn, owner_id=body.owner_id, conversation_id=body.conversation_id,
+            )
+            session = self._session_by_key(
+                conn, owner_id=body.owner_id, conversation_id=body.conversation_id,
+                surface=body.surface,
+            )
+            turn = self._turn_by_id(conn, body.runtime_turn_id)
+            if (session is None or session.runtime_session_id != body.runtime_session_id
+                    or session.status not in {"active", "paused"} or session.closed_at is not None
+                    or turn is None or turn.runtime_session_id != session.runtime_session_id
+                    or self._turn_admission_request(conn, turn) != body.request_id):
+                raise RuntimeError("surface_presence_binding_invalid")
+            rows = conn.execute(
+                "SELECT * FROM conversation_runtime_events WHERE runtime_turn_id=? "
+                "AND event_type='surface_presence_published' ORDER BY id;",
+                (body.runtime_turn_id,),
+            ).fetchall()
+            for row in rows:
+                saved = json.loads(row["event_payload_json"])
+                if saved.get("stage") == body.stage:
+                    if (saved.get("state") != body.state
+                            or saved.get("request_id") != body.request_id):
+                        raise RuntimeError("surface_presence_conflict")
+                    return SurfacePresencePublishResponse(
+                        binding=body, event=SurfacePresentationEvent(
+                            cursor=saved["cursor"], state=saved["state"],
+                        ),
+                    )
+            thread = self._thread_by_key(
+                conn, owner_id=body.owner_id, conversation_id=body.conversation_id,
+            )
+            latest = conn.execute(
+                "SELECT t.runtime_turn_id FROM conversation_runtime_turns t "
+                "JOIN conversation_runtime_sessions s USING(runtime_session_id) "
+                "WHERE s.owner_id=? AND s.conversation_id=? ORDER BY t.id DESC LIMIT 1;",
+                (body.owner_id, body.conversation_id),
+            ).fetchone()
+            if (thread is None or latest is None or latest[0] != body.runtime_turn_id
+                    or thread["state"] not in {"active", "idle"}):
+                raise RuntimeError("surface_presence_binding_invalid")
+            if body.stage == "processing":
+                if body.state != "thinking" or rows or turn.turn_status in _TERMINAL_TURN_STATUSES:
+                    raise RuntimeError("surface_presence_transition_invalid")
+                self._validate_current_turn(conn, session=session, turn=turn)
+                if thread["active_request_id"] != body.request_id or session.status != "active":
+                    raise RuntimeError("surface_presence_binding_invalid")
+            else:
+                completion = self._turn_event(
+                    conn, runtime_turn_id=turn.runtime_turn_id, event_type="turn_completed",
+                    request_id=body.request_id, turn_status=turn.turn_status,
+                )
+                if (body.state == "thinking" or turn.turn_status not in _TERMINAL_TURN_STATUSES
+                        or completion is None or thread["state"] != "idle"
+                        or thread["active_runtime_turn_id"] is not None
+                        or (turn.turn_status == "abandoned" and body.state != "unavailable")
+                        or (body.state != "unavailable" and not _canonical_assistant_message_id(
+                            completion.event_payload_json.get("assistant_message_id"),
+                        ))):
+                    raise RuntimeError("surface_presence_transition_invalid")
+            cursor = "pe_" + uuid4().hex
+            self._record_event(
+                conn, runtime_session_id=session.runtime_session_id,
+                runtime_turn_id=turn.runtime_turn_id, event_type="surface_presence_published",
+                event_payload_json={"request_id": body.request_id, "stage": body.stage,
+                                    "state": body.state, "cursor": cursor},
+            )
+            return SurfacePresencePublishResponse(
+                binding=body, event=SurfacePresentationEvent(cursor=cursor, state=body.state),
+            )
+
+    def read_surface_presence(
+        self, body: SurfacePresenceReadRequest,
+    ) -> SurfacePresenceReadResponse:
+        # Read transaction: never call resolving/repairing thread helpers here.
+        with self._connect() as conn:
+            conn.execute("BEGIN;")
+            session = self._session_by_key(
+                conn, owner_id=body.owner_id, conversation_id=body.conversation_id,
+                surface=body.surface,
+            )
+            if session is None:
+                raise RuntimeError("surface_presence_scope_unavailable")
+            origin = "p0_" + sha256(_json([
+                body.owner_id, body.conversation_id, body.surface,
+            ]).encode()).hexdigest()[:32]
+            # Only this exact session's last 200 transitions are replayable.
+            rows = conn.execute(
+                "SELECT * FROM conversation_runtime_events WHERE runtime_session_id=? "
+                "AND event_type='surface_presence_published' ORDER BY id DESC LIMIT 201;",
+                (session.runtime_session_id,),
+            ).fetchall()
+            history = list(reversed(rows[:200]))
+            position = -1
+            if body.after is not None and body.after != origin:
+                positions = [i for i, row in enumerate(history)
+                             if json.loads(row["event_payload_json"]).get("cursor") == body.after]
+                if len(positions) != 1:
+                    raise RuntimeError("surface_presence_cursor_invalid")
+                position = positions[0]
+            elif body.after == origin and len(rows) > 200:
+                raise RuntimeError("surface_presence_cursor_invalid")
+            def event(row: sqlite3.Row) -> SurfacePresentationEvent:
+                data = json.loads(row["event_payload_json"])
+                saved_turn = self._turn_by_id(conn, row["runtime_turn_id"])
+                if (set(data) != {"request_id", "stage", "state", "cursor"}
+                        or data["stage"] not in {"processing", "terminal"}
+                        or (data["stage"] == "processing") != (data["state"] == "thinking")
+                        or saved_turn is None
+                        or saved_turn.runtime_session_id != session.runtime_session_id
+                        or self._turn_admission_request(conn, saved_turn) != data["request_id"]):
+                    raise RuntimeError("surface_presence_history_invalid")
+                return SurfacePresentationEvent(cursor=data["cursor"], state=data["state"])
+
+            latest_event = event(history[-1]) if history else None
+            current = latest_event
+            thread = self._thread_by_key(
+                conn, owner_id=body.owner_id, conversation_id=body.conversation_id,
+            )
+            latest_turn = conn.execute(
+                "SELECT t.* FROM conversation_runtime_turns t "
+                "JOIN conversation_runtime_sessions s USING(runtime_session_id) "
+                "WHERE s.owner_id=? AND s.conversation_id=? ORDER BY t.id DESC LIMIT 1;",
+                (body.owner_id, body.conversation_id),
+            ).fetchone()
+            valid = bool(history and thread and latest_turn and session.closed_at is None
+                         and session.status in {"active", "paused"}
+                         and thread["state"] in {"active", "idle"}
+                         and latest_turn["runtime_turn_id"] == history[-1]["runtime_turn_id"])
+            if valid:
+                data = json.loads(history[-1]["event_payload_json"])
+                active = latest_turn["turn_status"] not in _TERMINAL_TURN_STATUSES
+                active_rows = self._non_terminal_turn_rows(
+                    conn, owner_id=body.owner_id, conversation_id=body.conversation_id,
+                )
+                valid = (
+                    (active and data["stage"] == "processing" and data["state"] == "thinking"
+                     and len(active_rows) == 1 and latest_turn["completed_at"] is None
+                     and session.status == "active"
+                     and thread["state"] == "active"
+                     and thread["active_surface"] == body.surface
+                     and thread["active_runtime_turn_id"] == latest_turn["runtime_turn_id"]
+                     and thread["active_runtime_session_id"] == session.runtime_session_id
+                     and thread["active_request_id"] == data["request_id"])
+                    or (not active and data["stage"] == "terminal" and thread["state"] == "idle"
+                        and not active_rows and latest_turn["completed_at"] is not None
+                        and thread["active_runtime_turn_id"] is None
+                        and thread["active_runtime_session_id"] is None
+                        and thread["active_request_id"] is None and thread["active_surface"] is None
+                        and (latest_turn["turn_status"] != "abandoned"
+                             or data["state"] == "unavailable"))
+                )
+                if conn.execute(
+                    "SELECT 1 FROM conversation_runtime_retirement_reservations "
+                    "WHERE owner_id=? AND conversation_id=?;",
+                    (body.owner_id, body.conversation_id),
+                ).fetchone():
+                    valid = False
+                try:
+                    age = (datetime.now(UTC) - datetime.fromisoformat(
+                        latest_turn["updated_at"],
+                    )).total_seconds()
+                    # Read freshness only; this never changes runtime attention/timing.
+                    valid = valid and 0 <= age <= 300
+                except (TypeError, ValueError):
+                    valid = False
+            if not valid:
+                current = None
+            page = history[position + 1:position + 1 + body.limit] if body.after else []
+            cursor = (event(page[-1]).cursor if page else body.after) if body.after else (
+                latest_event.cursor if latest_event else origin
+            )
+            return SurfacePresenceReadResponse(
+                owner_id=body.owner_id, conversation_id=body.conversation_id, surface=body.surface,
+                runtime_session_id=session.runtime_session_id, current=current, cursor=cursor,
+                events=[event(row) for row in page],
+                has_more=bool(body.after and len(history) > position + 1 + len(page)),
+            )
 
     def record_session_event(
         self,
