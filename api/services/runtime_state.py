@@ -2915,6 +2915,8 @@ class RuntimeStateRepository:
                 if (set(data) != {"request_id", "stage", "state", "cursor"}
                         or data["stage"] not in {"processing", "terminal"}
                         or (data["stage"] == "processing") != (data["state"] == "thinking")
+                        or not isinstance(data["cursor"], str)
+                        or not data["cursor"].startswith("pe_")
                         or saved_turn is None
                         or saved_turn.runtime_session_id != session.runtime_session_id
                         or self._turn_admission_request(conn, saved_turn) != data["request_id"]):
@@ -2959,6 +2961,16 @@ class RuntimeStateRepository:
                         and (latest_turn["turn_status"] != "abandoned"
                              or data["state"] == "unavailable"))
                 )
+                if not active and valid:
+                    completion = self._turn_event(
+                        conn, runtime_turn_id=latest_turn["runtime_turn_id"],
+                        event_type="turn_completed", request_id=data["request_id"],
+                        turn_status=latest_turn["turn_status"],
+                    )
+                    valid = bool(completion and (data["state"] == "unavailable"
+                        or _canonical_assistant_message_id(
+                            completion.event_payload_json.get("assistant_message_id"),
+                        )))
                 if conn.execute(
                     "SELECT 1 FROM conversation_runtime_retirement_reservations "
                     "WHERE owner_id=? AND conversation_id=?;",

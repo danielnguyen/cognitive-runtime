@@ -257,6 +257,30 @@ def test_surface_presence_corrupt_or_incomplete_read_does_not_repair(tmp_path, f
         assert count == before
 
 
+@pytest.mark.parametrize("fault", ["missing", "request", "assistant"])
+def test_surface_presence_current_requires_intact_completion_receipt(tmp_path, fault):
+    from models import SurfacePresenceReadRequest
+
+    repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
+    body = _presence_turn(repo)
+    repo.publish_surface_presence(body)
+    repo.publish_surface_presence(_presence_complete(repo, body))
+    with repo._connect() as conn:
+        if fault == "missing":
+            conn.execute("DELETE FROM conversation_runtime_events "
+                         "WHERE event_type='turn_completed'")
+        else:
+            row = conn.execute("SELECT id,event_payload_json FROM conversation_runtime_events "
+                               "WHERE event_type='turn_completed'").fetchone()
+            payload = json.loads(row["event_payload_json"])
+            payload["request_id" if fault == "request" else "assistant_message_id"] = "wrong"
+            conn.execute("UPDATE conversation_runtime_events SET event_payload_json=? WHERE id=?",
+                         (json.dumps(payload), row["id"]))
+    assert repo.read_surface_presence(SurfacePresenceReadRequest(
+        owner_id=body.owner_id, conversation_id=body.conversation_id, surface=body.surface,
+    )).current is None
+
+
 def test_surface_presence_concurrent_terminal_conflict_has_one_winner(tmp_path):
     repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
     body = _presence_turn(repo)
