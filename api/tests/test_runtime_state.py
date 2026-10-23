@@ -116,7 +116,7 @@ def test_surface_presence_rejects_wrong_binding_without_mutation(tmp_path, field
                             "WHERE event_type='surface_presence_published'").fetchone()[0] == 0
 
 
-def test_surface_presence_rejects_phase_conflict_stale_turn_and_closed_session(tmp_path):
+def test_surface_presence_rejects_stage_conflict_stale_turn_and_closed_session(tmp_path):
     repo = RuntimeStateRepository(tmp_path / "presence.sqlite3")
     body = _presence_turn(repo)
     for bad in (body.model_copy(update={"state": "alerting"}),
