@@ -4797,6 +4797,15 @@ class SceneResolveRequest(CompanionPolicyCompileRequest):
     pass
 
 
+class SceneOverrideRequest(RuntimeStateResolveRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    runtime_session_id: str = Field(min_length=1, max_length=120, strict=True)
+    runtime_turn_id: str = Field(min_length=1, max_length=120, strict=True)
+    # Null removes the saved choice; omission is not an instruction to clear it.
+    scene_id: BoundedScene | None
+
+
 class SceneResolveResponse(BaseModel):
     scene_id: str = Field(max_length=64)
     scene_version: int
@@ -4807,6 +4816,10 @@ class SceneResolveResponse(BaseModel):
     used_fallback: bool
     used_default_scene: bool
     policy: ScenePolicyDetail
+
+
+class SceneOverrideResponse(SceneResolveResponse):
+    runtime_state: RuntimeState
 
 
 class DiagnosticFinding(BaseModel):

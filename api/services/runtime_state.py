@@ -1974,6 +1974,46 @@ class RuntimeStateRepository:
         self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
         runtime_session_id: str, runtime_turn_id: str,
     ) -> Iterator[RuntimeState]:
+        with self._current_turn_state(
+            request_id=request_id, owner_id=owner_id, conversation_id=conversation_id,
+            surface=surface, runtime_session_id=runtime_session_id, runtime_turn_id=runtime_turn_id,
+        ) as (_, state):
+            yield state
+
+    @contextmanager
+    def scene_override(
+        self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
+        runtime_session_id: str, runtime_turn_id: str, scene_id: str | None,
+    ) -> Iterator[tuple[RuntimeState, RuntimeState, sqlite3.Connection]]:
+        """Set or clear the existing saved scene under the current-turn guard."""
+        if scene_id is not None:
+            scene = companion_contracts_repository().scene_policy(scene_id)
+            if scene is None:
+                raise ValueError("unknown_scene_override")
+            scene_id = scene.scene_id
+        with self._current_turn_state(
+            request_id=request_id, owner_id=owner_id, conversation_id=conversation_id,
+            surface=surface, runtime_session_id=runtime_session_id, runtime_turn_id=runtime_turn_id,
+        ) as (conn, previous):
+            # Keep the existing scene trace and saved choice in one SQLite
+            # transaction, including rollback if response construction fails.
+            conn.execute("ATTACH DATABASE ? AS scene_contracts", (
+                str(companion_contracts_repository().db_path),
+            ))
+            state = previous
+            if previous.active_scene != scene_id:
+                now = _now()
+                self._update_session_row(conn, runtime_session_id, {
+                    "active_scene": scene_id, "updated_at": now, "last_activity_at": now,
+                })
+                state = previous.model_copy(update={"active_scene": scene_id, "updated_at": now})
+            yield previous, state, conn
+
+    @contextmanager
+    def _current_turn_state(
+        self, *, request_id: str, owner_id: str, conversation_id: str, surface: str,
+        runtime_session_id: str, runtime_turn_id: str,
+    ) -> Iterator[tuple[sqlite3.Connection, RuntimeState]]:
         """Keep an admitted request current through its consumer's decision.
 
         This read must not bootstrap a session or repair an inconsistent thread.
@@ -2026,7 +2066,7 @@ class RuntimeStateRepository:
                 (runtime_session_id,),
             ).fetchone()
             assert row is not None
-            yield self._runtime_state_from_row(row)
+            yield conn, self._runtime_state_from_row(row)
 
     def runtime_state_by_session_id(self, runtime_session_id: str) -> RuntimeState:
         with self._connect() as conn:
