@@ -29,6 +29,9 @@ from models import (
     CapabilityDiscoveryRequest,
     CapabilityDiscoveryResponse,
     CapabilityDiscoveryResult,
+    CapabilityExposureBatchRequest,
+    CapabilityExposureBatchResponse,
+    CapabilityExposureDecision,
     CapabilityMatchRequest,
     CapabilityMatchResponse,
     CapabilityMatchResult,
@@ -53,6 +56,7 @@ from services.runtime_state import (
     record_runtime_event,
     runtime_session_by_id,
     runtime_state_db_path,
+    runtime_state_repository,
     sqlite_connection,
     sqlite_timing_request,
     validate_runtime_turn_session,
@@ -517,9 +521,14 @@ class CapabilityAuthorizationRepository:
                 """
             )
 
-    def authorize(self, body: CapabilityAuthorizationRequest) -> CapabilityAuthorizationResponse:
+    def authorize(
+        self, body: CapabilityAuthorizationRequest, *, observation_refs: list[str] | None = None,
+        protected_contexts: list[tuple[str, Any, Any]] | None = None,
+    ) -> CapabilityAuthorizationResponse:
         if body.persona_selection_mode == "strict":
-            return self._authorize_strict(body)
+            return self._authorize_strict(
+                body, observation_refs=observation_refs, protected_contexts=protected_contexts,
+            )
         _session_and_turn(body)
         identity = resolve_runtime_identity(
             RuntimeIdentityResolveRequest(
@@ -574,11 +583,16 @@ class CapabilityAuthorizationRepository:
             reason_codes.append("argument_digest_required")
 
         if not registered_reasons:
-            relationship_reasons = self._relationship_reasons(body, active_persona_id)
+            observation = {"protected_contexts": protected_contexts} if (
+                protected_contexts is not None
+            ) else {}
+            relationship_reasons = self._relationship_reasons(
+                body, active_persona_id, **observation,
+            )
             reason_codes.extend(relationship_reasons[0])
             relationship_ids_used = relationship_reasons[1]
 
-            world_reasons = self._world_state_reasons(body, active_persona_id)
+            world_reasons = self._world_state_reasons(body, active_persona_id, **observation)
             reason_codes.extend(world_reasons[0])
             world_state_claim_ids_used = world_reasons[1]
             revalidation_selector = world_reasons[2]
@@ -677,7 +691,7 @@ class CapabilityAuthorizationRepository:
             relationship_ids_used=relationship_ids_used,
             world_state_claim_ids_used=world_state_claim_ids_used,
         )
-        record_runtime_event(
+        observation = record_runtime_event(
             runtime_session_id=body.runtime_session_id,
             runtime_turn_id=body.runtime_turn_id,
             event_type="capability_authorization_evaluated",
@@ -696,6 +710,8 @@ class CapabilityAuthorizationRepository:
                 "revalidation_required": result.revalidation_required,
             },
         )
+        if observation_refs is not None:
+            observation_refs.append(observation.event_id)
         return CapabilityAuthorizationResponse(
             request_id=body.request_id,
             owner_id=body.owner_id,
@@ -707,7 +723,8 @@ class CapabilityAuthorizationRepository:
         )
 
     def _authorize_strict(
-        self, body: CapabilityAuthorizationRequest,
+        self, body: CapabilityAuthorizationRequest, *, observation_refs: list[str] | None = None,
+        protected_contexts: list[tuple[str, Any, Any]] | None = None,
     ) -> CapabilityAuthorizationResponse:
         authority, record = _strict_action_context(body)
         persona_id = authority[0].active_persona_id
@@ -727,10 +744,15 @@ class CapabilityAuthorizationRepository:
             reasons.append("strict_consequential_action_unavailable")
         # Denied registry/action metadata cannot reach protected context or any challenge path.
         if not reasons:
-            relationship_reasons, relationship_ids = self._relationship_reasons(body, persona_id)
+            observation = {"protected_contexts": protected_contexts} if (
+                protected_contexts is not None
+            ) else {}
+            relationship_reasons, relationship_ids = self._relationship_reasons(
+                body, persona_id, **observation,
+            )
             reasons.extend(relationship_reasons)
             world_reasons, world_ids, selector, world_confirmation = self._world_state_reasons(
-                body, persona_id,
+                body, persona_id, **observation,
             )
             reasons.extend(world_reasons)
             confirmation_needed = confirmation_needed or world_confirmation
@@ -750,7 +772,7 @@ class CapabilityAuthorizationRepository:
             relationship_ids_used=relationship_ids, world_state_claim_ids_used=world_ids,
         )
         _revalidate_strict_action(body, authority, record)
-        record_runtime_event(
+        observation = record_runtime_event(
             runtime_session_id=body.runtime_session_id, runtime_turn_id=body.runtime_turn_id,
             event_type="capability_authorization_evaluated",
             event_payload_json={
@@ -763,6 +785,8 @@ class CapabilityAuthorizationRepository:
             },
         )
         _revalidate_strict_action(body, authority, record)
+        if observation_refs is not None:
+            observation_refs.append(observation.event_id)
         return CapabilityAuthorizationResponse(
             request_id=body.request_id, owner_id=body.owner_id,
             conversation_id=body.conversation_id, runtime_session_id=body.runtime_session_id,
@@ -829,31 +853,33 @@ class CapabilityAuthorizationRepository:
         self,
         body: CapabilityAuthorizationRequest,
         active_persona_id: str,
+        *, protected_contexts: list[tuple[str, Any, Any]] | None = None,
     ) -> tuple[list[str], list[str]]:
         reasons: list[str] = []
         used: list[str] = []
         for requirement in body.relationship_requirements:
-            selected = select_relationships(
-                RelationshipSelectRequest(
-                    request_id=body.request_id,
-                    owner_id=body.owner_id,
-                    conversation_id=body.conversation_id,
-                    surface=body.surface,
-                    runtime_session_id=body.runtime_session_id,
-                    active_persona_id=active_persona_id,
-                    **_strict_protected_context_fields(body),
-                    requested_scopes=(
-                        [requirement.relationship_scope]
-                        if requirement.relationship_scope
-                        else []
-                    ),
-                    relationship_types=(
-                        [requirement.relationship_type]
-                        if requirement.relationship_type
-                        else []
-                    ),
-                )
+            request = RelationshipSelectRequest(
+                request_id=body.request_id,
+                owner_id=body.owner_id,
+                conversation_id=body.conversation_id,
+                surface=body.surface,
+                runtime_session_id=body.runtime_session_id,
+                active_persona_id=active_persona_id,
+                **_strict_protected_context_fields(body),
+                requested_scopes=(
+                    [requirement.relationship_scope]
+                    if requirement.relationship_scope
+                    else []
+                ),
+                relationship_types=(
+                    [requirement.relationship_type]
+                    if requirement.relationship_type
+                    else []
+                ),
             )
+            selected = select_relationships(request)
+            if protected_contexts is not None:
+                protected_contexts.append(("relationship", request, selected.model_dump()))
             eligible = {edge.relationship_id for edge in selected.selected_relationships}
             requested = set(body.selected_relationship_ids)
             candidates = eligible & requested if requested else eligible
@@ -869,6 +895,7 @@ class CapabilityAuthorizationRepository:
         self,
         body: CapabilityAuthorizationRequest,
         active_persona_id: str,
+        *, protected_contexts: list[tuple[str, Any, Any]] | None = None,
     ) -> tuple[list[str], list[str], CapabilityRevalidationSelector | None, bool]:
         requested_domains = sorted(
             {
@@ -877,16 +904,16 @@ class CapabilityAuthorizationRepository:
                 if requirement.domain
             }
         )
-        resolved = resolve_world_state(
-            request_id=body.request_id,
-            owner_id=body.owner_id,
-            conversation_id=body.conversation_id,
-            surface=body.surface,
-            runtime_session_id=body.runtime_session_id,
-            active_persona_id=active_persona_id,
+        request = dict(
+            request_id=body.request_id, owner_id=body.owner_id,
+            conversation_id=body.conversation_id, surface=body.surface,
+            runtime_session_id=body.runtime_session_id, active_persona_id=active_persona_id,
             requested_domains=requested_domains,
             **_strict_protected_context_fields(body),
         )
+        resolved = resolve_world_state(**request)
+        if protected_contexts is not None:
+            protected_contexts.append(("world", request, resolved.model_dump()))
         claim_map = {claim.world_state_claim_id: claim for claim in resolved.included_claims}
         reasons: list[str] = []
         used: list[str] = []
@@ -1950,6 +1977,133 @@ def compose_action_summary(body: ActionSummaryRequest) -> ActionSummaryResponse:
 @sqlite_timing_request("POST /v1/capabilities/authorize")
 def authorize_capability(body: CapabilityAuthorizationRequest) -> CapabilityAuthorizationResponse:
     return capability_authorization_repository().authorize(body)
+
+
+def _exposure_batch_context(body: CapabilityExposureBatchRequest) -> tuple[int, str]:
+    """Recheck existing authorities; retain only their digest outside this call."""
+    first = body.candidates[0]
+    session, revision, events = runtime_state_repository().persona_selection_events(**{
+        key: getattr(first, key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id", "expected_thread_revision",
+        )
+    }, include_containment=True)
+    if not _CAPABILITY_REGISTRY_AVAILABLE:
+        raise ValueError("capability_registry_unavailable")
+    if first.persona_selection_mode == "strict":
+        selection, containment, binding, surface = _strict_capability_exposure_authority(first)
+        identity = [selection.model_dump(), containment.model_dump(), binding.model_dump(), surface]
+    else:
+        resolved = resolve_runtime_identity(RuntimeIdentityResolveRequest(**{
+            key: getattr(first, key) for key in (
+                "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            )
+        }))
+        identity = resolved.model_dump()
+        persona = resolved.runtime_identity.active_persona_id
+        if persona != first.active_persona_id:
+            raise ValueError("capability_exposure_persona_mismatch")
+    material = [session.model_dump(), revision, [event.model_dump() for event in events], identity,
+                [item.record.model_dump() for item in _CAPABILITY_REGISTRY]]
+    return revision, "sha256:" + sha256(_json(material).encode()).hexdigest()
+
+
+@sqlite_timing_request("POST /v1/capabilities/exposure-batch")
+def authorize_capability_exposure_batch(
+    body: CapabilityExposureBatchRequest,
+) -> CapabilityExposureBatchResponse:
+    # Validate the entire set even for internal callers using model_copy/construct.
+    body = CapabilityExposureBatchRequest.model_validate(body.model_dump(), strict=True)
+    context = _exposure_batch_context(body)
+    repository = capability_authorization_repository()
+    decisions = []
+    protected_contexts: list[tuple[str, Any, Any]] = []
+    for candidate in body.candidates:
+        request = CapabilityAuthorizationRequest.model_validate(candidate.model_dump(), strict=True)
+        observation_refs: list[str] = []
+        response = repository.authorize(
+            request, observation_refs=observation_refs, protected_contexts=protected_contexts,
+        )
+        # The single evaluator remains the sole policy authority. Validate its
+        # wire projection before any successful prefix can escape the batch.
+        response = CapabilityAuthorizationResponse.model_validate(
+            response.model_dump(), strict=True,
+        )
+        for key in (
+            "request_id", "owner_id", "conversation_id", "runtime_session_id",
+            "runtime_turn_id", "capability_id", "persona_selection_ref",
+        ):
+            if getattr(response, key) != getattr(request, key):
+                raise ValueError("capability_exposure_result_mismatch")
+        result = response.result
+        if (getattr(result, "pha" + "se") != "exposure"
+                or response.selection_contract != (
+                    "strict_turn" if request.persona_selection_mode == "strict"
+                    else "legacy_unbound"
+                )
+                or result.allowed != (result.decision_code == "allowed")
+                or result.decision_code not in {
+                    "allowed", "authorization_denied", "confirmation_required",
+                    "revalidation_required",
+                }
+                or not result.reason_codes
+                or (result.allowed and (
+                    result.reason_codes != ["allowed"] or result.revalidation_required
+                ))
+                or (not result.allowed and result.reason_codes == ["allowed"])
+                or result.challenge_ref is not None or result.challenge_expires_at is not None
+                or result.confirmation_state not in {"not_required", "required"}
+                or result.revalidation_required != (result.revalidation_selector is not None)
+                or result.revalidation_required != (
+                    result.decision_code == "revalidation_required"
+                )):
+            raise ValueError("capability_exposure_result_invalid")
+        events = get_runtime_session(request.runtime_session_id).events
+        if len(observation_refs) != 1:
+            raise ValueError("capability_exposure_observation_invalid")
+        observation = next((event for event in events if (
+            event.event_id == observation_refs[0]
+            and event.runtime_session_id == request.runtime_session_id
+            and event.event_type == "capability_authorization_evaluated"
+            and event.runtime_turn_id == request.runtime_turn_id
+            and event.event_payload_json.get("request_id") == request.request_id
+            and event.event_payload_json.get("capability_id") == request.capability_id
+        )), None)
+        observed_result = result.model_dump(include={
+            "decision_code", "reason_codes", "confirmation_state",
+            "relationship_ids_used", "world_state_claim_ids_used",
+        })
+        if observation is None or any(
+            observation.event_payload_json.get(key) != value
+            for key, value in observed_result.items()
+        ):
+            raise ValueError("capability_exposure_observation_invalid")
+        decisions.append(CapabilityExposureDecision(
+            input_digest="sha256:" + sha256(_json(candidate.model_dump()).encode()).hexdigest(),
+            event_ref=observation.event_id, authorization=response,
+        ))
+    # Recheck only projections the existing evaluator actually consumed. Denied
+    # registry metadata must not cause additional protected-context reads.
+    for kind, request, expected in protected_contexts:
+        actual = select_relationships(request) if kind == "relationship" else (
+            resolve_world_state(**request)
+        )
+        if actual.model_dump() != expected:
+            raise ValueError("capability_exposure_protected_context_changed")
+    if _exposure_batch_context(body) != context:
+        raise ValueError("capability_exposure_authority_changed")
+    # Failed batches may leave ordinary evaluation observations. Those are not
+    # permission grants, confirmations, dispatches, or published descriptors.
+    return CapabilityExposureBatchResponse(
+        **{key: getattr(body.candidates[0], key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id",
+        )},
+        thread_revision=context[0], decisions=decisions,
+        context_digest="sha256:" + sha256(_json([
+            context, [expected for _, _, expected in protected_contexts],
+        ]).encode()).hexdigest(),
+    )
 
 
 def record_capability_confirmation(
