@@ -14,6 +14,8 @@ from models import (
     CapabilityConfirmationResponse,
     CapabilityDiscoveryRequest,
     CapabilityDiscoveryResponse,
+    CapabilityExposureBatchRequest,
+    CapabilityExposureBatchResponse,
     CapabilityMatchRequest,
     CapabilityMatchResponse,
     ClaimCalibrationEvaluateRequest,
@@ -122,6 +124,7 @@ from models import (
 )
 from services.capability_authorization import (
     authorize_capability,
+    authorize_capability_exposure_batch,
     compose_action_summary,
     decide_action_authority,
     decide_action_flow,
@@ -989,6 +992,20 @@ async def world_state_resolve(
         if body.persona_selection_mode != "strict":
             raise
         raise HTTPException(status_code=409, detail="world_state_authority_rejected") from exc
+
+
+@app.post("/v1/capabilities/exposure-batch", response_model=CapabilityExposureBatchResponse)
+async def capability_exposure_batch(
+    body: CapabilityExposureBatchRequest,
+) -> CapabilityExposureBatchResponse:
+    try:
+        return authorize_capability_exposure_batch(body)
+    except (ValueError, TypeError, RuntimeError):
+        raise HTTPException(status_code=409, detail="capability_exposure_batch_rejected") from None
+    except Exception:
+        raise HTTPException(
+            status_code=503, detail="capability_exposure_batch_unavailable",
+        ) from None
 
 
 @app.post("/v1/capabilities/authorize", response_model=CapabilityAuthorizationResponse)
