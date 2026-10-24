@@ -435,6 +435,8 @@ class RuntimeSessionResponse(BaseModel):
 class RuntimeTurnStartRequest(RuntimeSessionResolveRequest):
     model_config = ConfigDict(extra="forbid")
 
+    surface_presence_state: Literal["thinking"] | None = None
+
     input_message_id: str | None = Field(default=None, max_length=120)
     intent_class: str | None = Field(default=None, max_length=64)
     timing_policy: str | None = Field(default=None, max_length=64)

@@ -8201,3 +8201,80 @@ def test_null_response_marker_preserves_legacy_completion_event(tmp_path):
     assert explicit_null.json() == omitted.json()
     assert "response_continuation_state" not in omitted.json()["event"]["event_payload_json"]
     assert _runtime_rows(db_path) == before
+
+
+def test_admission_presence_is_optional_atomic_idempotent_and_restart_safe(tmp_path, monkeypatch):
+    from models import SurfacePresenceReadRequest
+
+    db = tmp_path / "admission-presence.sqlite3"
+    repo = RuntimeStateRepository(db)
+    scope = dict(request_id="observe", owner_id="owner",
+                 conversation_id="conversation", surface="web")
+    first = repo.start_turn(**scope, surface_presence_state="thinking")
+    before = _runtime_rows(db)
+    assert repo.start_turn(**scope, surface_presence_state="thinking") == first
+    assert _runtime_rows(db) == before
+    read_scope = SurfacePresenceReadRequest(**{key: scope[key] for key in (
+        "owner_id", "conversation_id", "surface",
+    )})
+    current = RuntimeStateRepository(db).read_surface_presence(read_scope).current
+    assert current is not None and current.state == "thinking"
+    with repo._connect() as conn:
+        events = conn.execute(
+            "SELECT event_type FROM conversation_runtime_events ORDER BY id",
+        ).fetchall()
+    assert [row[0] for row in events][-2:] == ["turn_started", "surface_presence_published"]
+    with pytest.raises(RuntimeError):
+        repo.start_turn(**{**scope, "request_id": "contender"}, surface_presence_state="thinking")
+    assert _runtime_rows(db) == before
+    with pytest.raises(RuntimeError):
+        repo.start_turn(**scope, surface_presence_state="listening")
+    assert _runtime_rows(db) == before
+
+    other = {**scope, "owner_id": "other-owner"}
+    original = repo._publish_surface_presence_in_transaction
+
+    def fail(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("publication failed after ledger insertion")
+
+    monkeypatch.setattr(repo, "_publish_surface_presence_in_transaction", fail)
+    with pytest.raises(RuntimeError):
+        repo.start_turn(**other, surface_presence_state="thinking")
+    assert _runtime_rows(db) == before  # Includes admission and its thread/session changes.
+    monkeypatch.setattr(repo, "_publish_surface_presence_in_transaction", original)
+    repo.start_turn(**other)
+    assert repo.read_surface_presence(read_scope).current == current
+    other_scope = read_scope.model_copy(update={"owner_id": "other-owner"})
+    assert repo.read_surface_presence(other_scope).current is None
+
+
+def test_admission_presence_http_contract_rejects_forged_state_without_admission(
+    tmp_path, monkeypatch,
+):
+    import services.runtime_state as state_service
+    from models import SurfacePresenceReadRequest
+
+    repo = RuntimeStateRepository(tmp_path / "http-presence.sqlite3")
+    monkeypatch.setattr(state_service, "_RUNTIME_REPOSITORY", repo)
+    scope = dict(request_id="http-observe", owner_id="owner", conversation_id="conv", surface="web")
+    client = TestClient(app)
+    for state in ("listening", "idle", "alerting", {}, True):
+        assert client.post("/v1/runtime/turns/start", json={
+            **scope, "surface_presence_state": state,
+        }).status_code == 422
+    response = client.post("/v1/runtime/turns/start", json={
+        **scope, "surface_presence_state": "thinking",
+    })
+    assert response.status_code == 200
+    assert client.post("/v1/runtime/turns/start", json={
+        **scope, "surface_presence_state": "thinking",
+    }).json() == response.json()
+    current = repo.read_surface_presence(SurfacePresenceReadRequest(**{
+        key: scope[key] for key in ("owner_id", "conversation_id", "surface")
+    })).current
+    assert current.state == "thinking"
+    with repo._connect() as conn:
+        assert conn.execute("SELECT count(*) FROM conversation_runtime_turns").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM conversation_runtime_events "
+                            "WHERE event_type='surface_presence_published'").fetchone()[0] == 1

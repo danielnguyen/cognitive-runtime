@@ -533,6 +533,7 @@ async def runtime_turn_start(body: RuntimeTurnStartRequest) -> RuntimeTurnRespon
             restraint_policy=body.restraint_policy,
             continuation_state=body.continuation_state,
             expected_thread_revision=body.expected_thread_revision,
+            surface_presence_state=body.surface_presence_state,
         )
     except Exception as exc:
         raise _runtime_state_http_error(exc) from None
