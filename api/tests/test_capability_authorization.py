@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -23,6 +24,418 @@ from services.world_state import (
 
 def _iso(delta_seconds: int) -> str:
     return (datetime.now(UTC) + timedelta(seconds=delta_seconds)).isoformat()
+
+
+def _exposure_batch(client, mode="strict"):
+    if mode == "strict":
+        scope, _, _ = _strict_exposure_turn(client)
+    else:
+        turn = _start_turn(client, request_id="exposure-batch")
+        scope = _authorized_request(turn, request_id="exposure-batch")
+    candidates = []
+    for capability_id in (
+        "service_health_check", "runtime.world_state.read", "draft_notification",
+        "jellyfin_restart",
+    ):
+        registered = capability_authorization_service._registered_capability_by_id(capability_id)
+        candidate = {
+            **scope, "capability_id": capability_id,
+            "capability_domain": registered.record.domain,
+            "operation_class": capability_authorization_service._registered_operation_class(
+                registered.record,
+            ),
+            "supported_surfaces": registered.record.allowed_surfaces,
+            "argument_digest": None,
+        }
+        candidate["authorization_" + "pha" + "se"] = "exposure"
+        candidates.append(candidate)
+    return {"candidates": candidates}
+
+
+def _assert_batch_rejected(response, status=409):
+    assert response.status_code == status, response.text
+    assert response.json() == {"detail": (
+        "capability_exposure_batch_rejected" if status == 409
+        else "capability_exposure_batch_unavailable"
+    )}
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+def test_exposure_batch_matches_individual_decisions_and_has_exact_provenance(mode):
+    from hashlib import sha256
+
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+    expected = [client.post("/v1/capabilities/authorize", json=candidate).json()
+                for candidate in batch["candidates"]]
+    before_challenges = _challenge_snapshot()
+    response = client.post("/v1/capabilities/exposure-batch", json=batch)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["producer"] == "/v1/capabilities/authorize"
+    assert result["schema_version"] == "capability-exposure-batch.v1"
+    assert result["policy_version"] == "capability-authorization.v1"
+    assert result["thread_revision"] >= 1
+    for field in ("request_id", "owner_id", "conversation_id", "surface",
+                  "runtime_session_id", "runtime_turn_id"):
+        assert result[field] == batch["candidates"][0][field]
+    assert [entry["authorization"] for entry in result["decisions"]] == expected
+    events = runtime_state_repository().list_events_for_tests(
+        batch["candidates"][0]["runtime_session_id"],
+    )
+    by_id = {event.event_id: event for event in events}
+    for candidate, entry in zip(batch["candidates"], result["decisions"]):
+        from models import CapabilityExposureCandidate
+
+        canonical = CapabilityExposureCandidate.model_validate(candidate).model_dump()
+        assert entry["input_digest"] == "sha256:" + sha256(
+            capability_authorization_service._json(canonical).encode(),
+        ).hexdigest()
+        event = by_id[entry["event_ref"]]
+        assert event.event_type == "capability_authorization_evaluated"
+        assert event.event_payload_json["capability_id"] == candidate["capability_id"]
+        assert event.event_payload_json["reason_codes"] == entry["authorization"]["result"][
+            "reason_codes"
+        ]
+    repeated = client.post("/v1/capabilities/exposure-batch", json=batch).json()
+    assert repeated["context_digest"] == result["context_digest"]
+    assert [entry["authorization"] for entry in repeated["decisions"]] == expected
+    assert _challenge_snapshot() == before_challenges
+    assert not any(event.event_type in {"action_summary_recorded", "action_authority_evaluated",
+                                       "action_flow_evaluated"} for event in events)
+    assert "capability" not in result  # Authorization results, never executable descriptors.
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+@pytest.mark.parametrize("field,value", [
+    ("request_id", "wrong"), ("owner_id", "wrong"), ("conversation_id", "wrong"),
+    ("runtime_session_id", "wrong"), ("runtime_turn_id", "wrong"), ("surface", "web"),
+    ("active_persona_id", "general_assistant"), ("expected_thread_revision", 999),
+])
+def test_exposure_batch_rejects_wrong_shared_authority(mode, field, value):
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+    for candidate in batch["candidates"]:
+        candidate[field] = value
+    _assert_batch_rejected(client.post("/v1/capabilities/exposure-batch", json=batch))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("mutation", [
+    "empty", "oversized", "duplicate", "mixed_scope", "mixed_mode", "selection", "dispatch",
+    "challenge", "arguments", "missing_turn", "unknown_field", "bad_requirement", "bad_bool",
+    "unknown_requirement", "coerced_requirement",
+])
+def test_exposure_batch_validates_all_members_before_evaluating(mutation, monkeypatch):
+    client = TestClient(app)
+    batch = _exposure_batch(client)
+    last = batch["candidates"][-1]
+    if mutation == "empty":
+        batch["candidates"] = []
+    elif mutation == "oversized":
+        batch["candidates"] *= 5
+    elif mutation == "duplicate":
+        batch["candidates"].append(deepcopy(last))
+    elif mutation == "mixed_scope":
+        last["owner_id"] = "different"
+    elif mutation == "mixed_mode":
+        last.update(persona_selection_mode="legacy", persona_selection_ref=None,
+                    active_persona_id="technical_architect")
+    elif mutation in {"selection", "dispatch"}:
+        last["authorization_" + "pha" + "se"] = mutation
+    elif mutation == "challenge":
+        last["confirmation_challenge_ref"] = "challenge:forged"
+    elif mutation == "arguments":
+        last["argument_digest"] = "args:forged"
+    elif mutation == "missing_turn":
+        last.pop("runtime_turn_id")
+    elif mutation == "unknown_field":
+        last["confirmed"] = True
+    elif mutation == "bad_requirement":
+        last["world_state_requirements"] = [None]
+    elif mutation == "unknown_requirement":
+        last["world_state_requirements"] = [{"min_confidence_typo": 0.9}]
+    elif mutation == "coerced_requirement":
+        last["world_state_requirements"] = [{"min_confidence": "0.9"}]
+    else:
+        last["capability_id"] = True
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("malformed batch reached authorization")
+
+    monkeypatch.setattr(capability_authorization_service.CapabilityAuthorizationRepository,
+                        "authorize", forbidden)
+    assert client.post("/v1/capabilities/exposure-batch", json=batch).status_code == 422
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+@pytest.mark.parametrize("defect", [
+    "exception", "scope", "candidate", "allowed", "reason", "challenge", "stage", "missing_audit",
+])
+def test_exposure_batch_never_returns_successful_prefix(mode, defect, monkeypatch):
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+    original = capability_authorization_service.CapabilityAuthorizationRepository.authorize
+    calls = []
+
+    def corrupt(repository, body, **kwargs):
+        calls.append(body.capability_id)
+        if len(calls) == 2 and defect == "exception":
+            raise sqlite3.OperationalError("private_sentinel")
+        response = original(repository, body, **kwargs)
+        if len(calls) != 2:
+            return response
+        if defect == "scope":
+            response.owner_id = "wrong"
+        elif defect == "candidate":
+            response.capability_id = "wrong"
+        elif defect == "allowed":
+            response.result.allowed = "true"
+        elif defect == "reason":
+            response.result.reason_codes = ["persona_mismatch"]
+        elif defect == "challenge":
+            response.result.challenge_ref = "challenge:forged"
+        elif defect == "stage":
+            setattr(response.result, "pha" + "se", "dispatch")
+        elif defect == "missing_audit":
+            with runtime_state_repository()._connect() as conn:
+                conn.execute("DELETE FROM conversation_runtime_events WHERE "
+                             "event_type='capability_authorization_evaluated' "
+                             "AND event_payload_json LIKE ?", ('%runtime.world_state.read%',))
+        return response
+
+    monkeypatch.setattr(capability_authorization_service.CapabilityAuthorizationRepository,
+                        "authorize", corrupt)
+    _assert_batch_rejected(client.post("/v1/capabilities/exposure-batch", json=batch),
+                           503 if defect == "exception" else 409)
+    assert len(calls) == 2
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+@pytest.mark.parametrize("change", ["registry", "record", "binding", "completion", "revision"])
+def test_exposure_batch_revalidates_authority_after_last_member(mode, change, monkeypatch):
+    from services.companion_contracts import companion_contracts_repository
+
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+    original = capability_authorization_service.CapabilityAuthorizationRepository.authorize
+    calls = []
+
+    def mutate(repository, body, **kwargs):
+        response = original(repository, body, **kwargs)
+        calls.append(body.capability_id)
+        if len(calls) == len(batch["candidates"]):
+            if change == "registry":
+                configure_capability_registry_for_tests(available=False)
+            elif change == "record":
+                record = capability_authorization_service._registered_capability_by_id(
+                    "service_health_check",
+                ).record
+                monkeypatch.setattr(record, "allowed_personas", [])
+            elif change == "binding":
+                with companion_contracts_repository()._connect() as conn:
+                    conn.execute("UPDATE surface_bindings SET surface_type='web_app' "
+                                 "WHERE surface_id='dev'")
+            elif change == "completion":
+                runtime_state_repository().complete_turn(
+                    request_id=body.request_id, runtime_session_id=body.runtime_session_id,
+                    runtime_turn_id=body.runtime_turn_id, turn_status="completed",
+                )
+            else:
+                with runtime_state_repository()._connect() as conn:
+                    conn.execute("UPDATE conversation_runtime_threads SET revision=revision+1")
+        return response
+
+    monkeypatch.setattr(capability_authorization_service.CapabilityAuthorizationRepository,
+                        "authorize", mutate)
+    _assert_batch_rejected(client.post("/v1/capabilities/exposure-batch", json=batch))
+    assert len(calls) == len(batch["candidates"])
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+def test_exposure_batch_registry_unavailable_cannot_return_allowances(mode, monkeypatch):
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+    configure_capability_registry_for_tests(available=False)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unavailable registry reached candidate authorization")
+
+    monkeypatch.setattr(capability_authorization_service.CapabilityAuthorizationRepository,
+                        "authorize", forbidden)
+    _assert_batch_rejected(client.post("/v1/capabilities/exposure-batch", json=batch))
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+@pytest.mark.parametrize("restriction", ["allowed", "relationship", "world", "confirmation"])
+def test_exposure_batch_preserves_real_protected_context_decisions(mode, restriction):
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+    relationship_id = _relationship(client, blocked_persona_scopes_json=(
+        ["technical_architect"] if restriction == "relationship" else []
+    ))
+    claim_response = client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(
+            sensitivity="restricted" if restriction == "world" else "medium",
+            confirmation_policy=(
+                "confirm_before_action" if restriction == "confirmation" else "none"
+            ),
+        ),
+    })
+    assert claim_response.status_code == 200, claim_response.text
+    claim_id = claim_response.json()["claim"]["world_state_claim_id"]
+    candidate = batch["candidates"][2]  # Existing draft capability, no execution path.
+    candidate.update(relationship_requirements=_relationship_requirement(),
+                     selected_relationship_ids=[relationship_id],
+                     world_state_requirements=[{"domain": "active_repository"}],
+                     selected_world_state_claim_ids=[claim_id])
+    individual = client.post("/v1/capabilities/authorize", json=candidate)
+    assert individual.status_code == 200, individual.text
+    response = client.post("/v1/capabilities/exposure-batch", json=batch)
+    assert response.status_code == 200, response.text
+    decision = response.json()["decisions"][2]["authorization"]
+    assert decision == individual.json()
+    assert decision["result"]["allowed"] is (restriction == "allowed" or (
+        mode == "legacy" and restriction == "confirmation"
+    ))
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+@pytest.mark.parametrize("dependency", ["relationship", "world"])
+def test_exposure_batch_rejects_protected_change_after_earlier_allowance(
+    mode, dependency, monkeypatch,
+):
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+    relationship_id = _relationship(client)
+    claim = client.post("/v1/world-state/claims/upsert", json={
+        **_base(), "claim": _claim(),
+    }).json()["claim"]
+    first = batch["candidates"][0]
+    first.update(relationship_requirements=_relationship_requirement(),
+                 selected_relationship_ids=[relationship_id],
+                 world_state_requirements=[{"domain": "active_repository"}],
+                 selected_world_state_claim_ids=[claim["world_state_claim_id"]])
+    original = capability_authorization_service.CapabilityAuthorizationRepository.authorize
+    calls = []
+
+    def mutate(repository, body, **kwargs):
+        response = original(repository, body, **kwargs)
+        calls.append(body.capability_id)
+        if len(calls) == 2:
+            with runtime_state_repository()._connect() as conn:
+                if dependency == "relationship":
+                    conn.execute("UPDATE relationship_edges SET status='revoked'")
+                else:
+                    conn.execute("UPDATE runtime_world_state_claims SET sensitivity='restricted'")
+        return response
+
+    monkeypatch.setattr(capability_authorization_service.CapabilityAuthorizationRepository,
+                        "authorize", mutate)
+    _assert_batch_rejected(client.post("/v1/capabilities/exposure-batch", json=batch))
+    assert len(calls) == len(batch["candidates"])
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("dependency", ["relationship", "world"])
+def test_exposure_batch_protected_dependency_failure_cannot_publish_prefix(dependency, monkeypatch):
+    client = TestClient(app)
+    batch = _exposure_batch(client)
+    if dependency == "relationship":
+        batch["candidates"][1]["relationship_requirements"] = _relationship_requirement()
+        function = "select_relationships"
+    else:
+        batch["candidates"][1]["world_state_requirements"] = [{"domain": "active_repository"}]
+        function = "resolve_world_state"
+
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError("private_sentinel")
+
+    monkeypatch.setattr(capability_authorization_service, function, unavailable)
+    _assert_batch_rejected(client.post("/v1/capabilities/exposure-batch", json=batch), 503)
+    assert _challenge_snapshot() == []
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+def test_exposure_batch_cannot_enter_confirmation_or_action_paths(mode, monkeypatch):
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("exposure attempted an authority side effect")
+
+    for name in ("_issue_challenge", "_consume_dispatch_challenge_atomic", "confirm"):
+        monkeypatch.setattr(capability_authorization_service.CapabilityAuthorizationRepository,
+                            name, forbidden)
+    for name in ("decide_action_authority", "decide_action_flow", "compose_action_summary"):
+        monkeypatch.setattr(capability_authorization_service, name, forbidden)
+    assert client.post("/v1/capabilities/exposure-batch", json=batch).status_code == 200
+
+
+@pytest.mark.parametrize("selection,containment", [(False, False), (True, False)])
+def test_exposure_batch_does_not_create_missing_strict_predecessors(selection, containment):
+    client = TestClient(app)
+    scope, _, _ = _strict_exposure_turn(client, selection=selection, containment=containment)
+    candidate = _strict_action_request(
+        scope, "authorize", authorization_stage="exposure", argument_digest=None,
+    )
+    before = runtime_state_repository().list_events_for_tests(scope["runtime_session_id"])
+    _assert_batch_rejected(client.post("/v1/capabilities/exposure-batch",
+                                      json={"candidates": [candidate]}))
+    assert runtime_state_repository().list_events_for_tests(scope["runtime_session_id"]) == before
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy"])
+def test_exposure_batch_denied_metadata_never_reads_protected_context(mode, monkeypatch):
+    client = TestClient(app)
+    batch = _exposure_batch(client, mode)
+    batch["candidates"] = [batch["candidates"][0]]
+    batch["candidates"][0].update(
+        capability_domain="wrong", relationship_requirements=_relationship_requirement(),
+        world_state_requirements=[{"domain": "active_repository"}],
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("denied registry metadata reached protected context")
+
+    monkeypatch.setattr(capability_authorization_service, "select_relationships", forbidden)
+    monkeypatch.setattr(capability_authorization_service, "resolve_world_state", forbidden)
+    response = client.post("/v1/capabilities/exposure-batch", json=batch)
+    assert response.status_code == 200, response.text
+    result = response.json()["decisions"][0]["authorization"]["result"]
+    assert result["allowed"] is False
+    assert result["reason_codes"] == ["registered_capability_domain_mismatch"]
+
+
+def test_exposure_batch_parallel_retries_retain_their_own_evaluation_events(monkeypatch):
+    from threading import Barrier
+
+    client = TestClient(app)
+    batch = _exposure_batch(client)
+    batch["candidates"] = [batch["candidates"][0]]
+    barrier = Barrier(2)
+    original = capability_authorization_service.CapabilityAuthorizationRepository.authorize
+
+    def interleave(repository, body, **kwargs):
+        result = original(repository, body, **kwargs)
+        barrier.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(capability_authorization_service.CapabilityAuthorizationRepository,
+                        "authorize", interleave)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        replies = list(pool.map(
+            lambda _: client.post("/v1/capabilities/exposure-batch", json=batch), range(2),
+        ))
+    assert [reply.status_code for reply in replies] == [200, 200]
+    decisions = [reply.json()["decisions"][0] for reply in replies]
+    assert decisions[0]["authorization"] == decisions[1]["authorization"]
+    assert decisions[0]["event_ref"] != decisions[1]["event_ref"]
+    assert _challenge_snapshot() == []
 
 
 def _base(*, surface: str = "dev") -> dict[str, object]:

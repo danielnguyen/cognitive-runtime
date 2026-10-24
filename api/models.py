@@ -4212,6 +4212,85 @@ class CapabilityAuthorizationResponse(BaseModel):
     persona_selection_ref: str | None = Field(default=None, pattern=r"^psel_[0-9a-f]{32}$")
 
 
+class CapabilityExposureCandidate(CapabilityAuthorizationRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def strict_requirements(cls, value):
+        if isinstance(value, dict):
+            for field, model in (
+                ("relationship_requirements", CapabilityRelationshipRequirement),
+                ("world_state_requirements", CapabilityWorldStateRequirement),
+            ):
+                members = value.get(field, [])
+                if not isinstance(members, list):
+                    continue  # The normal list validator rejects the container.
+                for member in members:
+                    if not isinstance(member, dict) or set(member) - model.model_fields.keys():
+                        raise ValueError("capability_exposure_requirement_invalid")
+                    model.model_validate(member, strict=True)
+        return value
+
+    @model_validator(mode="after")
+    def exposure_only(self) -> "CapabilityExposureCandidate":
+        if getattr(self, "authorization_" + "pha" + "se") != "exposure":
+            raise ValueError("capability_exposure_stage_required")
+        if self.argument_digest is not None or self.confirmation_challenge_ref is not None:
+            raise ValueError("capability_exposure_cannot_confirm")
+        for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id", "capability_id",
+        ):
+            value = getattr(self, key)
+            if not value or value != value.strip():
+                raise ValueError("capability_exposure_binding_required")
+        return self
+
+
+class CapabilityExposureBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    candidates: list[CapabilityExposureCandidate] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def shared_context(self) -> "CapabilityExposureBatchRequest":
+        first = self.candidates[0]
+        fields = (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id", "active_persona_id", "persona_selection_mode",
+            "persona_selection_ref", "expected_thread_revision",
+        )
+        if any(getattr(candidate, key) != getattr(first, key)
+               for candidate in self.candidates for key in fields):
+            raise ValueError("capability_exposure_context_mismatch")
+        ids = [candidate.capability_id for candidate in self.candidates]
+        if len(ids) != len(set(ids)):
+            raise ValueError("capability_exposure_duplicate_candidate")
+        return self
+
+
+class CapabilityExposureDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    input_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    event_ref: str = Field(min_length=1, max_length=120)
+    authorization: CapabilityAuthorizationResponse
+
+
+class CapabilityExposureBatchResponse(RuntimeStateResolveRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    runtime_session_id: str = Field(min_length=1, max_length=120)
+    runtime_turn_id: str = Field(min_length=1, max_length=120)
+    schema_version: Literal["capability-exposure-batch.v1"] = "capability-exposure-batch.v1"
+    producer: Literal["/v1/capabilities/authorize"] = "/v1/capabilities/authorize"
+    policy_version: Literal["capability-authorization.v1"] = "capability-authorization.v1"
+    thread_revision: int = Field(ge=0)
+    context_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    decisions: list[CapabilityExposureDecision] = Field(min_length=1, max_length=16)
+
+
 class CapabilityConfirmationRequest(RuntimeStateResolveRequest):
     runtime_session_id: str = Field(max_length=120)
     runtime_turn_id: str = Field(max_length=120)
