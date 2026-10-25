@@ -233,6 +233,8 @@ def evaluate_evidence_sufficiency(
 
 def evaluate_evidence_sufficiency_with_event(
     body: EvidenceSufficiencyEvaluateRequest,
+    *,
+    expected_event_id: str | None = None,
 ) -> tuple[EvidenceSufficiencyEvaluateResponse, RuntimeEvent]:
     session = runtime_session_by_id(body.runtime_session_id)
     if session is None:
@@ -274,6 +276,7 @@ def evaluate_evidence_sufficiency_with_event(
         runtime_session_id=body.runtime_session_id,
         runtime_turn_id=body.runtime_turn_id,
         event_type="evidence_sufficiency_evaluated",
+        **({"expected_event_id": expected_event_id} if expected_event_id is not None else {}),
         event_payload_json={
             "policy_version": EVIDENCE_SUFFICIENCY_POLICY_VERSION,
             "request_id": body.request_id,

@@ -8278,3 +8278,90 @@ def test_admission_presence_http_contract_rejects_forged_state_without_admission
         assert conn.execute("SELECT count(*) FROM conversation_runtime_turns").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM conversation_runtime_events "
                             "WHERE event_type='surface_presence_published'").fetchone()[0] == 1
+
+
+def test_internal_event_identity_defaults_retries_conflicts_and_reload(tmp_path, monkeypatch):
+    from services import runtime_state as state_service
+
+    repo = RuntimeStateRepository(tmp_path / "event-identities.sqlite3")
+    scope = _presence_turn(repo)
+    monkeypatch.setattr(state_service, "_RUNTIME_REPOSITORY", repo)
+    kwargs = dict(runtime_session_id=scope.runtime_session_id,
+                  runtime_turn_id=scope.runtime_turn_id,
+                  event_type="timing_evaluated", event_payload_json={"observed": True})
+    before = repo.diagnostics(scope.runtime_session_id).events
+    # The default path retains its timestamp/ordinal algorithm, including retries
+    # and unrelated event types. No expected identity is required by old writers.
+    default = state_service.record_runtime_event(**kwargs)
+    assert default.event_id == state_service._event_id(
+        scope.runtime_session_id, kwargs["event_type"], default.created_at, len(before),
+    )
+    retry = state_service.record_runtime_event(**kwargs)
+    assert retry.event_id == state_service._event_id(
+        scope.runtime_session_id, kwargs["event_type"], retry.created_at, len(before) + 1,
+    )
+    expected = state_service.new_runtime_event_id()
+    assert len(expected) == len("rtevent_") + 32
+    assert expected != state_service.new_runtime_event_id()
+    exact = state_service.record_runtime_event(**kwargs, expected_event_id=expected)
+    assert exact.event_id == expected
+    reloaded = RuntimeStateRepository(repo.db_path).diagnostics(scope.runtime_session_id)
+    assert reloaded.events == [*before, default, retry, exact]
+    # Unique-ID conflicts cannot overwrite an existing record or imply a retry.
+    with pytest.raises(sqlite3.IntegrityError):
+        state_service.record_runtime_event(**{**kwargs, "event_payload_json": {"forged": True}},
+                                          expected_event_id=expected)
+    assert repo.diagnostics(scope.runtime_session_id) == reloaded
+
+
+@pytest.mark.parametrize("invalid", ["", "rtevent_old", "rtevent_" + "x" * 32,
+                                     "rtevent_" + "0" * 33, 123])
+def test_internal_event_identity_rejects_invalid_values_without_writes(tmp_path, invalid):
+    repo = RuntimeStateRepository(tmp_path / "invalid-event.sqlite3")
+    scope = _presence_turn(repo)
+    before = repo.diagnostics(scope.runtime_session_id)
+    with pytest.raises(RuntimeError, match="runtime_event_identity_invalid"):
+        repo.record_session_event(runtime_session_id=scope.runtime_session_id,
+                                  runtime_turn_id=scope.runtime_turn_id,
+                                  event_type="timing_evaluated", event_payload_json={},
+                                  expected_event_id=invalid)
+    assert repo.diagnostics(scope.runtime_session_id) == before
+
+
+def test_internal_event_identity_rollback_and_concurrent_commits(tmp_path, monkeypatch):
+    from services import runtime_state as state_service
+
+    repo = RuntimeStateRepository(tmp_path / "concurrent-event.sqlite3")
+    scope = _presence_turn(repo)
+    kwargs = dict(runtime_session_id=scope.runtime_session_id,
+                  runtime_turn_id=scope.runtime_turn_id,
+                  event_type="timing_evaluated", event_payload_json={"policy_version": "v1"})
+    before = repo.diagnostics(scope.runtime_session_id)
+    expected = state_service.new_runtime_event_id()
+    original = repo._record_event
+
+    def fail_after_insert(conn, **values):
+        event = original(conn, **values)
+        assert event.event_id == expected
+        raise RuntimeError("storage_failure_after_insert")
+
+    monkeypatch.setattr(repo, "_record_event", fail_after_insert)
+    with pytest.raises(RuntimeError, match="storage_failure_after_insert"):
+        repo.record_session_event(**kwargs, expected_event_id=expected)
+    assert repo.diagnostics(scope.runtime_session_id) == before
+    monkeypatch.setattr(repo, "_record_event", original)
+    barrier = threading.Barrier(2)
+    expected_ids = [state_service.new_runtime_event_id() for _ in range(2)]
+
+    def write(event_id):
+        barrier.wait(timeout=10)
+        return repo.record_session_event(**kwargs, expected_event_id=event_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = list(pool.map(write, expected_ids))
+    assert [event.event_id for event in receipts] == expected_ids
+    persisted = RuntimeStateRepository(repo.db_path).diagnostics(scope.runtime_session_id)
+    assert {event.event_id for event in persisted.events[len(before.events):]} == set(expected_ids)
+    for receipt in receipts:
+        matching = [event for event in persisted.events if event.event_id == receipt.event_id]
+        assert matching == [receipt]

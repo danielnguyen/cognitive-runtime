@@ -2934,10 +2934,15 @@ def test_terminal_v2_forged_writer_event_reference_is_not_published(stage, monke
     response = _terminal(payload, "v2")
     assert response.status_code == 409
     assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
-    # Both writes can already be durable. Their existence is not terminal success.
-    assert [event["event_type"] for event in _diagnostics(scope)["events"][-2:]] == [
+    # An invalid sufficiency receipt must be rejected before selection. A bad
+    # selection receipt can leave both writes durable without terminal success.
+    decisions = [event["event_type"] for event in _diagnostics(scope)["events"]
+                 if event["event_type"] in {
+                     "evidence_sufficiency_evaluated", "evidence_next_step_selected",
+                 }]
+    assert decisions == (["evidence_sufficiency_evaluated"] if stage == "sufficiency" else [
         "evidence_sufficiency_evaluated", "evidence_next_step_selected",
-    ]
+    ])
 
 
 @pytest.mark.parametrize("version", ["v1", "v2"])
@@ -2992,3 +2997,373 @@ def test_terminal_v2_response_provenance_is_strict_and_bound():
         forged = {key: value for key, value in valid.items() if key != missing}
         with pytest.raises(ValidationError):
             EvidenceTerminalEvaluateResponseV2.model_validate(forged)
+
+
+@pytest.mark.parametrize("write_new_event", [True, False], ids=["writes-new", "no-write"])
+def test_terminal_v2_rejects_stale_sufficiency_commit_receipt(write_new_event, monkeypatch):
+    from models import RuntimeEvent
+    from services import evidence_sufficiency
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    evaluation = client.post("/v1/runtime/evidence-sufficiency/evaluate", json={
+        key: value for key, value in payload.items() if key != "current_premise"
+    })
+    assert evaluation.status_code == 200
+    before = _diagnostics(scope)
+    older = RuntimeEvent.model_validate(before["events"][-1])
+    assert older.event_payload_json["policy_version"] == "evidence-sufficiency-policy.v1"
+    assert older.event_payload_json["evaluation_id"] == evaluation.json()["result"]["evaluation_id"]
+    record = evidence_sufficiency.record_runtime_event
+    actual_writes = []
+    selection_calls = []
+    select = evidence_next_steps.select_evidence_next_step_with_events
+
+    def stale_receipt(**kwargs):
+        assert kwargs["event_payload_json"] == older.event_payload_json
+        if write_new_event:
+            actual_writes.append(record(**kwargs))
+            assert actual_writes[-1].event_id != older.event_id
+        return older
+
+    def observe_selection(*args, **kwargs):
+        selection_calls.append(True)
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_sufficiency, "record_runtime_event", stale_receipt)
+    monkeypatch.setattr(
+        evidence_next_steps, "select_evidence_next_step_with_events", observe_selection,
+    )
+    response = _terminal(payload, "v2")
+    assert response.status_code == 409, response.text
+    assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
+    assert selection_calls == []
+    after = _diagnostics(scope)
+    assert after["events"][:len(before["events"])] == before["events"]
+    assert after["events"][len(before["events"]):] == [
+        event.model_dump(mode="json") for event in actual_writes
+    ]
+    assert len(actual_writes) == int(write_new_event)
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
+@pytest.mark.parametrize("write_new_event", [True, False], ids=["writes-new", "no-write"])
+def test_terminal_v2_rejects_stale_selection_commit_receipt(write_new_event, monkeypatch):
+    from models import RuntimeEvent
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    assert _terminal(payload).status_code == 200
+    before = _diagnostics(scope)
+    older = RuntimeEvent.model_validate(before["events"][-1])
+    record = evidence_next_steps.record_runtime_event
+    get_session = evidence_next_steps.get_runtime_session
+    select = evidence_next_steps.select_evidence_next_step_with_events
+    actual_writes = []
+    inside_selection = False
+
+    def stale_selection_read(session_id):
+        diagnostics = get_session(session_id)
+        if inside_selection:
+            # Simulate a stale selection read so the original dedup check
+            # cannot see the retained occurrence and attempts a new write.
+            diagnostics.events = [event for event in diagnostics.events
+                                  if event.event_id != older.event_id]
+        return diagnostics
+
+    def select_with_stale_read(*args, **kwargs):
+        nonlocal inside_selection
+        inside_selection = True
+        try:
+            return select(*args, **kwargs)
+        finally:
+            inside_selection = False
+
+    def stale_receipt(**kwargs):
+        assert kwargs["event_payload_json"] == older.event_payload_json
+        if write_new_event:
+            actual_writes.append(record(**kwargs))
+            assert actual_writes[-1].event_id != older.event_id
+        return older
+
+    monkeypatch.setattr(evidence_next_steps, "get_runtime_session", stale_selection_read)
+    monkeypatch.setattr(
+        evidence_next_steps, "select_evidence_next_step_with_events", select_with_stale_read,
+    )
+    monkeypatch.setattr(evidence_next_steps, "record_runtime_event", stale_receipt)
+    response = _terminal(payload, "v2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
+    after = _diagnostics(scope)
+    assert after["events"][:len(before["events"])] == before["events"]
+    added = after["events"][len(before["events"]):]
+    assert added[0]["event_type"] == "evidence_sufficiency_evaluated"
+    assert added[1:] == [event.model_dump(mode="json") for event in actual_writes]
+    assert len(actual_writes) == int(write_new_event)
+
+
+@pytest.mark.parametrize("stage", ["sufficiency", "next_step"])
+@pytest.mark.parametrize("change", ["append", "remove", "mutate", "bool_type"])
+def test_terminal_v2_concurrent_additions_allow_bound_commits_but_mutations_reject(
+    stage, change, monkeypatch,
+):
+    from services import evidence_sufficiency
+    from services.runtime_state import runtime_state_repository
+
+    scope = _start_runtime()
+    prior = _diagnostics(scope)["events"][0]
+    if change == "bool_type":
+        seeded = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+        evaluation = client.post("/v1/runtime/evidence-sufficiency/evaluate", json={
+            key: value for key, value in seeded.items() if key != "current_premise"
+        })
+        assert evaluation.status_code == 200
+        prior = _diagnostics(scope)["events"][-1]
+        assert prior["event_payload_json"]["qualification_required"] is False
+    target = evidence_sufficiency if stage == "sufficiency" else evidence_next_steps
+    record = target.record_runtime_event
+
+    def intervening_writer(**kwargs):
+        receipt = record(**kwargs)
+        if change == "append":
+            # Identical payload and decision ID, genuinely different occurrence.
+            concurrent = record(**{key: value for key, value in kwargs.items()
+                                   if key != "expected_event_id"})
+            assert concurrent.event_id != receipt.event_id
+        else:
+            with runtime_state_repository()._connect() as conn:
+                if change == "remove":
+                    conn.execute("DELETE FROM conversation_runtime_events WHERE event_id=?",
+                                 (prior["event_id"],))
+                else:
+                    payload = dict(prior["event_payload_json"])
+                    if change == "bool_type":
+                        # Python considers False == 0; exact JSON records do not.
+                        payload["qualification_required"] = 0
+                    else:
+                        payload["changed"] = True
+                    conn.execute(
+                        "UPDATE conversation_runtime_events SET event_payload_json=? "
+                        "WHERE event_id=?",
+                        (json.dumps(payload), prior["event_id"]),
+                    )
+        return receipt
+
+    monkeypatch.setattr(target, "record_runtime_event", intervening_writer)
+    response = _terminal(_terminal_payload(scope), "v2")
+    if change == "append":
+        assert response.status_code == 200, response.text
+        _assert_v2_event_references(response.json(), scope)
+        return
+    assert response.status_code == 409
+    assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
+    if stage == "sufficiency":
+        assert _selection_events(scope["runtime_session_id"]) == []
+
+
+@pytest.mark.parametrize("stage", ["sufficiency", "next_step"])
+def test_terminal_v2_missing_write_receipt_cannot_produce_success(stage, monkeypatch):
+    from services import evidence_sufficiency
+
+    scope = _start_runtime()
+    target = evidence_sufficiency if stage == "sufficiency" else evidence_next_steps
+    monkeypatch.setattr(target, "record_runtime_event", lambda **kwargs: None)
+    response = _terminal(_terminal_payload(scope), "v2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("event_id", "invalid-id!"),
+    ("policy_version", "evidence-sufficiency-policy.v2"),
+    ("runtime_session_id", "wrong-session"),
+    ("runtime_turn_id", "wrong-turn"),
+    ("evidence_plan_id", "wrong-plan"),
+    ("acquisition_manifest_id", "wrong-manifest"),
+    ("evaluation_id", "wrong-evaluation"),
+    ("sufficiency_status", "unknown"),
+    ("evaluated_requirements_digest", f"sha256:{'0' * 64}"),
+])
+def test_terminal_v2_invalid_new_sufficiency_receipt_never_reaches_selection(
+    field, value, monkeypatch,
+):
+    from services import evidence_sufficiency
+    from services.runtime_state import runtime_state_repository
+
+    scope = _start_runtime()
+    record = evidence_sufficiency.record_runtime_event
+
+    def malformed_write(**kwargs):
+        if field == "event_id":
+            receipt = record(**kwargs)
+            with runtime_state_repository()._connect() as conn:
+                conn.execute("UPDATE conversation_runtime_events SET event_id=? WHERE event_id=?",
+                             (value, receipt.event_id))
+            return receipt.model_copy(update={"event_id": value})
+        kwargs["event_payload_json"][field] = value
+        return record(**kwargs)
+
+    def forbidden_selection(*args, **kwargs):
+        pytest.fail("Invalid sufficiency provenance reached selection")
+
+    monkeypatch.setattr(evidence_sufficiency, "record_runtime_event", malformed_write)
+    monkeypatch.setattr(
+        evidence_next_steps, "select_evidence_next_step_with_events", forbidden_selection,
+    )
+    response = _terminal(_terminal_payload(scope, facts=[_fact("material", "satisfied")]), "v2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
+def test_terminal_v2_concurrent_evaluation_receipt_does_not_attest_own_write(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, get_ident
+
+    from models import EvidenceSufficiencyEvaluateRequest
+    from services import evidence_sufficiency
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    other_body = EvidenceSufficiencyEvaluateRequest.model_validate({
+        key: value for key, value in payload.items() if key != "current_premise"
+    })
+    current_thread = get_ident()
+    ready = Event()
+    record = evidence_sufficiency.record_runtime_event
+    actual_commits = []
+
+    def foreign_receipt(**kwargs):
+        if get_ident() != current_thread:
+            event = record(**kwargs)
+            actual_commits.append((get_ident(), event))
+            return event
+        # This invocation does not write. The separate concurrent evaluation
+        # commits one matching occurrence after this invocation's snapshot.
+        ready.set()
+        return other.result(timeout=10)[1]
+
+    def independent_evaluation():
+        assert ready.wait(timeout=10)
+        return evidence_sufficiency.evaluate_evidence_sufficiency_with_event(other_body)
+
+    monkeypatch.setattr(evidence_sufficiency, "record_runtime_event", foreign_receipt)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        other = pool.submit(independent_evaluation)
+        response = _terminal(payload, "v2")
+    assert len(actual_commits) == 1
+    assert actual_commits[0][0] != current_thread
+    if response.status_code == 200:
+        provenance = response.json()["sufficiency_provenance"]
+        assert provenance["persisted_event"]["event_id"] == actual_commits[0][1].event_id
+        assert provenance["persistence"] == "committed"
+    assert response.status_code == 409, response.text
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
+def test_terminal_v2_concurrent_invocations_keep_exact_commit_identities(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from models import EvidenceTerminalEvaluateRequest
+    from services import evidence_sufficiency
+    from services.runtime_state import RuntimeStateRepository, runtime_state_repository
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    before = _diagnostics(scope)
+    barrier = Barrier(2)
+    record = evidence_sufficiency.record_runtime_event
+    receipts = {}
+
+    def synchronized_write(**kwargs):
+        expected = kwargs["expected_event_id"]
+        barrier.wait(timeout=10)
+        event = record(**kwargs)
+        assert event.event_id == expected
+        receipts[kwargs["event_payload_json"]["request_id"]] = event
+        return event
+
+    monkeypatch.setattr(evidence_sufficiency, "record_runtime_event", synchronized_write)
+
+    def evaluate(index):
+        body = EvidenceTerminalEvaluateRequest.model_validate({
+            **payload, "request_id": f"concurrent-terminal-{index}",
+        })
+        return evidence_next_steps.evaluate_evidence_terminal_v2(body).model_dump(mode="json")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(evaluate, range(2)))
+    assert len({event.event_id for event in receipts.values()}) == 2
+    for result in results:
+        _assert_v2_event_references(result, scope)
+        event = receipts[result["sufficiency"]["request_id"]]
+        assert result["sufficiency_provenance"]["persisted_event"]["event_id"] == event.event_id
+        consulted = result["next_step_provenance"]["consulted_sufficiency_event"]
+        assert consulted["event_id"] == event.event_id
+        assert result["next_step_provenance"]["persistence"] == "committed"
+        assert result["next_step"]["result"]["provider_disposition"] == "allowed"
+    persisted = RuntimeStateRepository(runtime_state_repository().db_path).diagnostics(
+        scope["runtime_session_id"],
+    )
+    assert len(persisted.events) == len(before["events"]) + 4
+    for result in results:
+        for key in ("sufficiency_provenance", "next_step_provenance"):
+            reference = result[key]["persisted_event"]
+            event = next(e for e in persisted.events if e.event_id == reference["event_id"])
+            assert event.event_payload_json["policy_version"] == reference["policy_version"]
+
+
+@pytest.mark.parametrize("stage", ["sufficiency", "next_step"])
+def test_terminal_v2_storage_rollback_cannot_publish_success(stage, monkeypatch):
+    from services.runtime_state import runtime_state_repository
+
+    scope = _start_runtime()
+    repo = runtime_state_repository()
+    original = repo._record_event
+    before = _diagnostics(scope)
+
+    def fail_after_insert(conn, **kwargs):
+        event = original(conn, **kwargs)
+        if kwargs["event_type"] == ("evidence_sufficiency_evaluated" if stage == "sufficiency"
+                                    else "evidence_next_step_selected"):
+            assert event.event_id == kwargs["expected_event_id"]
+            raise RuntimeError("storage_failure_after_insert")
+        return event
+
+    monkeypatch.setattr(repo, "_record_event", fail_after_insert)
+    with pytest.raises(RuntimeError, match="storage_failure_after_insert"):
+        _terminal(_terminal_payload(scope), "v2")
+    after = _diagnostics(scope)
+    added = after["events"][len(before["events"]):]
+    assert [e["event_type"] for e in added] == (
+        [] if stage == "sufficiency" else ["evidence_sufficiency_evaluated"]
+    )
+    assert _selection_events(scope["runtime_session_id"]) == []
+
+
+@pytest.mark.parametrize("stage", ["sufficiency", "next_step"])
+def test_terminal_v2_wrong_expected_identity_cannot_claim_committed(stage, monkeypatch):
+    from services import evidence_sufficiency
+    from services.runtime_state import new_runtime_event_id
+
+    scope = _start_runtime()
+    target = evidence_sufficiency if stage == "sufficiency" else evidence_next_steps
+    record = target.record_runtime_event
+    writes = []
+
+    def wrong_identity(**kwargs):
+        expected = kwargs["expected_event_id"]
+        event = record(**{**kwargs, "expected_event_id": new_runtime_event_id()})
+        assert event.event_id != expected
+        writes.append(event)
+        return event
+
+    monkeypatch.setattr(target, "record_runtime_event", wrong_identity)
+    response = _terminal(_terminal_payload(scope), "v2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
+    assert len(writes) == 1
+    if stage == "sufficiency":
+        assert _selection_events(scope["runtime_session_id"]) == []

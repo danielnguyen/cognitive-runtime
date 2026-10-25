@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from hashlib import sha256
 from typing import Any, cast
 
@@ -28,6 +29,7 @@ from models import (
     EvidenceTerminalEvaluateResponse,
     EvidenceTerminalEvaluateResponseV2,
     RuntimeEvent,
+    RuntimeSessionDiagnosticsResponse,
 )
 from pydantic import ValidationError
 from services.evidence_planning import evidence_acquisition_premise_digest
@@ -39,6 +41,7 @@ from services.evidence_sufficiency import (
 )
 from services.runtime_state import (
     get_runtime_session,
+    new_runtime_event_id,
     record_runtime_event,
     runtime_session_by_id,
     validate_runtime_turn_session,
@@ -188,14 +191,104 @@ def _event_reference(event: RuntimeEvent) -> dict[str, Any]:
     return reference
 
 
+def _validate_committed_occurrence(
+    before: RuntimeSessionDiagnosticsResponse,
+    after: RuntimeSessionDiagnosticsResponse,
+    receipt: RuntimeEvent,
+    body: EvidenceTerminalEvaluateRequest,
+    *,
+    expected_event_id: str,
+    event_type: str,
+    decision_fields: dict[str, Any],
+) -> None:
+    for snapshot in (before, after):
+        if any(getattr(snapshot.runtime_session, key) != getattr(body, key)
+               for key in ("owner_id", "conversation_id", "surface", "runtime_session_id")):
+            raise RuntimeError("evidence_terminal_provenance_invalid")
+    previous = {event.event_id: _canonical_json(event.model_dump(mode="json"))
+                for event in before.events}
+    persisted = {event.event_id: _canonical_json(event.model_dump(mode="json"))
+                 for event in after.events}
+    if (
+        not isinstance(receipt, RuntimeEvent)
+        or len(previous) != len(before.events)
+        or len(persisted) != len(after.events)
+        or receipt.event_id != expected_event_id
+        or receipt.event_id in previous
+        or any(persisted.get(event_id) != event for event_id, event in previous.items())
+        or persisted.get(receipt.event_id) != _canonical_json(receipt.model_dump(mode="json"))
+    ):
+        # The identity was chosen before this invocation's write. A matching
+        # new row from another invocation cannot substitute for its receipt.
+        # Concurrent additions are permitted; retained records stay exact.
+        raise RuntimeError("evidence_terminal_provenance_invalid")
+    expected = {
+        key: getattr(body, key) for key in (
+            "request_id", "runtime_session_id", "runtime_turn_id",
+            "evidence_plan_id", "acquisition_manifest_id",
+        )
+    } | decision_fields
+    if (
+        receipt.event_type != event_type
+        or receipt.runtime_session_id != body.runtime_session_id
+        or receipt.runtime_turn_id != body.runtime_turn_id
+        or not expected.keys() <= receipt.event_payload_json.keys()
+        or _canonical_json({key: receipt.event_payload_json.get(key) for key in expected})
+        != _canonical_json(expected)
+    ):
+        raise RuntimeError("evidence_terminal_provenance_invalid")
+
+
 def evaluate_evidence_terminal_v2(
     body: EvidenceTerminalEvaluateRequest,
 ) -> EvidenceTerminalEvaluateResponseV2:
+    expected_evaluation_event_id = new_runtime_event_id()
+    before_evaluation = get_runtime_session(body.runtime_session_id).model_copy(deep=True)
     sufficiency, evaluated_event = evaluate_evidence_sufficiency_with_event(
         EvidenceSufficiencyEvaluateRequest.model_validate(
             body.model_dump(include=set(EvidenceSufficiencyEvaluateRequest.model_fields))
-        )
+        ),
+        expected_event_id=expected_evaluation_event_id,
     )
+    before_selection = get_runtime_session(body.runtime_session_id).model_copy(deep=True)
+    _validate_committed_occurrence(
+        before_evaluation, before_selection, evaluated_event, body,
+        expected_event_id=expected_evaluation_event_id,
+        event_type="evidence_sufficiency_evaluated",
+        decision_fields={
+            "policy_version": EVIDENCE_SUFFICIENCY_POLICY_VERSION,
+            **sufficiency.result.model_dump(exclude={
+                "evaluated_requirements", "user_safe_summary",
+            }),
+            "evaluated_requirements_digest": evaluated_requirements_digest(
+                sufficiency.result.evaluated_requirements
+            ),
+        },
+    )
+    # Reject invalid sufficiency receipts before selection can compute or write
+    # a terminal decision. No v1/individual call uses this attribution gate.
+    if any(getattr(sufficiency, key) != getattr(body, key) for key in (
+        "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+        "runtime_turn_id", "evidence_plan_id", "acquisition_manifest_id",
+    )):
+        raise RuntimeError("evidence_terminal_provenance_invalid")
+    try:
+        sufficiency_provenance = EvidenceSufficiencyProvenance(
+            computation_policy_version=EVIDENCE_SUFFICIENCY_POLICY_VERSION,
+            persistence="committed",
+            persisted_event=EvidenceSufficiencyEventReference.model_validate(
+                _event_reference(evaluated_event)
+            ),
+        )
+    except ValidationError as exc:
+        raise RuntimeError("evidence_terminal_provenance_invalid") from exc
+    selection_event_ids: list[str] = []
+
+    def allocate_selection_event_id() -> str:
+        event_id = new_runtime_event_id()
+        selection_event_ids.append(event_id)
+        return event_id
+
     next_step, consulted_event, selected_events, committed = (
         select_evidence_next_step_with_events(
             EvidenceNextStepSelectRequest(
@@ -212,7 +305,8 @@ def evaluate_evidence_terminal_v2(
                 current_premise=body.current_premise,
                 proposed_acquisition_premise=body.proposed_acquisition_premise,
                 clarification_target=body.clarification_target,
-            )
+            ),
+            event_id_factory=allocate_selection_event_id,
         )
     )
     # The original selector deduplicates on existence, without choosing among
@@ -221,25 +315,40 @@ def evaluate_evidence_terminal_v2(
         raise RuntimeError("evidence_terminal_provenance_ambiguous")
     selected_event = selected_events[0]
     persisted = get_runtime_session(body.runtime_session_id)
+    if committed:
+        if len(selection_event_ids) != 1:
+            raise RuntimeError("evidence_terminal_provenance_invalid")
+        _validate_committed_occurrence(
+            before_selection, persisted, selected_event, body,
+            expected_event_id=selection_event_ids[0],
+            event_type="evidence_next_step_selected",
+            decision_fields={
+                "policy_version": EVIDENCE_NEXT_STEP_POLICY_VERSION,
+                **next_step.result.model_dump(exclude={
+                    "user_safe_summary", "unresolved_material_requirement_ids",
+                }),
+                "unresolved_material_requirement_count": len(
+                    next_step.result.unresolved_material_requirement_ids
+                ),
+            },
+        )
+    elif selection_event_ids:
+        raise RuntimeError("evidence_terminal_provenance_invalid")
     if any(getattr(persisted.runtime_session, key) != getattr(body, key)
            for key in ("owner_id", "conversation_id", "surface", "runtime_session_id")):
         raise RuntimeError("evidence_terminal_provenance_invalid")
     for captured in (evaluated_event, consulted_event, selected_event):
         # Verify exact occurrences, not a search by the repeatable decision ID.
         matches = [event for event in persisted.events if event.event_id == captured.event_id]
-        if len(matches) != 1 or matches[0] != captured:
+        if len(matches) != 1 or _canonical_json(matches[0].model_dump(mode="json")) != (
+            _canonical_json(captured.model_dump(mode="json"))
+        ):
             raise RuntimeError("evidence_terminal_provenance_invalid")
     try:
         return EvidenceTerminalEvaluateResponseV2(
             sufficiency=sufficiency,
             next_step=next_step,
-            sufficiency_provenance=EvidenceSufficiencyProvenance(
-                computation_policy_version=EVIDENCE_SUFFICIENCY_POLICY_VERSION,
-                persistence="committed",
-                persisted_event=EvidenceSufficiencyEventReference.model_validate(
-                    _event_reference(evaluated_event)
-                ),
-            ),
+            sufficiency_provenance=sufficiency_provenance,
             next_step_provenance=EvidenceNextStepProvenance(
                 computation_policy_version=EVIDENCE_NEXT_STEP_POLICY_VERSION,
                 persistence="committed" if committed else "reused",
@@ -687,6 +796,8 @@ def select_evidence_next_step(
 
 def select_evidence_next_step_with_events(
     body: EvidenceNextStepSelectRequest,
+    *,
+    event_id_factory: Callable[[], str] | None = None,
 ) -> tuple[EvidenceNextStepSelectResponse, RuntimeEvent, list[RuntimeEvent], bool]:
     session = runtime_session_by_id(body.runtime_session_id)
     if session is None:
@@ -813,7 +924,11 @@ def select_evidence_next_step_with_events(
     ]
     committed = not selected_events
     if committed:
+        # Allocate only for a new occurrence. Reuse retains the original event.
+        event_identity = ({"expected_event_id": event_id_factory()}
+                          if event_id_factory is not None else {})
         selected_event = record_runtime_event(
+            **event_identity,
             runtime_session_id=body.runtime_session_id,
             runtime_turn_id=body.runtime_turn_id,
             event_type="evidence_next_step_selected",
