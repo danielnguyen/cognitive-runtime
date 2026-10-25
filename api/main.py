@@ -35,6 +35,8 @@ from models import (
     EvidenceShapeDeriveResponse,
     EvidenceSufficiencyEvaluateRequest,
     EvidenceSufficiencyEvaluateResponse,
+    EvidenceTerminalEvaluateRequest,
+    EvidenceTerminalEvaluateResponse,
     HumanCompatibilityDiagnosticsRequest,
     HumanCompatibilityDiagnosticsResponse,
     HumanCompatibilityReviewRequest,
@@ -141,7 +143,10 @@ from services.companion_policy import (
     resolve_interaction_contract,
     resolve_scene,
 )
-from services.evidence_next_steps import select_evidence_next_step
+from services.evidence_next_steps import (
+    evaluate_evidence_terminal,
+    select_evidence_next_step,
+)
 from services.evidence_planning import compile_evidence_plan
 from services.evidence_shape import derive_evidence_shape
 from services.evidence_sufficiency import evaluate_evidence_sufficiency
@@ -755,6 +760,25 @@ async def runtime_evidence_next_step_select(
         return select_evidence_next_step(body)
     except RuntimeError as exc:
         error = _bounded_http_error(exc, _EVIDENCE_NEXT_STEP_ERROR_STATUS)
+        if error is not None:
+            raise error from exc
+        raise
+
+
+@app.post(
+    "/v1/runtime/evidence-terminal/evaluate",
+    response_model=EvidenceTerminalEvaluateResponse,
+)
+async def runtime_evidence_terminal_evaluate(
+    body: EvidenceTerminalEvaluateRequest,
+) -> EvidenceTerminalEvaluateResponse:
+    try:
+        return evaluate_evidence_terminal(body)
+    except RuntimeError as exc:
+        error = _bounded_http_error(
+            exc,
+            {**_EVIDENCE_SUFFICIENCY_ERROR_STATUS, **_EVIDENCE_NEXT_STEP_ERROR_STATUS},
+        )
         if error is not None:
             raise error from exc
         raise
