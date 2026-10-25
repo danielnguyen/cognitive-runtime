@@ -1622,6 +1622,7 @@ def test_event_is_structural_private_and_deterministic_for_reordered_inputs():
     assert len(events) == 1
     payload = events[0]["event_payload_json"]
     assert set(payload) == {
+        "policy_version",
         "request_id",
         "runtime_session_id",
         "runtime_turn_id",
@@ -1867,6 +1868,8 @@ def _assert_terminal_parity(payload, scope):
     ]
     assert new_events[0]["event_id"] != new_events[1]["event_id"]
     assert after["latest_turn"] == before["latest_turn"]
+    for key in ("owner_id", "conversation_id", "surface", "runtime_session_id"):
+        assert after["runtime_session"][key] == payload[key]
     sufficiency = composite["sufficiency"]
     selection = composite["next_step"]
     for key in (
@@ -1901,6 +1904,23 @@ def _assert_terminal_parity(payload, scope):
         assert association["evaluation_id"] == evaluation["evaluation_id"]
     evaluation_event = new_events[0]["event_payload_json"]
     selection_event = new_events[1]["event_payload_json"]
+    assert evaluation_event["policy_version"] == "evidence-sufficiency-policy.v1"
+    assert selection_event["policy_version"] == "evidence-next-step-policy.v1"
+    assert len({evaluation_event["policy_version"], selection_event["policy_version"],
+                composite["schema_version"]}) == 3
+    # Join each returned identity to its persisted event using the exact scope.
+    for event_type, id_field, decision in (
+        ("evidence_sufficiency_evaluated", "evaluation_id", evaluation),
+        ("evidence_next_step_selected", "selection_id", result),
+    ):
+        matches = [event for event in after["events"]
+                   if event["event_type"] == event_type
+                   and event["runtime_session_id"] == payload["runtime_session_id"]
+                   and event["runtime_turn_id"] == payload["runtime_turn_id"]
+                   and event["event_payload_json"].get(id_field) == decision[id_field]]
+        assert len(matches) == 1
+        assert matches[0] in new_events
+    assert "policy_version" not in json.dumps(composite)
     assert evaluation_event["reason_codes"] == evaluation["reason_codes"]
     assert evaluation_event["answer_constraints"] == evaluation["answer_constraints"]
     # Independently compute the wire digest rather than calling the owning helper.
@@ -2410,20 +2430,44 @@ def test_terminal_unexpected_constituent_failure_is_not_success(stage, monkeypat
     from services import evidence_sufficiency
 
     scope = _start_runtime()
+    before = _diagnostics(scope)
     original_record = evidence_sufficiency.record_runtime_event
 
+    attempted_records = []
+
     def fail_record(**kwargs):
+        attempted_records.append(copy.deepcopy(kwargs))
         raise RuntimeError("storage_unavailable")
 
     target = evidence_sufficiency if stage == "sufficiency" else evidence_next_steps
     monkeypatch.setattr(target, "record_runtime_event", fail_record)
     with pytest.raises(RuntimeError, match="storage_unavailable"):
         _terminal(_terminal_payload(scope))
-    events = _diagnostics(scope)["events"]
+    diagnostics = _diagnostics(scope)
+    assert diagnostics["latest_turn"] == before["latest_turn"]
+    events = diagnostics["events"]
     assert len([e for e in events if e["event_type"] == "evidence_sufficiency_evaluated"]) == (
         0 if stage == "sufficiency" else 1
     )
     assert _selection_events(scope["runtime_session_id"]) == []
+    if stage == "next_step":
+        retained = [event for event in events
+                    if event["event_type"] == "evidence_sufficiency_evaluated"][0]
+        payload = retained["event_payload_json"]
+        assert payload["policy_version"] == "evidence-sufficiency-policy.v1"
+        assert payload["runtime_session_id"] == retained["runtime_session_id"]
+        assert payload["runtime_turn_id"] == retained["runtime_turn_id"]
+        assert payload["evidence_plan_id"] == scope["evidence_plan_id"]
+        assert payload["acquisition_manifest_id"] == scope["acquisition_manifest_id"]
+        assert attempted_records[0]["event_type"] == "evidence_next_step_selected"
+        attempted = attempted_records[0]["event_payload_json"]
+        assert attempted["evaluation_id"] == payload["evaluation_id"]
+        assert attempted["policy_version"] == "evidence-next-step-policy.v1"
+        for key in ("runtime_session_id", "runtime_turn_id", "evidence_plan_id",
+                    "acquisition_manifest_id"):
+            assert attempted[key] == payload[key]
+        assert "provider_disposition" not in payload
+        assert "selection_id" not in payload
     if stage == "sufficiency":
         monkeypatch.setattr(target, "record_runtime_event", original_record)
 
@@ -2448,6 +2492,12 @@ def test_terminal_repeated_equivalent_requests_preserve_identity_and_events():
     assert events[-1]["event_type"] == "evidence_sufficiency_evaluated"
     assert events[-1]["event_payload_json"] == initial_events[-2]["event_payload_json"]
     assert len(_selection_events(scope["runtime_session_id"])) == 1
+    evaluated = [event["event_payload_json"] for event in events
+                 if event["event_type"] == "evidence_sufficiency_evaluated"]
+    assert len(evaluated) == 2
+    assert {event["policy_version"] for event in evaluated} == {"evidence-sufficiency-policy.v1"}
+    selected = _selection_events(scope["runtime_session_id"])[0]["event_payload_json"]
+    assert selected["policy_version"] == "evidence-next-step-policy.v1"
     # A new admitted turn must not reuse the prior plan or terminal decision.
     completion = client.post(
         "/v1/runtime/turns/complete",
@@ -2509,3 +2559,110 @@ def test_terminal_reacquisition_guard_retains_individual_request_semantics():
     assert evaluation.json() == second.json()["sufficiency"]
     assert selection.json() == second.json()["next_step"]
     assert len(_selection_events(scope["runtime_session_id"])) == 2
+
+
+def test_terminal_policy_versions_survive_reload_and_match_returned_decisions():
+    from services.evidence_next_steps import EVIDENCE_NEXT_STEP_POLICY_VERSION
+    from services.evidence_sufficiency import EVIDENCE_SUFFICIENCY_POLICY_VERSION
+    from services.runtime_state import clear_states_for_tests, runtime_state_repository
+
+    assert EVIDENCE_SUFFICIENCY_POLICY_VERSION == "evidence-sufficiency-policy.v1"
+    assert EVIDENCE_NEXT_STEP_POLICY_VERSION == "evidence-next-step-policy.v1"
+    scope = _start_runtime()
+    response = _assert_terminal_parity(
+        _terminal_payload(scope, facts=[_fact("material", "satisfied")]), scope,
+    )
+    before = _diagnostics(scope)
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    after = _diagnostics(scope)
+    assert after == before
+    selection = response["next_step"]["result"]
+    selections = [event for event in after["events"]
+                  if event["event_type"] == "evidence_next_step_selected"
+                  and event["event_payload_json"].get("selection_id") == selection["selection_id"]]
+    assert len(selections) == 1
+    assert selections[0]["event_payload_json"]["policy_version"] == (
+        EVIDENCE_NEXT_STEP_POLICY_VERSION
+    )
+    evaluations = [event["event_payload_json"] for event in after["events"]
+                   if event["event_type"] == "evidence_sufficiency_evaluated"
+                   and event["event_payload_json"].get("evaluation_id")
+                   == selection["evaluation_id"]]
+    # Existing append behavior allows multiple event rows for one evaluation ID;
+    # each new row truthfully records the same producing policy implementation.
+    assert len(evaluations) == 2
+    assert {event["policy_version"] for event in evaluations} == {
+        EVIDENCE_SUFFICIENCY_POLICY_VERSION
+    }
+
+
+def test_legacy_unversioned_events_are_not_backfilled_on_read_or_terminal_retry(monkeypatch):
+    from services import evidence_sufficiency
+    from services.runtime_state import clear_states_for_tests, runtime_state_repository
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    record = evidence_sufficiency.record_runtime_event
+
+    def legacy_record(**kwargs):
+        # Explicit old-record fixture: historical services did not record a version.
+        kwargs["event_payload_json"] = dict(kwargs["event_payload_json"])
+        kwargs["event_payload_json"].pop("policy_version")
+        return record(**kwargs)
+
+    with monkeypatch.context() as historical:
+        historical.setattr(evidence_sufficiency, "record_runtime_event", legacy_record)
+        historical.setattr(evidence_next_steps, "record_runtime_event", legacy_record)
+        first = _terminal(payload)
+    assert first.status_code == 200
+    before = _diagnostics(scope)
+    decisions = [event for event in before["events"] if event["event_type"] in {
+        "evidence_sufficiency_evaluated", "evidence_next_step_selected",
+    }]
+    assert len(decisions) == 2
+    assert all("policy_version" not in event["event_payload_json"] for event in decisions)
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    assert _diagnostics(scope) == before
+    repeated = _terminal(payload)
+    assert repeated.status_code == 200
+    assert repeated.json() == first.json()
+    after = _diagnostics(scope)
+    assert after["events"][:-1] == before["events"]
+    appended = after["events"][-1]
+    assert appended["event_type"] == "evidence_sufficiency_evaluated"
+    assert appended["event_payload_json"]["policy_version"] == "evidence-sufficiency-policy.v1"
+    assert appended["event_payload_json"]["evaluation_id"] == first.json()["sufficiency"]["result"][
+        "evaluation_id"
+    ]
+    # Selection deduplicates against the original immutable record; no current
+    # version may be asserted for that historical selection retroactively.
+    assert _selection_events(scope["runtime_session_id"]) == [decisions[1]]
+    assert "policy_version" not in json.dumps(repeated.json())
+
+
+def test_new_selection_over_legacy_sufficiency_records_only_its_own_policy(monkeypatch):
+    from services import evidence_sufficiency
+
+    scope = _start_runtime()
+    record = evidence_sufficiency.record_runtime_event
+
+    def legacy_record(**kwargs):
+        kwargs["event_payload_json"].pop("policy_version")
+        return record(**kwargs)
+
+    with monkeypatch.context() as historical:
+        historical.setattr(evidence_sufficiency, "record_runtime_event", legacy_record)
+        evaluation = _evaluate(scope, [_requirement("material", "targeted_evidence")],
+                               [_fact("material", "satisfied")])
+    before = _diagnostics(scope)
+    legacy = before["events"][-1]
+    assert "policy_version" not in legacy["event_payload_json"]
+    response = _select(_next_step_payload(scope, evaluation))
+    assert response.status_code == 200
+    after = _diagnostics(scope)
+    assert after["events"][:-1] == before["events"]
+    selection = after["events"][-1]["event_payload_json"]
+    assert selection["policy_version"] == "evidence-next-step-policy.v1"
+    assert selection["selection_id"] == response.json()["result"]["selection_id"]
+    assert selection["evaluation_id"] == evaluation["result"]["evaluation_id"]
+    assert "policy_version" not in json.dumps(response.json())

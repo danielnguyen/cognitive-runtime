@@ -498,6 +498,7 @@ def test_response_and_runtime_event_are_bounded_private_and_consistent():
     event = _evaluation_events(scope["runtime_session_id"])[0]
     payload = event["event_payload_json"]
     assert set(payload) == {
+        "policy_version",
         "request_id",
         "runtime_session_id",
         "runtime_turn_id",
@@ -637,3 +638,35 @@ def test_aggregate_material_unknown_or_missing_is_unknown(outcome: str):
     response = _evaluate(scope, requirements, facts)
 
     assert response.json()["result"]["sufficiency_status"] == "unknown"
+
+
+def test_sufficiency_policy_provenance_is_persisted_without_changing_response():
+    from services.evidence_sufficiency import EVIDENCE_SUFFICIENCY_POLICY_VERSION
+    from services.runtime_state import clear_states_for_tests, runtime_state_repository
+
+    assert EVIDENCE_SUFFICIENCY_POLICY_VERSION == "evidence-sufficiency-policy.v1"
+    scope = _start_runtime()
+    first = _evaluate(scope, [_requirement("material")], [_fact("material")])
+    assert first.status_code == 200
+    result = first.json()
+    event = _evaluation_events(scope["runtime_session_id"])[0]
+    payload = event["event_payload_json"]
+    assert payload["policy_version"] == EVIDENCE_SUFFICIENCY_POLICY_VERSION
+    assert payload["evaluation_id"] == result["result"]["evaluation_id"]
+    for field in ("request_id", "runtime_session_id", "runtime_turn_id",
+                  "evidence_plan_id", "acquisition_manifest_id"):
+        assert payload[field] == scope[field]
+    assert event["runtime_session_id"] == scope["runtime_session_id"]
+    assert event["runtime_turn_id"] == scope["runtime_turn_id"]
+    diagnostics = client.get(f"/v1/runtime/sessions/{scope['runtime_session_id']}").json()
+    for field in ("owner_id", "conversation_id", "surface"):
+        assert diagnostics["runtime_session"][field] == scope[field]
+    assert "policy_version" not in json.dumps(result)
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    assert _evaluation_events(scope["runtime_session_id"]) == [event]
+    repeated = _evaluate(scope, [_requirement("material")], [_fact("material")])
+    assert repeated.json() == result
+    events = _evaluation_events(scope["runtime_session_id"])
+    assert len(events) == 2
+    assert events[0]["event_id"] != events[1]["event_id"]
+    assert events[0]["event_payload_json"] == events[1]["event_payload_json"]

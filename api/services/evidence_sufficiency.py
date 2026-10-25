@@ -20,6 +20,10 @@ from services.runtime_state import (
     validate_runtime_turn_session,
 )
 
+# Identifies the current decision implementation, independently of wire schema.
+# Bump when decision semantics change; never infer this value for older events.
+EVIDENCE_SUFFICIENCY_POLICY_VERSION = "evidence-sufficiency-policy.v1"
+
 _CONCRETE_MATERIAL_FAILURES = {
     "partial",
     "not_attempted",
@@ -264,6 +268,7 @@ def evaluate_evidence_sufficiency(
         runtime_turn_id=body.runtime_turn_id,
         event_type="evidence_sufficiency_evaluated",
         event_payload_json={
+            "policy_version": EVIDENCE_SUFFICIENCY_POLICY_VERSION,
             "request_id": body.request_id,
             "runtime_session_id": body.runtime_session_id,
             "runtime_turn_id": body.runtime_turn_id,
