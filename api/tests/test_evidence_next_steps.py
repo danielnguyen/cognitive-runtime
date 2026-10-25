@@ -8,7 +8,11 @@ from itertools import count
 import pytest
 from fastapi.testclient import TestClient
 from main import app
-from models import EvidenceAcquisitionPremise, EvidenceNextStepResult
+from models import (
+    EvidenceAcquisitionPremise,
+    EvidenceNextStepResult,
+    EvidenceTerminalEvaluateResponseV2,
+)
 from pydantic import ValidationError
 from services import evidence_next_steps
 from services.evidence_planning import evidence_acquisition_premise_digest
@@ -1795,8 +1799,8 @@ def _terminal_payload(scope, requirements=None, facts=None, **overrides):
     return payload
 
 
-def _terminal(payload):
-    return client.post("/v1/runtime/evidence-terminal/evaluate", json=payload)
+def _terminal(payload, version="v1"):
+    return client.post(f"/{version}/runtime/evidence-terminal/evaluate", json=payload)
 
 
 def _sequential(payload):
@@ -1851,6 +1855,35 @@ def _diagnostics(scope):
     response = client.get(f"/v1/runtime/sessions/{scope['runtime_session_id']}")
     assert response.status_code == 200
     return response.json()
+
+
+def _assert_v2_event_references(response, scope):
+    assert EvidenceTerminalEvaluateResponseV2.model_validate(response).model_dump(
+        mode="json"
+    ) == response
+    events = _diagnostics(scope)["events"]
+    for reference in (
+        response["sufficiency_provenance"]["persisted_event"],
+        response["next_step_provenance"]["persisted_event"],
+        response["next_step_provenance"]["consulted_sufficiency_event"],
+    ):
+        matches = [event for event in events if event["event_id"] == reference["event_id"]]
+        assert len(matches) == 1
+        event = matches[0]
+        payload = event["event_payload_json"]
+        assert reference == {
+            "event_id": event["event_id"],
+            "event_type": event["event_type"],
+            **{key: payload[key] for key in (
+                "request_id", "runtime_session_id", "runtime_turn_id",
+                "evidence_plan_id", "acquisition_manifest_id", "evaluation_id",
+            )},
+            "policy_version": payload.get("policy_version", "UNKNOWN"),
+            **({"selection_id": payload["selection_id"]}
+               if event["event_type"] == "evidence_next_step_selected" else {}),
+        }
+        assert event["runtime_session_id"] == scope["runtime_session_id"]
+        assert event["runtime_turn_id"] == scope["runtime_turn_id"]
 
 
 def _assert_terminal_parity(payload, scope):
@@ -1960,6 +1993,19 @@ def _assert_terminal_parity(payload, scope):
     assert final_events[-1]["event_type"] == "evidence_sufficiency_evaluated"
     assert final_events[-1]["event_payload_json"] == evaluation_event
     assert final_events[-1]["event_id"] != new_events[0]["event_id"]
+    # Exercise v2 against every independently checked policy outcome in this
+    # matrix, retaining the complete decisions from the original endpoints.
+    v2 = _terminal(payload, "v2")
+    assert v2.status_code == 200, v2.text
+    assert v2.json()["sufficiency"] == sufficiency
+    assert v2.json()["next_step"] == selection
+    assert v2.json()["schema_version"] == "evidence-terminal.v2"
+    _assert_v2_event_references(v2.json(), scope)
+    provenance = v2.json()["next_step_provenance"]
+    assert provenance["persistence"] == "reused"
+    assert provenance["consulted_sufficiency_event"]["event_id"] == new_events[0]["event_id"]
+    assert provenance["persisted_event"]["event_id"] == new_events[1]["event_id"]
+    assert len(_diagnostics(scope)["events"]) == len(final_events) + 1
     return composite
 
 
@@ -2174,10 +2220,11 @@ def test_terminal_scope_sensitive_restrictions(task_shape, kind, constraint):
         "unknown_field",
     ],
 )
-def test_terminal_rejects_caller_authority(field):
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_terminal_rejects_caller_authority(field, version):
     scope = _start_runtime()
     before = _diagnostics(scope)
-    response = _terminal(_terminal_payload(scope, **{field: "forged"}))
+    response = _terminal(_terminal_payload(scope, **{field: "forged"}), version)
     assert response.status_code == 422
     assert _diagnostics(scope) == before
 
@@ -2200,7 +2247,8 @@ def test_terminal_rejects_caller_authority(field):
         "bad_digest",
     ],
 )
-def test_terminal_rejects_malformed_inputs_before_events(mutation):
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_terminal_rejects_malformed_inputs_before_events(mutation, version):
     scope = _start_runtime()
     payload = _terminal_payload(scope)
     if mutation == "missing_context":
@@ -2233,7 +2281,7 @@ def test_terminal_rejects_malformed_inputs_before_events(mutation):
     else:
         payload["current_premise"]["question_anchor_digest"] = "sha256:forged"
     before = _diagnostics(scope)
-    assert _terminal(payload).status_code == 422
+    assert _terminal(payload, version).status_code == 422
     assert _diagnostics(scope) == before
 
 
@@ -2250,7 +2298,8 @@ def test_terminal_rejects_malformed_inputs_before_events(mutation):
         ("evidence_plan_id", "wrong-plan", 400, "current_acquisition_premise_mismatch"),
     ],
 )
-def test_terminal_context_failure_matches_individual_calls(field, value, status, detail):
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_terminal_context_failure_matches_individual_calls(field, value, status, detail, version):
     scope = _start_runtime()
     other = _start_runtime()
     if value == "other-turn":
@@ -2258,7 +2307,7 @@ def test_terminal_context_failure_matches_individual_calls(field, value, status,
     elif value == "other-session":
         value = other["runtime_session_id"]
     payload = _terminal_payload(scope, **{field: value})
-    response = _terminal(payload)
+    response = _terminal(payload, version)
     assert response.status_code == status
     assert response.json() == {"detail": detail}
     assert _selection_events(scope["runtime_session_id"]) == []
@@ -2291,7 +2340,8 @@ def test_terminal_context_failure_matches_individual_calls(field, value, status,
         "strategies",
     ],
 )
-def test_terminal_changed_current_premise_fails_without_partial_success(mutation):
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_terminal_changed_current_premise_fails_without_partial_success(mutation, version):
     scope = _start_runtime()
     payload = _terminal_payload(
         scope,
@@ -2300,7 +2350,7 @@ def test_terminal_changed_current_premise_fails_without_partial_success(mutation
             mutation,
         ),
     )
-    response = _terminal(payload)
+    response = _terminal(payload, version)
     assert response.status_code == 400
     assert response.json() == {"detail": "current_acquisition_premise_mismatch"}
     events = _diagnostics(scope)["events"]
@@ -2426,7 +2476,8 @@ def test_terminal_authoritative_event_failures_preserve_conservative_behavior(
 
 
 @pytest.mark.parametrize("stage", ["sufficiency", "next_step"])
-def test_terminal_unexpected_constituent_failure_is_not_success(stage, monkeypatch):
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_terminal_unexpected_constituent_failure_is_not_success(stage, monkeypatch, version):
     from services import evidence_sufficiency
 
     scope = _start_runtime()
@@ -2442,7 +2493,7 @@ def test_terminal_unexpected_constituent_failure_is_not_success(stage, monkeypat
     target = evidence_sufficiency if stage == "sufficiency" else evidence_next_steps
     monkeypatch.setattr(target, "record_runtime_event", fail_record)
     with pytest.raises(RuntimeError, match="storage_unavailable"):
-        _terminal(_terminal_payload(scope))
+        _terminal(_terminal_payload(scope), version)
     diagnostics = _diagnostics(scope)
     assert diagnostics["latest_turn"] == before["latest_turn"]
     events = diagnostics["events"]
@@ -2590,7 +2641,7 @@ def test_terminal_policy_versions_survive_reload_and_match_returned_decisions():
                    == selection["evaluation_id"]]
     # Existing append behavior allows multiple event rows for one evaluation ID;
     # each new row truthfully records the same producing policy implementation.
-    assert len(evaluations) == 2
+    assert len(evaluations) == 3  # v1 composite, sequential evaluation, v2 composite
     assert {event["policy_version"] for event in evaluations} == {
         EVIDENCE_SUFFICIENCY_POLICY_VERSION
     }
@@ -2666,3 +2717,278 @@ def test_new_selection_over_legacy_sufficiency_records_only_its_own_policy(monke
     assert selection["selection_id"] == response.json()["result"]["selection_id"]
     assert selection["evaluation_id"] == evaluation["result"]["evaluation_id"]
     assert "policy_version" not in json.dumps(response.json())
+
+
+def test_terminal_v2_fresh_exact_writer_events_and_v1_json_parity(monkeypatch):
+    from services import evidence_sufficiency
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    before = _diagnostics(scope)
+    committed = []
+    record = evidence_sufficiency.record_runtime_event
+
+    def capture_record(**kwargs):
+        event = record(**kwargs)
+        committed.append(event)
+        return event
+
+    monkeypatch.setattr(evidence_sufficiency, "record_runtime_event", capture_record)
+    monkeypatch.setattr(evidence_next_steps, "record_runtime_event", capture_record)
+    response = _terminal(payload, "v2")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {"schema_version", "sufficiency", "next_step",
+                         "sufficiency_provenance", "next_step_provenance"}
+    assert body["schema_version"] == "evidence-terminal.v2"
+    assert len(committed) == 2
+    assert [event.event_type for event in committed] == [
+        "evidence_sufficiency_evaluated", "evidence_next_step_selected",
+    ]
+    sufficiency = body["sufficiency_provenance"]
+    selection = body["next_step_provenance"]
+    assert sufficiency["computation_policy_version"] == "evidence-sufficiency-policy.v1"
+    assert selection["computation_policy_version"] == "evidence-next-step-policy.v1"
+    assert sufficiency["persistence"] == selection["persistence"] == "committed"
+    assert sufficiency["persisted_event"]["event_id"] == committed[0].event_id
+    assert selection["persisted_event"]["event_id"] == committed[1].event_id
+    assert selection["consulted_sufficiency_event"] == sufficiency["persisted_event"]
+    _assert_v2_event_references(body, scope)
+    assert len(_diagnostics(scope)["events"]) == len(before["events"]) + 2
+    assert _diagnostics(scope)["latest_turn"] == before["latest_turn"]
+    v1 = _terminal(payload)
+    evaluation, next_step = _sequential(payload)
+    assert v1.json() == {
+        "schema_version": "evidence-terminal.v1",
+        "sufficiency": body["sufficiency"], "next_step": body["next_step"],
+    }
+    assert body["sufficiency"] == evaluation.json()
+    assert body["next_step"] == next_step.json()
+    assert body["next_step"]["result"]["provider_disposition"] == "allowed"
+    assert body["next_step"]["result"]["selected_next_step"] == "answer_within_declared_scope"
+    # V1's exact serialized JSON contract still contains only its original fields.
+    assert v1.content == json.dumps(v1.json(), separators=(",", ":")).encode()
+
+
+def test_terminal_v2_duplicate_evaluation_occurrences_and_reload():
+    from services.runtime_state import clear_states_for_tests, runtime_state_repository
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope)
+    first = _terminal(payload, "v2")
+    second = _terminal(payload, "v2")
+    assert first.status_code == second.status_code == 200
+    a, b = first.json(), second.json()
+    assert a["sufficiency"] == b["sufficiency"]
+    assert a["next_step"] == b["next_step"]
+    assert (a["sufficiency"]["result"]["evaluation_id"]
+            == b["sufficiency"]["result"]["evaluation_id"])
+    original = a["sufficiency_provenance"]["persisted_event"]
+    current = b["sufficiency_provenance"]["persisted_event"]
+    assert original["event_id"] != current["event_id"]
+    assert b["next_step_provenance"]["consulted_sufficiency_event"] == original
+    assert (b["next_step_provenance"]["persisted_event"]
+            == a["next_step_provenance"]["persisted_event"])
+    assert a["next_step_provenance"]["persistence"] == "committed"
+    assert b["next_step_provenance"]["persistence"] == "reused"
+    before = _diagnostics(scope)
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    assert _diagnostics(scope) == before
+    _assert_v2_event_references(a, scope)
+    _assert_v2_event_references(b, scope)
+
+
+def test_terminal_v2_historical_unversioned_counterexample(monkeypatch):
+    from services import evidence_sufficiency
+    from services.runtime_state import clear_states_for_tests, runtime_state_repository
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    record = evidence_sufficiency.record_runtime_event
+
+    def historical_record(**kwargs):
+        # Reproduce the old service's real persisted payloads and API results.
+        # Both events lack policy metadata, as in the independent counterexample.
+        kwargs["event_payload_json"].pop("policy_version")
+        return record(**kwargs)
+
+    with monkeypatch.context() as historical:
+        historical.setattr(evidence_sufficiency, "record_runtime_event", historical_record)
+        historical.setattr(evidence_next_steps, "record_runtime_event", historical_record)
+        legacy = _terminal(payload)
+    assert legacy.status_code == 200
+    before = _diagnostics(scope)
+    old_evaluation, old_selection = before["events"][-2:]
+    assert "policy_version" not in old_evaluation["event_payload_json"]
+    assert "policy_version" not in old_selection["event_payload_json"]
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    computations = []
+    select = evidence_next_steps._selection
+
+    def compute_selection(**kwargs):
+        computations.append(kwargs)
+        return select(**kwargs)
+
+    monkeypatch.setattr(evidence_next_steps, "_selection", compute_selection)
+    response = _terminal(payload, "v2")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(computations) == 1  # Recomputed, despite reusing the old event.
+    assert body["sufficiency"] == legacy.json()["sufficiency"]
+    assert body["next_step"] == legacy.json()["next_step"]
+    current = body["sufficiency_provenance"]
+    selection = body["next_step_provenance"]
+    assert current["computation_policy_version"] == "evidence-sufficiency-policy.v1"
+    assert current["persisted_event"]["policy_version"] == "evidence-sufficiency-policy.v1"
+    assert current["persisted_event"]["event_id"] != old_evaluation["event_id"]
+    assert current["persisted_event"]["evaluation_id"] == old_evaluation["event_payload_json"][
+        "evaluation_id"
+    ]
+    assert selection["computation_policy_version"] == "evidence-next-step-policy.v1"
+    assert selection["persistence"] == "reused"
+    assert selection["persisted_event"]["event_id"] == old_selection["event_id"]
+    assert selection["persisted_event"]["policy_version"] == "UNKNOWN"
+    assert selection["consulted_sufficiency_event"]["event_id"] == old_evaluation["event_id"]
+    assert selection["consulted_sufficiency_event"]["policy_version"] == "UNKNOWN"
+    after = _diagnostics(scope)
+    assert after["events"][:-1] == before["events"]
+    assert len(after["events"]) == len(before["events"]) + 1
+    assert after["events"][-1]["event_id"] == current["persisted_event"]["event_id"]
+    clear_states_for_tests(db_path=runtime_state_repository().db_path)
+    assert _diagnostics(scope) == after
+    _assert_v2_event_references(body, scope)
+
+
+def test_terminal_v2_ambiguous_retained_selection_fails_without_changing_v1():
+    from services.runtime_state import record_runtime_event
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    original = _terminal(payload)
+    assert original.status_code == 200
+    retained = _selection_events(scope["runtime_session_id"])[0]
+    duplicate = record_runtime_event(
+        runtime_session_id=scope["runtime_session_id"],
+        runtime_turn_id=scope["runtime_turn_id"],
+        event_type=retained["event_type"],
+        event_payload_json=retained["event_payload_json"],
+    )
+    assert duplicate.event_id != retained["event_id"]
+    assert _terminal(payload).content == original.content
+    before = _diagnostics(scope)
+    response = _terminal(payload, "v2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "evidence_terminal_provenance_ambiguous"}
+    after = _diagnostics(scope)
+    assert after["events"][:-1] == before["events"]
+    assert after["events"][-1]["event_type"] == "evidence_sufficiency_evaluated"
+    assert len(_selection_events(scope["runtime_session_id"])) == 2
+
+
+@pytest.mark.parametrize("field,value", [
+    ("request_id", "wrong-request"),
+    ("runtime_session_id", "wrong-session"),
+    ("runtime_turn_id", "wrong-turn"),
+    ("evidence_plan_id", "wrong-plan"),
+    ("acquisition_manifest_id", "wrong-manifest"),
+    ("evaluation_id", "wrong-evaluation"),
+    ("policy_version", "evidence-terminal.v2"),
+    ("policy_version", None),
+])
+def test_terminal_v2_invalid_retained_event_provenance_fails_closed(field, value):
+    from services.runtime_state import runtime_state_repository
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope, facts=[_fact("material", "satisfied")])
+    assert _terminal(payload).status_code == 200
+    selected = _selection_events(scope["runtime_session_id"])[0]
+    corrupt = {**selected["event_payload_json"], field: value}
+    with runtime_state_repository()._connect() as conn:
+        conn.execute(
+            "UPDATE conversation_runtime_events SET event_payload_json=? WHERE event_id=?",
+            (json.dumps(corrupt), selected["event_id"]),
+        )
+    before = _diagnostics(scope)
+    response = _terminal(payload, "v2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
+    after = _diagnostics(scope)
+    assert after["events"][:-1] == before["events"]
+    assert len(_selection_events(scope["runtime_session_id"])) == 1
+
+
+@pytest.mark.parametrize("stage", ["sufficiency", "next_step"])
+def test_terminal_v2_forged_writer_event_reference_is_not_published(stage, monkeypatch):
+    from services import evidence_sufficiency
+
+    scope = _start_runtime()
+    payload = _terminal_payload(scope)
+    target = evidence_sufficiency if stage == "sufficiency" else evidence_next_steps
+    record = target.record_runtime_event
+
+    def forged_reference(**kwargs):
+        event = record(**kwargs)
+        return event.model_copy(update={"event_id": "event-not-persisted"})
+
+    monkeypatch.setattr(target, "record_runtime_event", forged_reference)
+    response = _terminal(payload, "v2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "evidence_terminal_provenance_invalid"}
+    # Both writes can already be durable. Their existence is not terminal success.
+    assert [event["event_type"] for event in _diagnostics(scope)["events"][-2:]] == [
+        "evidence_sufficiency_evaluated", "evidence_next_step_selected",
+    ]
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+@pytest.mark.parametrize("field", ["sufficiency_provenance", "next_step_provenance",
+                                   "persisted_event", "computation_policy_version"])
+def test_terminal_provenance_is_server_owned_not_request_authority(version, field):
+    scope = _start_runtime()
+    before = _diagnostics(scope)
+    response = _terminal(_terminal_payload(scope, **{field: {"persistence": "committed"}}), version)
+    assert response.status_code == 422
+    assert _diagnostics(scope) == before
+
+
+def test_terminal_v2_response_provenance_is_strict_and_bound():
+    scope = _start_runtime()
+    response = _terminal(_terminal_payload(scope), "v2")
+    assert response.status_code == 200
+    valid = response.json()
+    mutations = [
+        (("schema_version",), "evidence-terminal.v1"),
+        (("extra",), True),
+        (("sufficiency_provenance", "computation_policy_version"), "evidence-terminal.v2"),
+        (("next_step_provenance", "computation_policy_version"), "UNKNOWN"),
+        (("sufficiency_provenance", "persistence"), "reused"),
+        (("next_step_provenance", "persistence"), True),
+        (("sufficiency_provenance", "persisted_event", "policy_version"), "UNKNOWN"),
+        (("next_step_provenance", "persisted_event", "policy_version"), "UNKNOWN"),
+        (("next_step_provenance", "persisted_event", "extra"), "forged"),
+        (("next_step_provenance", "persisted_event", "event_id"), ""),
+        (("next_step_provenance", "persisted_event", "event_type"),
+         "evidence_sufficiency_evaluated"),
+        (("next_step_provenance", "persisted_event", "evaluation_id"), "wrong-evaluation"),
+        (("next_step_provenance", "persisted_event", "selection_id"), "wrong-selection"),
+        (("next_step_provenance", "consulted_sufficiency_event", "runtime_session_id"), "wrong"),
+        (("next_step_provenance", "consulted_sufficiency_event", "runtime_turn_id"), "wrong"),
+        (("next_step_provenance", "consulted_sufficiency_event", "evidence_plan_id"), "wrong"),
+        (("next_step_provenance", "consulted_sufficiency_event", "acquisition_manifest_id"),
+         "wrong"),
+        (("next_step", "owner_id"), "wrong-owner"),
+        (("next_step", "conversation_id"), "wrong-conversation"),
+        (("next_step", "surface"), "wrong-surface"),
+    ]
+    for path, value in mutations:
+        forged = copy.deepcopy(valid)
+        target = forged
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        with pytest.raises(ValidationError):
+            EvidenceTerminalEvaluateResponseV2.model_validate(forged)
+    for missing in ("sufficiency", "next_step", "sufficiency_provenance", "next_step_provenance"):
+        forged = {key: value for key, value in valid.items() if key != missing}
+        with pytest.raises(ValidationError):
+            EvidenceTerminalEvaluateResponseV2.model_validate(forged)

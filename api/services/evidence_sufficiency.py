@@ -13,6 +13,7 @@ from models import (
     EvidenceSufficiencyReasonCode,
     EvidenceSufficiencyResult,
     EvidenceSufficiencyStatus,
+    RuntimeEvent,
 )
 from services.runtime_state import (
     record_runtime_event,
@@ -227,6 +228,12 @@ def _evaluation_identity(
 def evaluate_evidence_sufficiency(
     body: EvidenceSufficiencyEvaluateRequest,
 ) -> EvidenceSufficiencyEvaluateResponse:
+    return evaluate_evidence_sufficiency_with_event(body)[0]
+
+
+def evaluate_evidence_sufficiency_with_event(
+    body: EvidenceSufficiencyEvaluateRequest,
+) -> tuple[EvidenceSufficiencyEvaluateResponse, RuntimeEvent]:
     session = runtime_session_by_id(body.runtime_session_id)
     if session is None:
         raise RuntimeError("runtime_session_not_found")
@@ -263,7 +270,7 @@ def evaluate_evidence_sufficiency(
         item.effective_outcome == "satisfied" for item in evaluations
     )
     missing_count = sum(item.effective_outcome == "missing" for item in evaluations)
-    record_runtime_event(
+    event = record_runtime_event(
         runtime_session_id=body.runtime_session_id,
         runtime_turn_id=body.runtime_turn_id,
         event_type="evidence_sufficiency_evaluated",
@@ -294,7 +301,7 @@ def evaluate_evidence_sufficiency(
             "additional_acquisition_required": result.additional_acquisition_required,
         },
     )
-    return EvidenceSufficiencyEvaluateResponse(
+    response = EvidenceSufficiencyEvaluateResponse(
         request_id=body.request_id,
         owner_id=body.owner_id,
         conversation_id=body.conversation_id,
@@ -305,3 +312,4 @@ def evaluate_evidence_sufficiency(
         acquisition_manifest_id=body.acquisition_manifest_id,
         result=result,
     )
+    return response, event

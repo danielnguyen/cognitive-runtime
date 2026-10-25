@@ -10,6 +10,8 @@ from models import (
     EvidenceAnswerConstraint,
     EvidenceConclusionDisposition,
     EvidenceNextStep,
+    EvidenceNextStepEventReference,
+    EvidenceNextStepProvenance,
     EvidenceNextStepReasonCode,
     EvidenceNextStepResult,
     EvidenceNextStepSelectRequest,
@@ -18,15 +20,21 @@ from models import (
     EvidenceReacquisitionGuard,
     EvidenceRequirementEvaluation,
     EvidenceSufficiencyEvaluateRequest,
+    EvidenceSufficiencyEventReference,
+    EvidenceSufficiencyProvenance,
     EvidenceSufficiencyStatus,
     EvidenceTaskShape,
     EvidenceTerminalEvaluateRequest,
     EvidenceTerminalEvaluateResponse,
+    EvidenceTerminalEvaluateResponseV2,
     RuntimeEvent,
 )
+from pydantic import ValidationError
 from services.evidence_planning import evidence_acquisition_premise_digest
 from services.evidence_sufficiency import (
+    EVIDENCE_SUFFICIENCY_POLICY_VERSION,
     evaluate_evidence_sufficiency,
+    evaluate_evidence_sufficiency_with_event,
     evaluated_requirements_digest,
 )
 from services.runtime_state import (
@@ -158,6 +166,95 @@ def evaluate_evidence_terminal(
     return EvidenceTerminalEvaluateResponse(sufficiency=sufficiency, next_step=next_step)
 
 
+def _event_reference(event: RuntimeEvent) -> dict[str, Any]:
+    payload = event.event_payload_json
+    if (event.runtime_session_id != payload.get("runtime_session_id")
+            or event.runtime_turn_id != payload.get("runtime_turn_id")):
+        raise RuntimeError("evidence_terminal_provenance_invalid")
+    reference = {
+        "event_id": event.event_id,
+        "request_id": payload.get("request_id"),
+        "event_type": event.event_type,
+        "runtime_session_id": event.runtime_session_id,
+        "runtime_turn_id": event.runtime_turn_id,
+        "evidence_plan_id": payload.get("evidence_plan_id"),
+        "acquisition_manifest_id": payload.get("acquisition_manifest_id"),
+        "evaluation_id": payload.get("evaluation_id"),
+        # Absence is historical unknown, never the current computation version.
+        "policy_version": payload.get("policy_version", "UNKNOWN"),
+    }
+    if event.event_type == "evidence_next_step_selected":
+        reference["selection_id"] = payload.get("selection_id")
+    return reference
+
+
+def evaluate_evidence_terminal_v2(
+    body: EvidenceTerminalEvaluateRequest,
+) -> EvidenceTerminalEvaluateResponseV2:
+    sufficiency, evaluated_event = evaluate_evidence_sufficiency_with_event(
+        EvidenceSufficiencyEvaluateRequest.model_validate(
+            body.model_dump(include=set(EvidenceSufficiencyEvaluateRequest.model_fields))
+        )
+    )
+    next_step, consulted_event, selected_events, committed = (
+        select_evidence_next_step_with_events(
+            EvidenceNextStepSelectRequest(
+                request_id=sufficiency.request_id,
+                owner_id=sufficiency.owner_id,
+                conversation_id=sufficiency.conversation_id,
+                surface=sufficiency.surface,
+                runtime_session_id=sufficiency.runtime_session_id,
+                runtime_turn_id=sufficiency.runtime_turn_id,
+                evidence_plan_id=sufficiency.evidence_plan_id,
+                acquisition_manifest_id=sufficiency.acquisition_manifest_id,
+                evaluation_id=sufficiency.result.evaluation_id,
+                evaluated_requirements=sufficiency.result.evaluated_requirements,
+                current_premise=body.current_premise,
+                proposed_acquisition_premise=body.proposed_acquisition_premise,
+                clarification_target=body.clarification_target,
+            )
+        )
+    )
+    # The original selector deduplicates on existence, without choosing among
+    # duplicate selection records. V2 must not manufacture that association.
+    if len(selected_events) != 1:
+        raise RuntimeError("evidence_terminal_provenance_ambiguous")
+    selected_event = selected_events[0]
+    persisted = get_runtime_session(body.runtime_session_id)
+    if any(getattr(persisted.runtime_session, key) != getattr(body, key)
+           for key in ("owner_id", "conversation_id", "surface", "runtime_session_id")):
+        raise RuntimeError("evidence_terminal_provenance_invalid")
+    for captured in (evaluated_event, consulted_event, selected_event):
+        # Verify exact occurrences, not a search by the repeatable decision ID.
+        matches = [event for event in persisted.events if event.event_id == captured.event_id]
+        if len(matches) != 1 or matches[0] != captured:
+            raise RuntimeError("evidence_terminal_provenance_invalid")
+    try:
+        return EvidenceTerminalEvaluateResponseV2(
+            sufficiency=sufficiency,
+            next_step=next_step,
+            sufficiency_provenance=EvidenceSufficiencyProvenance(
+                computation_policy_version=EVIDENCE_SUFFICIENCY_POLICY_VERSION,
+                persistence="committed",
+                persisted_event=EvidenceSufficiencyEventReference.model_validate(
+                    _event_reference(evaluated_event)
+                ),
+            ),
+            next_step_provenance=EvidenceNextStepProvenance(
+                computation_policy_version=EVIDENCE_NEXT_STEP_POLICY_VERSION,
+                persistence="committed" if committed else "reused",
+                persisted_event=EvidenceNextStepEventReference.model_validate(
+                    _event_reference(selected_event)
+                ),
+                consulted_sufficiency_event=EvidenceSufficiencyEventReference.model_validate(
+                    _event_reference(consulted_event)
+                ),
+            ),
+        )
+    except ValidationError as exc:
+        raise RuntimeError("evidence_terminal_provenance_invalid") from exc
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -217,7 +314,7 @@ def _selection_identity(
 def _associated_sufficiency_event(
     events: list[RuntimeEvent],
     body: EvidenceNextStepSelectRequest,
-) -> dict[str, Any]:
+) -> RuntimeEvent:
     candidates = [
         event
         for event in events
@@ -255,7 +352,7 @@ def _associated_sufficiency_event(
         or re.fullmatch(r"sha256:[0-9a-f]{64}", requirements_digest) is None
     ):
         raise RuntimeError("evidence_sufficiency_event_invalid")
-    return payload
+    return matches[0]
 
 
 def _associated_plan_event(
@@ -585,6 +682,12 @@ def _selection(
 def select_evidence_next_step(
     body: EvidenceNextStepSelectRequest,
 ) -> EvidenceNextStepSelectResponse:
+    return select_evidence_next_step_with_events(body)[0]
+
+
+def select_evidence_next_step_with_events(
+    body: EvidenceNextStepSelectRequest,
+) -> tuple[EvidenceNextStepSelectResponse, RuntimeEvent, list[RuntimeEvent], bool]:
     session = runtime_session_by_id(body.runtime_session_id)
     if session is None:
         raise RuntimeError("runtime_session_not_found")
@@ -600,7 +703,8 @@ def select_evidence_next_step(
     )
 
     events = get_runtime_session(body.runtime_session_id).events
-    sufficiency_event = _associated_sufficiency_event(events, body)
+    consulted_event = _associated_sufficiency_event(events, body)
+    sufficiency_event = consulted_event.event_payload_json
     evaluations = _normalized_evaluations(body.evaluated_requirements)
     requirements_digest = evaluated_requirements_digest(evaluations)
     if requirements_digest != sufficiency_event["evaluated_requirements_digest"]:
@@ -702,13 +806,14 @@ def select_evidence_next_step(
         user_safe_summary=user_safe_summary,
     )
 
-    event_exists = any(
-        event.event_type == "evidence_next_step_selected"
+    selected_events = [
+        event for event in events
+        if event.event_type == "evidence_next_step_selected"
         and event.event_payload_json.get("selection_id") == selection_id
-        for event in events
-    )
-    if not event_exists:
-        record_runtime_event(
+    ]
+    committed = not selected_events
+    if committed:
+        selected_event = record_runtime_event(
             runtime_session_id=body.runtime_session_id,
             runtime_turn_id=body.runtime_turn_id,
             event_type="evidence_next_step_selected",
@@ -736,8 +841,9 @@ def select_evidence_next_step(
                 "reason_codes": result.reason_codes,
             },
         )
+        selected_events = [selected_event]
 
-    return EvidenceNextStepSelectResponse(
+    response = EvidenceNextStepSelectResponse(
         request_id=body.request_id,
         owner_id=body.owner_id,
         conversation_id=body.conversation_id,
@@ -746,3 +852,4 @@ def select_evidence_next_step(
         runtime_turn_id=body.runtime_turn_id,
         result=result,
     )
+    return response, consulted_event, selected_events, committed
