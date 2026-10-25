@@ -17,12 +17,18 @@ from models import (
     EvidenceProviderDisposition,
     EvidenceReacquisitionGuard,
     EvidenceRequirementEvaluation,
+    EvidenceSufficiencyEvaluateRequest,
     EvidenceSufficiencyStatus,
     EvidenceTaskShape,
+    EvidenceTerminalEvaluateRequest,
+    EvidenceTerminalEvaluateResponse,
     RuntimeEvent,
 )
 from services.evidence_planning import evidence_acquisition_premise_digest
-from services.evidence_sufficiency import evaluated_requirements_digest
+from services.evidence_sufficiency import (
+    evaluate_evidence_sufficiency,
+    evaluated_requirements_digest,
+)
 from services.runtime_state import (
     get_runtime_session,
     record_runtime_event,
@@ -114,6 +120,38 @@ _REASON_CODE_ORDER: tuple[EvidenceNextStepReasonCode, ...] = (
     "unexamined_material_scope",
     "unsupported_conclusion_withheld",
 )
+
+
+def evaluate_evidence_terminal(
+    body: EvidenceTerminalEvaluateRequest,
+) -> EvidenceTerminalEvaluateResponse:
+    sufficiency = evaluate_evidence_sufficiency(
+        EvidenceSufficiencyEvaluateRequest.model_validate(
+            body.model_dump(include=set(EvidenceSufficiencyEvaluateRequest.model_fields))
+        )
+    )
+    # The evaluator has committed its event. Selection must still read and
+    # validate that event, just as it does for the individual API calls.
+    next_step = select_evidence_next_step(
+        EvidenceNextStepSelectRequest(
+            request_id=sufficiency.request_id,
+            owner_id=sufficiency.owner_id,
+            conversation_id=sufficiency.conversation_id,
+            surface=sufficiency.surface,
+            runtime_session_id=sufficiency.runtime_session_id,
+            runtime_turn_id=sufficiency.runtime_turn_id,
+            evidence_plan_id=sufficiency.evidence_plan_id,
+            acquisition_manifest_id=sufficiency.acquisition_manifest_id,
+            evaluation_id=sufficiency.result.evaluation_id,
+            evaluated_requirements=sufficiency.result.evaluated_requirements,
+            current_premise=body.current_premise,
+            proposed_acquisition_premise=body.proposed_acquisition_premise,
+            clarification_target=body.clarification_target,
+        )
+    )
+    # Constituent failures propagate; a committed sufficiency event is not
+    # rolled back or represented as a successful partial terminal decision.
+    return EvidenceTerminalEvaluateResponse(sufficiency=sufficiency, next_step=next_step)
 
 
 def _canonical_json(value: Any) -> str:

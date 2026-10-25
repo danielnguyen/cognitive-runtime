@@ -2675,6 +2675,31 @@ class EvidenceNextStepSelectResponse(BaseModel):
     result: EvidenceNextStepResult
 
 
+class EvidenceTerminalEvaluateRequest(EvidenceSufficiencyEvaluateRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    current_premise: EvidenceAcquisitionPremise
+    proposed_acquisition_premise: EvidenceAcquisitionPremise | None = None
+    clarification_target: EvidenceClarificationTarget | None = None
+
+    @model_validator(mode="after")
+    def validate_terminal_inputs(self) -> EvidenceTerminalEvaluateRequest:
+        if (
+            self.proposed_acquisition_premise is not None
+            and self.clarification_target is not None
+        ):
+            raise ValueError("conflicting_next_step_inputs")
+        return self
+
+
+class EvidenceTerminalEvaluateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["evidence-terminal.v1"] = "evidence-terminal.v1"
+    sufficiency: EvidenceSufficiencyEvaluateResponse
+    next_step: EvidenceNextStepSelectResponse
+
+
 PrivacySurfaceCategory = Literal[
     "desktop_private",
     "mobile_private",
