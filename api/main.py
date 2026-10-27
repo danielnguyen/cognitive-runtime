@@ -37,6 +37,7 @@ from models import (
     EvidenceSufficiencyEvaluateResponse,
     EvidenceTerminalEvaluateRequest,
     EvidenceTerminalEvaluateResponse,
+    EvidenceTerminalEvaluateResponseV2,
     HumanCompatibilityDiagnosticsRequest,
     HumanCompatibilityDiagnosticsResponse,
     HumanCompatibilityReviewRequest,
@@ -145,6 +146,7 @@ from services.companion_policy import (
 )
 from services.evidence_next_steps import (
     evaluate_evidence_terminal,
+    evaluate_evidence_terminal_v2,
     select_evidence_next_step,
 )
 from services.evidence_planning import compile_evidence_plan
@@ -778,6 +780,27 @@ async def runtime_evidence_terminal_evaluate(
         error = _bounded_http_error(
             exc,
             {**_EVIDENCE_SUFFICIENCY_ERROR_STATUS, **_EVIDENCE_NEXT_STEP_ERROR_STATUS},
+        )
+        if error is not None:
+            raise error from exc
+        raise
+
+
+@app.post(
+    "/v2/runtime/evidence-terminal/evaluate",
+    response_model=EvidenceTerminalEvaluateResponseV2,
+)
+async def runtime_evidence_terminal_evaluate_v2(
+    body: EvidenceTerminalEvaluateRequest,
+) -> EvidenceTerminalEvaluateResponseV2:
+    try:
+        return evaluate_evidence_terminal_v2(body)
+    except RuntimeError as exc:
+        error = _bounded_http_error(
+            exc,
+            {**_EVIDENCE_SUFFICIENCY_ERROR_STATUS, **_EVIDENCE_NEXT_STEP_ERROR_STATUS,
+             "evidence_terminal_provenance_invalid": 409,
+             "evidence_terminal_provenance_ambiguous": 409},
         )
         if error is not None:
             raise error from exc

@@ -2700,6 +2700,100 @@ class EvidenceTerminalEvaluateResponse(BaseModel):
     next_step: EvidenceNextStepSelectResponse
 
 
+class EvidenceDecisionEventReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    event_id: EvidenceSufficiencyIdentifier
+    request_id: EvidenceSufficiencyIdentifier
+    runtime_session_id: EvidenceSufficiencyIdentifier
+    runtime_turn_id: EvidenceSufficiencyIdentifier
+    evidence_plan_id: EvidenceSufficiencyIdentifier
+    acquisition_manifest_id: EvidenceSufficiencyIdentifier
+    evaluation_id: EvidenceSufficiencyIdentifier
+
+
+class EvidenceSufficiencyEventReference(EvidenceDecisionEventReference):
+    event_type: Literal["evidence_sufficiency_evaluated"]
+    # UNKNOWN means the retained event did not record a policy version.
+    policy_version: Literal["UNKNOWN"] | Annotated[
+        str, Field(pattern=r"^evidence-sufficiency-policy\.v[1-9][0-9]{0,8}$", max_length=120)
+    ]
+
+
+class EvidenceNextStepEventReference(EvidenceDecisionEventReference):
+    event_type: Literal["evidence_next_step_selected"]
+    selection_id: EvidenceSufficiencyIdentifier
+    policy_version: Literal["UNKNOWN"] | Annotated[
+        str, Field(pattern=r"^evidence-next-step-policy\.v[1-9][0-9]{0,8}$", max_length=120)
+    ]
+
+
+class EvidenceSufficiencyProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    computation_policy_version: Literal["evidence-sufficiency-policy.v1"]
+    persistence: Literal["committed"]
+    persisted_event: EvidenceSufficiencyEventReference
+
+
+class EvidenceNextStepProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    computation_policy_version: Literal["evidence-next-step-policy.v1"]
+    persistence: Literal["committed", "reused"]
+    persisted_event: EvidenceNextStepEventReference
+    # Input to the current selection computation, not a claim about the
+    # unrecorded dependencies of a historical deduplicated selection event.
+    consulted_sufficiency_event: EvidenceSufficiencyEventReference
+
+
+class EvidenceTerminalEvaluateResponseV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["evidence-terminal.v2"] = "evidence-terminal.v2"
+    sufficiency: EvidenceSufficiencyEvaluateResponse
+    next_step: EvidenceNextStepSelectResponse
+    sufficiency_provenance: EvidenceSufficiencyProvenance
+    next_step_provenance: EvidenceNextStepProvenance
+
+    @model_validator(mode="after")
+    def validate_provenance_associations(self) -> EvidenceTerminalEvaluateResponseV2:
+        evaluation = self.sufficiency.result
+        selection = self.next_step.result
+        for key in ("request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id"):
+            if getattr(self.sufficiency, key) != getattr(self.next_step, key):
+                raise ValueError("evidence_terminal_identity_mismatch")
+        if (evaluation.evaluation_id != selection.evaluation_id
+                or evaluation.task_shape != selection.task_shape
+                or evaluation.sufficiency_status != selection.sufficiency_status):
+            raise ValueError("evidence_terminal_decision_mismatch")
+        current = self.sufficiency_provenance.persisted_event
+        consulted = self.next_step_provenance.consulted_sufficiency_event
+        selected = self.next_step_provenance.persisted_event
+        for key in ("request_id", "runtime_session_id", "runtime_turn_id", "evidence_plan_id",
+                    "acquisition_manifest_id"):
+            expected = getattr(self.sufficiency, key)
+            if any(getattr(event, key) != expected for event in (current, consulted, selected)):
+                raise ValueError("evidence_terminal_event_scope_mismatch")
+        if (any(event.evaluation_id != evaluation.evaluation_id
+                for event in (current, consulted, selected))
+                or selected.selection_id != selection.selection_id
+                or selection.evidence_plan_id != self.sufficiency.evidence_plan_id
+                or selection.acquisition_manifest_id != self.sufficiency.acquisition_manifest_id):
+            raise ValueError("evidence_terminal_event_decision_mismatch")
+        if (selected.event_id in {current.event_id, consulted.event_id}
+                or (current.event_id == consulted.event_id and current != consulted)):
+            raise ValueError("evidence_terminal_event_identity_mismatch")
+        if current.policy_version != self.sufficiency_provenance.computation_policy_version:
+            raise ValueError("evidence_terminal_committed_policy_mismatch")
+        if (self.next_step_provenance.persistence == "committed"
+                and selected.policy_version
+                != self.next_step_provenance.computation_policy_version):
+            raise ValueError("evidence_terminal_committed_policy_mismatch")
+        return self
+
+
 PrivacySurfaceCategory = Literal[
     "desktop_private",
     "mobile_private",

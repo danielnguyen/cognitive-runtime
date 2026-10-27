@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import secrets
 import sqlite3
 from asyncio import CancelledError
 from contextlib import contextmanager
@@ -390,6 +392,12 @@ def _canonical_assistant_message_id(value: Any) -> bool:
 
 def _event_id(runtime_session_id: str, event_type: str, created_at: str, ordinal: int) -> str:
     return _digest("rtevent", f"{runtime_session_id}:{event_type}:{created_at}:{ordinal}")
+
+
+def new_runtime_event_id() -> str:
+    # Server-only invocation identity, retaining the event prefix and hex format
+    # with 128 unpredictable bits. Never sourced from an HTTP request.
+    return f"rtevent_{secrets.token_hex(16)}"
 
 
 def _retirement_reservation_id() -> str:
@@ -3058,6 +3066,7 @@ class RuntimeStateRepository:
         runtime_turn_id: str | None,
         event_type: str,
         event_payload_json: dict[str, Any],
+        expected_event_id: str | None = None,
     ) -> RuntimeEvent:
         with self._connect("runtime_event") as conn:
             return self._record_event(
@@ -3066,6 +3075,8 @@ class RuntimeStateRepository:
                 runtime_turn_id=runtime_turn_id,
                 event_type=event_type,
                 event_payload_json=event_payload_json,
+                **({"expected_event_id": expected_event_id}
+                   if expected_event_id is not None else {}),
             )
 
     def update_turn_intent_class(
@@ -3295,7 +3306,13 @@ class RuntimeStateRepository:
         runtime_turn_id: str | None,
         event_type: str,
         event_payload_json: dict[str, Any],
+        expected_event_id: str | None = None,
     ) -> RuntimeEvent:
+        if expected_event_id is not None and (
+            not isinstance(expected_event_id, str)
+            or re.fullmatch(r"rtevent_[0-9a-f]{32}", expected_event_id) is None
+        ):
+            raise RuntimeError("runtime_event_identity_invalid")
         created_at = _now()
         ordinal = int(
             conn.execute(
@@ -3303,7 +3320,8 @@ class RuntimeStateRepository:
                 (runtime_session_id,),
             ).fetchone()[0]
         )
-        event_id = _event_id(runtime_session_id, event_type, created_at, ordinal)
+        event_id = (expected_event_id if expected_event_id is not None
+                    else _event_id(runtime_session_id, event_type, created_at, ordinal))
         conn.execute(
             """
             INSERT INTO conversation_runtime_events (
@@ -3687,12 +3705,14 @@ def record_runtime_event(
     runtime_turn_id: str | None,
     event_type: str,
     event_payload_json: dict[str, Any],
+    expected_event_id: str | None = None,
 ) -> RuntimeEvent:
     return runtime_state_repository().record_session_event(
         runtime_session_id=runtime_session_id,
         runtime_turn_id=runtime_turn_id,
         event_type=event_type,
         event_payload_json=event_payload_json,
+        **({"expected_event_id": expected_event_id} if expected_event_id is not None else {}),
     )
 
 
