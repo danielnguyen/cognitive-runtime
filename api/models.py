@@ -3490,6 +3490,53 @@ class RuntimeIdentityResolveResponse(BaseModel):
     persona_selection: PersonaSelectionDecision | None = None
 
 
+class RuntimeIdentityProvenance(BaseModel):
+    """Evidence of observed producer inputs; neither permission nor a freshness lease."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["runtime-identity.v2"]
+    policy_version: Literal["strict-persona-selection.v1"]
+    producer: Literal["cognitive-runtime"]
+    endpoint: Literal["/v2/runtime/identity/resolve"]
+    decision: Literal["strict_persona_selection"]
+    request_id: BoundedTraceRef
+    owner_id: BoundedTraceRef
+    conversation_id: BoundedTraceRef
+    surface: str = Field(min_length=1, max_length=64)
+    runtime_session_id: BoundedTraceRef
+    runtime_turn_id: BoundedTraceRef
+    thread_revision: int = Field(ge=0)
+    selection_ref: str = Field(pattern=r"^psel_[0-9a-f]{32}$")
+    selection_event_ref: BoundedTraceRef
+    governance_event_ref: BoundedTraceRef
+    input_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    result_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    provenance_ref: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    # Persona/binding storage does not advance the runtime thread revision.
+    # A retained digest cannot detect an unobserved change in either store.
+    freshness: Literal["observed_inputs_only"]
+
+
+class RuntimeIdentityResolveRequestV2(RuntimeIdentityResolveRequest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    persona_selection_mode: Literal["strict"] = "strict"
+    runtime_session_id: BoundedTraceRef
+    runtime_turn_id: BoundedTraceRef
+    # Validated against newly observed producer evidence at runtime, with bounded
+    # diagnostics. Omission produces evidence; explicit null is invalid evidence.
+    expected_provenance: Any = None
+
+
+class RuntimeIdentityResolveResponseV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["runtime-identity.v2"] = "runtime-identity.v2"
+    result: RuntimeIdentityResolveResponse
+    provenance: RuntimeIdentityProvenance
+
+
 WorldStateFreshnessState = Literal[
     "fresh",
     "aging",
