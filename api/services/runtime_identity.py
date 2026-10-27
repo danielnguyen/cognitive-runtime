@@ -9,8 +9,11 @@ from models import (
     PersonaProfile,
     PersonaSelectionDecision,
     RuntimeIdentityContext,
+    RuntimeIdentityProvenance,
     RuntimeIdentityResolveRequest,
+    RuntimeIdentityResolveRequestV2,
     RuntimeIdentityResolveResponse,
+    RuntimeIdentityResolveResponseV2,
     RuntimeIdentityTrace,
     SurfaceBinding,
 )
@@ -46,7 +49,7 @@ def _selection_scope(body) -> dict:
     )}
 
 
-def _strict_bound_persona(surface: str):
+def _strict_bound_persona(surface: str, producer_inputs: dict | None = None):
     repository = companion_contracts_repository()
     try:
         record = _surface_binding(surface)
@@ -65,6 +68,9 @@ def _strict_bound_persona(surface: str):
         raise
     unknown = binding.surface_id != surface or binding.surface_id == "unknown"
     persona = repository.persona_profile(binding.default_persona_id)
+    if producer_inputs is not None:
+        producer_inputs["surface_binding"] = binding.model_dump()
+        producer_inputs["bound_persona_present"] = persona is not None
     if persona is None:
         persona = repository.default_persona_profile()
         return (
@@ -77,13 +83,15 @@ def _strict_bound_persona(surface: str):
     ), ("unknown_surface_default" if unknown else "surface_default")
 
 
-def _contextual_proposal(events, request_id: str):
+def _contextual_proposal(events, request_id: str, producer_inputs: dict | None = None):
     governance = [
         event for event in events if event.event_type == "interaction_governance_evaluated"
     ]
     if not governance:
         raise ValueError("persona_selection_governance_missing")
     event = governance[-1]
+    if producer_inputs is not None:
+        producer_inputs["governance"] = event.model_dump()
     payload = event.event_payload_json
     if payload.get("request_id") != request_id:
         raise ValueError("persona_selection_governance_mismatch")
@@ -91,25 +99,47 @@ def _contextual_proposal(events, request_id: str):
     if type(kind) is not str or kind not in get_args(InteractionGovernanceKind):
         raise ValueError("persona_selection_governance_invalid")
     hint = persona_scope_hint_for_kind(kind)
+    if producer_inputs is not None:
+        producer_inputs["contextual_hint"] = hint
     if hint is None:
         return event, None, "none", "none", "no_contextual_proposal"
     proposed = persona_from_scope_hint(hint)
-    if proposed is None or companion_contracts_repository().persona_profile(proposed) is None:
+    if producer_inputs is not None:
+        producer_inputs["contextual_persona"] = proposed
+    proposed_record = (
+        companion_contracts_repository().persona_profile(proposed) if proposed is not None else None
+    )
+    if producer_inputs is not None:
+        # Selection consumes existence, not the proposed persona's policy or text.
+        producer_inputs["proposed_persona_present"] = proposed_record is not None
+    if proposed is None or proposed_record is None:
         return event, proposed, "interaction_governance", "rejected", "proposal_unmapped"
     return (
         event, proposed, "interaction_governance", "advisory", "contextual_activation_not_enabled",
     )
 
 
-def resolve_persona_selection(body: RuntimeIdentityResolveRequest):
+def resolve_persona_selection(
+    body: RuntimeIdentityResolveRequest, producer_inputs: dict | None = None,
+):
     """Only binding authority activates a persona; classification stays advisory."""
     scope = _selection_scope(body)
     repository = runtime_state_repository()
     session, revision, events = repository.persona_selection_events(**scope)
     governance, proposed, proposal_source, status, reason = _contextual_proposal(
-        events, body.request_id,
+        events, body.request_id, producer_inputs,
     )
-    binding, persona, source, selection_reason = _strict_bound_persona(body.surface)
+    binding, persona, source, selection_reason = _strict_bound_persona(
+        body.surface, producer_inputs,
+    )
+    if producer_inputs is not None:
+        producer_inputs.update(
+            request=body.model_dump(), runtime_session=session.model_dump(),
+            thread_revision=revision, selected_persona=persona.model_dump(),
+            turn_started=[event.model_dump() for event in events if (
+                event.event_type == "turn_started"
+            )],
+        )
     payload = {
         **{key: value for key, value in scope.items() if key != "expected_thread_revision"},
         "thread_revision": revision, "governance_event_ref": governance.event_id,
@@ -122,7 +152,14 @@ def resolve_persona_selection(body: RuntimeIdentityResolveRequest):
         "contextual_activation": False, "explicit_selection_verified": False,
     }
     selection = PersonaSelectionDecision(selection_ref=_selection_ref(payload), **payload)
-    repository.persona_selection_events(**scope, selection=selection)
+    _, _, committed_events = repository.persona_selection_events(**scope, selection=selection)
+    if producer_inputs is not None:
+        committed = [event for event in committed_events if (
+            event.event_type == "persona_selection_resolved"
+        )]
+        if len(committed) != 1 or committed[0].event_payload_json != selection.model_dump():
+            raise ValueError("persona_selection_provenance_invalid")
+        producer_inputs["selection_event_ref"] = committed[0].event_id
     return session, binding, persona, selection
 
 
@@ -244,10 +281,13 @@ def _identity_content(*, persona: PersonaProfile, binding: SurfaceBinding) -> st
 
 def resolve_runtime_identity(
     body: RuntimeIdentityResolveRequest,
+    *, producer_inputs: dict | None = None,
 ) -> RuntimeIdentityResolveResponse:
     selection = None
     if body.persona_selection_mode == "strict":
-        session, binding, persona_record, selection = resolve_persona_selection(body)
+        session, binding, persona_record, selection = resolve_persona_selection(
+            body, producer_inputs,
+        )
         resolution_reason = (
             "surface_binding" if selection.selection_source == "surface_binding"
             else "default_fallback"
@@ -315,3 +355,51 @@ def resolve_runtime_identity(
         selection_contract="strict_turn" if selection else "legacy_unbound",
         persona_selection=selection,
     )
+
+
+def _identity_digest(material: dict) -> str:
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return f"sha256:{sha256(canonical.encode()).hexdigest()}"
+
+
+def resolve_runtime_identity_v2(
+    body: RuntimeIdentityResolveRequestV2,
+) -> RuntimeIdentityResolveResponseV2:
+    """Observe authority afresh; never store or reuse a cached policy result.
+
+    Optional expected provenance is compared to this computation, not trusted as
+    authority. Reads across runtime and companion stores are not an atomic
+    snapshot or lease: later consumers must observe dependencies again when
+    their immutability cannot otherwise be established.
+    """
+    expected = None
+    if "expected_provenance" in body.model_fields_set:
+        try:
+            expected = RuntimeIdentityProvenance.model_validate(body.expected_provenance)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("persona_selection_provenance_invalid") from exc
+    request = RuntimeIdentityResolveRequest(**body.model_dump(exclude={"expected_provenance"}))
+    inputs = {"policy_version": "strict-persona-selection.v1"}
+    result = resolve_runtime_identity(request, producer_inputs=inputs)
+    selection = result.persona_selection
+    if selection is None:
+        raise ValueError("persona_selection_provenance_invalid")
+    metadata = {
+        "schema_version": "runtime-identity.v2",
+        "policy_version": "strict-persona-selection.v1",
+        "producer": "cognitive-runtime", "endpoint": "/v2/runtime/identity/resolve",
+        "decision": "strict_persona_selection", "freshness": "observed_inputs_only",
+        **{key: getattr(selection, key) for key in (
+            "request_id", "owner_id", "conversation_id", "surface", "runtime_session_id",
+            "runtime_turn_id", "thread_revision", "selection_ref", "governance_event_ref",
+        )},
+        "selection_event_ref": inputs.pop("selection_event_ref"),
+        "input_digest": _identity_digest(inputs),
+        "result_digest": _identity_digest(result.model_dump()),
+    }
+    provenance = RuntimeIdentityProvenance(
+        **metadata, provenance_ref=_identity_digest(metadata),
+    )
+    if expected is not None and expected != provenance:
+        raise ValueError("persona_selection_provenance_mismatch")
+    return RuntimeIdentityResolveResponseV2(result=result, provenance=provenance)

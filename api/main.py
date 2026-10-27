@@ -78,7 +78,9 @@ from models import (
     RetirementReservationRequest,
     RetirementReservationResponse,
     RuntimeIdentityResolveRequest,
+    RuntimeIdentityResolveRequestV2,
     RuntimeIdentityResolveResponse,
+    RuntimeIdentityResolveResponseV2,
     RuntimeOverlayResponse,
     RuntimePresenceEvaluateRequest,
     RuntimePresenceEvaluateResponse,
@@ -182,7 +184,7 @@ from services.relationships import (
     upsert_relationship_entity,
 )
 from services.restraint import evaluate_restraint
-from services.runtime_identity import resolve_runtime_identity
+from services.runtime_identity import resolve_runtime_identity, resolve_runtime_identity_v2
 from services.runtime_state import (
     build_overlay,
     cancel_runtime_retirement,
@@ -861,6 +863,29 @@ async def runtime_identity_resolve(
         },
     )
     return resolution
+
+
+@app.post("/v2/runtime/identity/resolve", response_model=RuntimeIdentityResolveResponseV2)
+async def runtime_identity_resolve_v2(
+    body: RuntimeIdentityResolveRequestV2,
+) -> RuntimeIdentityResolveResponseV2:
+    try:
+        response = resolve_runtime_identity_v2(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="persona_selection_rejected") from exc
+    resolution = response.result
+    record_runtime_event(
+        runtime_session_id=body.runtime_session_id, runtime_turn_id=body.runtime_turn_id,
+        event_type="identity_resolved",
+        event_payload_json={
+            "request_id": body.request_id,
+            "active_persona_id": resolution.trace.active_persona_id,
+            "persona_resolution_reason": resolution.trace.persona_resolution_reason,
+            "surface_id": resolution.trace.surface_id,
+            "persona_selection_ref": resolution.persona_selection.selection_ref,
+        },
+    )
+    return response
 
 
 @app.post("/v1/relationships/entities/upsert", response_model=RelationshipEntityResponse)
