@@ -1799,14 +1799,29 @@ class SemanticEvidenceAdvisory(BaseModel):
     candidate_source_ids: list[EvidenceSufficiencyIdentifier] = Field(max_length=3)
     aggregate_function: AggregateFunction | None = None
     aggregate_field_name: AggregateFieldName | None = None
+    external_evidence_need: Literal[
+        "supplied_information_sufficient", "external_facts_needed", "uncertain"
+    ] | None = None
+
+    @field_validator("external_evidence_need", mode="before")
+    @classmethod
+    def normalize_external_evidence_need(cls, value: Any) -> str | None:
+        # This optional hint must not invalidate otherwise usable source advice.
+        if isinstance(value, str) and value in {
+            "supplied_information_sufficient", "external_facts_needed", "uncertain"
+        }:
+            return value
+        return None
 
     @model_serializer(mode="wrap")
-    def omit_absent_aggregate_fields(self, handler):
+    def omit_absent_optional_fields(self, handler):
         serialized = handler(self)
         if self.aggregate_function is None:
             serialized.pop("aggregate_function", None)
         if self.aggregate_field_name is None:
             serialized.pop("aggregate_field_name", None)
+        if self.external_evidence_need is None:
+            serialized.pop("external_evidence_need", None)
         return serialized
 
     @field_validator("aggregate_field_name")
