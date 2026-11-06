@@ -806,15 +806,6 @@ def _build_result(
 
 def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
     specialized = _specialized_shapes(body.task_text)
-    effective_task_shape = _effective_task_shape(body, specialized=specialized)
-    source_match = _derive_source_match(
-        body,
-        effective_task_shape=effective_task_shape,
-    )
-    source_context_material = source_match is not None and source_match.status in {
-        "matched",
-        "ambiguous",
-    }
     explicit_evidence = _explicit_evidence_language(
         body.task_text,
         specialized=specialized,
@@ -827,12 +818,47 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         if context.semantic_advisory is not None
         else None
     )
+    context_material = bool(
+        context.evidence_input_kinds
+        or context.external_verification_required
+        or context.freshness_sensitive
+        or context.high_stakes_accuracy_required
+        or context.continuation_of_prior_evidence_task
+    )
+    # Source ambiguity can refine an evidence task, but a comparison advisory
+    # alone cannot make an ordinary, unmatched question evidence-dependent.
+    comparison_advice_only = False
+    if (
+        context.semantic_advisory is not None
+        and context.semantic_advisory.interpretation_status == "ambiguous"
+        and semantic_operation == "comparison"
+        and not context_material
+        and not distinct_evidence_request
+    ):
+        deterministic = _derive_deterministic_source_match(body)
+        comparison_advice_only = (
+            deterministic is not None and deterministic.result.status == "no_match"
+        )
+    effective_task_shape = _effective_task_shape(body, specialized=specialized)
+    source_match = _derive_source_match(
+        body,
+        effective_task_shape=None if comparison_advice_only else effective_task_shape,
+    )
+    source_context_material = (
+        not comparison_advice_only
+        and source_match is not None
+        and source_match.status in {
+            "matched",
+            "ambiguous",
+        }
+    )
     # An unsuccessful source interpretation cannot establish an evidence need
     # from its operation hint alone. Independent task/context requirements remain.
     semantic_operation_material = (
         context.semantic_advisory is not None
         and context.semantic_advisory.interpretation_status != "no_match"
         and semantic_operation not in {None, "unknown"}
+        and not comparison_advice_only
     )
     reasons = _materiality_reasons(
         body,
@@ -841,13 +867,6 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
     )
     if source_context_material:
         reasons.add("source_context_present")
-    context_material = bool(
-        context.evidence_input_kinds
-        or context.external_verification_required
-        or context.freshness_sensitive
-        or context.high_stakes_accuracy_required
-        or context.continuation_of_prior_evidence_task
-    )
     evidence_material = (
         context_material
         or distinct_evidence_request

@@ -2844,6 +2844,7 @@ def test_semantic_ambiguity_requires_every_probe_candidate_available(
         _start_runtime(),
         task_text="Please handle this question.",
         task_context=_context(
+            external_verification_required=True,
             source_discovery=_discovery(
                 _discovery_source(
                     "source_a", "Alpine Register", availability=availability
@@ -2918,6 +2919,124 @@ def test_unsafe_semantic_ambiguity_does_not_authorize_probe(
 
 
 @pytest.mark.parametrize(
+    "task_text",
+    [
+        "I have 12 blue beads and 8 red beads. How many beads do I have?",
+        "The dough rests about an hour. When can I shape it if I start at noon?",
+        "My walk was roughly 3 km yesterday and 4 km today. What is the total?",
+        "Compare these lengths: the ribbon is 8 cm and the cord is 5 cm.",
+        "Does this sentence work in the paragraph? It says 'The door opened.'",
+    ],
+)
+def test_ambiguous_comparison_alone_keeps_self_contained_turn_ordinary(task_text: str):
+    runtime = _start_runtime()
+    discovery = _discovery(
+        _discovery_source("source_a", "Alpine Register"),
+        _discovery_source("source_b", "Harbor Register"),
+    )
+    initial = _derive(
+        runtime, task_text=task_text, task_context=_context(source_discovery=discovery)
+    ).json()["result"]
+    _assert_not_applicable(initial)
+    assert initial["source_match"] == {
+        "status": "no_match",
+        "matched_source_ids": [],
+        "reason_codes": ["no_source_specific_match"],
+    }
+
+    for advisory in (
+        _semantic_advisory("ambiguous", "comparison", "source_b", "source_a"),
+        _semantic_advisory("no_match", "comparison"),
+    ):
+        result = _derive(
+            runtime,
+            task_text=task_text,
+            task_context=_context(source_discovery=discovery, semantic_advisory=advisory),
+        ).json()["result"]
+        _assert_not_applicable(result)
+        assert result["source_match"]["status"] == advisory["interpretation_status"]
+        assert result["source_match"]["matched_source_ids"] == []
+        assert not result["source_match"].get("probe_source_ids")
+        assert "source_context_present" not in result["reason_codes"]
+        assert "semantic_operation_hint" not in result["reason_codes"]
+
+    for event in _shape_events(runtime["runtime_session_id"]):
+        payload = event["event_payload_json"]
+        assert payload["derivation_status"] == "not_applicable"
+        assert "probe_source_count" not in payload
+        assert task_text not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("task_text", "authority", "expected_shape"),
+    [
+        ("Compare the available records.", {}, "cross_source_comparison"),
+        ("Please verify the reports.", {}, "cross_source_comparison"),
+        ("Will these two modules work together?", {}, "cross_source_comparison"),
+        (
+            "I have 12 beads. Also, compare the available records.",
+            {},
+            "cross_source_comparison",
+        ),
+        (
+            "Please handle this question.",
+            {"external_verification_required": True},
+            "cross_source_comparison",
+        ),
+        (
+            "Please handle this question.",
+            {"freshness_sensitive": True},
+            "cross_source_comparison",
+        ),
+        (
+            "Please handle this question.",
+            {"high_stakes_accuracy_required": True},
+            "cross_source_comparison",
+        ),
+        (
+            "Please handle this question.",
+            {"evidence_input_kinds": ["artifact"]},
+            "cross_source_comparison",
+        ),
+        (
+            "Continue with the next item.",
+            {"continuation_of_prior_evidence_task": True, "prior_task_shape": "targeted_lookup"},
+            "targeted_lookup",
+        ),
+        ("What does Alpine Register say?", {}, "cross_source_comparison"),
+        ("What is the operations result?", {}, "cross_source_comparison"),
+    ],
+)
+def test_ambiguous_comparison_preserves_independent_evidence_authority(
+    task_text: str,
+    authority: dict[str, object],
+    expected_shape: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        task_context=_context(
+            **authority,
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register", domain_tags=["operations"]),
+                _discovery_source("source_b", "Harbor Register", domain_tags=["operations"]),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "comparison", "source_b", "source_a"
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == expected_shape
+    assert result["evidence_scope_material"] is True
+    assert result["clarification_required"] is False
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert result["source_match"]["probe_source_ids"] == ["source_a", "source_b"]
+
+
+@pytest.mark.parametrize(
     ("operation_hint", "expected_shape"),
     [
         ("comparison", "cross_source_comparison"),
@@ -2933,6 +3052,7 @@ def test_semantic_ambiguity_authorizes_bounded_probe_for_safe_reasoning_shapes(
         _start_runtime(),
         task_text="Please handle this bounded question.",
         task_context=_context(
+            external_verification_required=True,
             source_discovery=_discovery(
                 _discovery_source("source_c", "Forest Register"),
                 _discovery_source("source_a", "Alpine Register"),
@@ -3368,12 +3488,16 @@ def test_semantic_candidate_and_inventory_order_are_canonical():
     assert first["derivation_id"] == second["derivation_id"]
 
 
-def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
+@pytest.mark.parametrize("external_verification_required", [False, True])
+def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids(
+    external_verification_required: bool,
+):
     runtime = _start_runtime()
     _derive(
         runtime,
         task_text="SECRETQUESTIONMARKER please answer this question.",
         task_context=_context(
+            external_verification_required=external_verification_required,
             source_discovery=_discovery(
                 _discovery_source(
                     "private_candidate_alpha",
@@ -3400,7 +3524,12 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
     assert payload["semantic_interpretation_status"] == "ambiguous"
     assert payload["semantic_operation_hint"] == "comparison"
     assert payload["semantic_candidate_count"] == 2
-    assert payload["probe_source_count"] == 2
+    if external_verification_required:
+        assert payload["derivation_status"] == "derived"
+        assert payload["probe_source_count"] == 2
+    else:
+        assert payload["derivation_status"] == "not_applicable"
+        assert "probe_source_count" not in payload
     assert "matched_source_ids" not in payload
     assert "probe_source_ids" not in payload
     for sentinel in (
