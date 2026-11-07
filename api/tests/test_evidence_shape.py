@@ -111,6 +111,7 @@ def _semantic_advisory(
     *candidate_source_ids: str,
     aggregate_function: str | None = None,
     aggregate_field_name: str | None = None,
+    external_evidence_need: str | None = None,
 ) -> dict[str, object]:
     advisory: dict[str, object] = {
         "interpretation_status": interpretation_status,
@@ -121,6 +122,8 @@ def _semantic_advisory(
         advisory["aggregate_function"] = aggregate_function
     if aggregate_field_name is not None:
         advisory["aggregate_field_name"] = aggregate_field_name
+    if external_evidence_need is not None:
+        advisory["external_evidence_need"] = external_evidence_need
     return advisory
 
 
@@ -2844,6 +2847,7 @@ def test_semantic_ambiguity_requires_every_probe_candidate_available(
         _start_runtime(),
         task_text="Please handle this question.",
         task_context=_context(
+            external_verification_required=True,
             source_discovery=_discovery(
                 _discovery_source(
                     "source_a", "Alpine Register", availability=availability
@@ -2918,6 +2922,128 @@ def test_unsafe_semantic_ambiguity_does_not_authorize_probe(
 
 
 @pytest.mark.parametrize(
+    "task_text",
+    [
+        "I have 12 blue beads and 8 red beads. How many beads do I have?",
+        "The dough rests about an hour. When can I shape it if I start at noon?",
+        "My walk was roughly 3 km yesterday and 4 km today. What is the total?",
+        "Compare these lengths: the ribbon is 8 cm and the cord is 5 cm.",
+        "Does this sentence work in the paragraph? It says 'The door opened.'",
+    ],
+)
+def test_sufficient_ambiguous_comparison_keeps_self_contained_turn_ordinary(task_text: str):
+    runtime = _start_runtime()
+    discovery = _discovery(
+        _discovery_source("source_a", "Alpine Register"),
+        _discovery_source("source_b", "Harbor Register"),
+    )
+    initial = _derive(
+        runtime, task_text=task_text, task_context=_context(source_discovery=discovery)
+    ).json()["result"]
+    _assert_not_applicable(initial)
+    assert initial["source_match"] == {
+        "status": "no_match",
+        "matched_source_ids": [],
+        "reason_codes": ["no_source_specific_match"],
+    }
+
+    for advisory in (
+        _semantic_advisory(
+            "ambiguous", "comparison", "source_b", "source_a",
+            external_evidence_need="supplied_information_sufficient",
+        ),
+        _semantic_advisory("no_match", "comparison"),
+    ):
+        result = _derive(
+            runtime,
+            task_text=task_text,
+            task_context=_context(source_discovery=discovery, semantic_advisory=advisory),
+        ).json()["result"]
+        _assert_not_applicable(result)
+        assert result["source_match"]["status"] == advisory["interpretation_status"]
+        assert result["source_match"]["matched_source_ids"] == []
+        assert not result["source_match"].get("probe_source_ids")
+        assert "source_context_present" not in result["reason_codes"]
+        assert "semantic_operation_hint" not in result["reason_codes"]
+
+    for event in _shape_events(runtime["runtime_session_id"]):
+        payload = event["event_payload_json"]
+        assert payload["derivation_status"] == "not_applicable"
+        assert "probe_source_count" not in payload
+        assert task_text not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("task_text", "authority", "expected_shape"),
+    [
+        ("Compare the available records.", {}, "cross_source_comparison"),
+        ("Please verify the reports.", {}, "cross_source_comparison"),
+        ("Will these two modules work together?", {}, "cross_source_comparison"),
+        (
+            "I have 12 beads. Also, compare the available records.",
+            {},
+            "cross_source_comparison",
+        ),
+        (
+            "Please handle this question.",
+            {"external_verification_required": True},
+            "cross_source_comparison",
+        ),
+        (
+            "Please handle this question.",
+            {"freshness_sensitive": True},
+            "cross_source_comparison",
+        ),
+        (
+            "Please handle this question.",
+            {"high_stakes_accuracy_required": True},
+            "cross_source_comparison",
+        ),
+        (
+            "Please handle this question.",
+            {"evidence_input_kinds": ["artifact"]},
+            "cross_source_comparison",
+        ),
+        (
+            "Continue with the next item.",
+            {"continuation_of_prior_evidence_task": True, "prior_task_shape": "targeted_lookup"},
+            "targeted_lookup",
+        ),
+        ("What does Alpine Register say?", {}, "cross_source_comparison"),
+        ("What is the operations result?", {}, "cross_source_comparison"),
+    ],
+)
+def test_ambiguous_comparison_preserves_independent_evidence_authority(
+    task_text: str,
+    authority: dict[str, object],
+    expected_shape: str,
+):
+    result = _derive(
+        _start_runtime(),
+        task_text=task_text,
+        task_context=_context(
+            **authority,
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register", domain_tags=["operations"]),
+                _discovery_source("source_b", "Harbor Register", domain_tags=["operations"]),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "comparison", "source_b", "source_a",
+                external_evidence_need="supplied_information_sufficient",
+            ),
+        ),
+    ).json()["result"]
+
+    assert result["derivation_status"] == "derived"
+    assert result["task_shape"] == expected_shape
+    assert result["evidence_scope_material"] is True
+    assert result["clarification_required"] is False
+    assert result["source_match"]["status"] == "ambiguous"
+    assert result["source_match"]["matched_source_ids"] == []
+    assert result["source_match"]["probe_source_ids"] == ["source_a", "source_b"]
+
+
+@pytest.mark.parametrize(
     ("operation_hint", "expected_shape"),
     [
         ("comparison", "cross_source_comparison"),
@@ -2933,6 +3059,7 @@ def test_semantic_ambiguity_authorizes_bounded_probe_for_safe_reasoning_shapes(
         _start_runtime(),
         task_text="Please handle this bounded question.",
         task_context=_context(
+            external_verification_required=True,
             source_discovery=_discovery(
                 _discovery_source("source_c", "Forest Register"),
                 _discovery_source("source_a", "Alpine Register"),
@@ -3368,12 +3495,16 @@ def test_semantic_candidate_and_inventory_order_are_canonical():
     assert first["derivation_id"] == second["derivation_id"]
 
 
-def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
+@pytest.mark.parametrize("external_verification_required", [False, True])
+def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids(
+    external_verification_required: bool,
+):
     runtime = _start_runtime()
     _derive(
         runtime,
         task_text="SECRETQUESTIONMARKER please answer this question.",
         task_context=_context(
+            external_verification_required=external_verification_required,
             source_discovery=_discovery(
                 _discovery_source(
                     "private_candidate_alpha",
@@ -3391,6 +3522,7 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
                 "comparison",
                 "private_candidate_beta",
                 "private_candidate_alpha",
+                external_evidence_need="supplied_information_sufficient",
             ),
         ),
     )
@@ -3400,7 +3532,12 @@ def test_semantic_event_is_structural_and_hides_ambiguous_candidate_ids():
     assert payload["semantic_interpretation_status"] == "ambiguous"
     assert payload["semantic_operation_hint"] == "comparison"
     assert payload["semantic_candidate_count"] == 2
-    assert payload["probe_source_count"] == 2
+    if external_verification_required:
+        assert payload["derivation_status"] == "derived"
+        assert payload["probe_source_count"] == 2
+    else:
+        assert payload["derivation_status"] == "not_applicable"
+        assert "probe_source_count" not in payload
     assert "matched_source_ids" not in payload
     assert "probe_source_ids" not in payload
     for sentinel in (
@@ -4207,3 +4344,246 @@ def test_enriched_aggregate_event_omits_contract_metadata():
     assert "aggregate_field_name" not in payload
     assert "content_fields" not in payload
     assert "PRIVATE_AGGREGATE_FIELD" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("question", "facts"),
+    [
+        ("Which shift had more late arrivals last month, morning or evening?",
+         "Morning had 8 and evening had 3."),
+        ("Which group had more late arrivals last month, the first crew or the second?",
+         "The first crew had 8 and the second had 3."),
+        ("Which depot handled more parcels last week?", "East handled 8 and west handled 3."),
+        ("Which kiln yielded more intact tiles?", "Kiln A yielded 8 and kiln B yielded 3."),
+        ("Which reef had more nesting pairs?", "Reef A had 8 and reef B had 3."),
+    ],
+)
+def test_external_evidence_need_paired_comparison_regression(question: str, facts: str):
+    discovery = _discovery(
+        _discovery_source("source_a", "North Gate Swipe Ledger"),
+        _discovery_source("source_b", "South Gate Swipe Ledger"),
+    )
+    advice = _semantic_advisory("ambiguous", "comparison", "source_a", "source_b")
+    # Same operation/candidates; only supplied facts, evidence need, or explicit
+    # verification differ. The legacy request must retain implicit comparison.
+    for text, need, expected in [
+        (question, None, "derived"),
+        (question, "external_facts_needed", "derived"),
+        (f"{facts} {question}", "supplied_information_sufficient", "not_applicable"),
+        (f"{facts} {question} Please verify independently.",
+         "supplied_information_sufficient", "derived"),
+    ]:
+        initial = _fixed_shape_request(task_text=text, source_discovery=discovery)
+        if "verify" not in text:
+            assert _derive_result(initial).derivation_status == "not_applicable"
+            assert _derive_result(initial).source_match.status == "no_match"
+        advisory = dict(advice)
+        if need is not None:
+            advisory["external_evidence_need"] = need
+        request = _fixed_shape_request(
+            task_text=text, source_discovery=discovery, semantic_advisory=advisory,
+        )
+        result = _derive_result(request)
+        assert result.derivation_status == expected
+        assert result.source_match.matched_source_ids == []
+        assert result.source_match.probe_source_ids == (
+            [] if expected == "not_applicable" else ["source_a", "source_b"]
+        )
+        assert result.task_shape == (
+            None if expected == "not_applicable" else "cross_source_comparison"
+        )
+
+
+@pytest.mark.parametrize("value", [None, "uncertain", "unknown", "", "SUFFICIENT",
+                                      True, 1, [], {}, ["supplied_information_sufficient"],
+                                      {"value": "supplied_information_sufficient"}])
+def test_external_evidence_need_unusable_value_preserves_legacy_advisory(value: object):
+    discovery = _discovery(
+        _discovery_source("source_a", "Alpine Register"),
+        _discovery_source("source_b", "Harbor Register"),
+    )
+    advice = _semantic_advisory("ambiguous", "comparison", "source_a", "source_b")
+    legacy = _fixed_shape_request(
+        task_text="Which kiln yielded more intact tiles?",
+        source_discovery=discovery, semantic_advisory=advice,
+    )
+    enriched = EvidenceShapeDeriveRequest.model_validate({
+        **legacy.model_dump(mode="json", exclude_none=True),
+        "task_context": {
+            **legacy.task_context.model_dump(mode="json", exclude_none=True),
+            "semantic_advisory": {**advice, "external_evidence_need": value},
+        },
+    })
+    result = _derive_result(enriched)
+    assert result.derivation_status == "derived"
+    assert result.task_shape == "cross_source_comparison"
+    assert result.source_match.probe_source_ids == ["source_a", "source_b"]
+    wire = enriched.model_dump(mode="json")["task_context"]["semantic_advisory"]
+    if value == "uncertain":
+        assert wire == {**advice, "external_evidence_need": "uncertain"}
+        assert result.model_dump(exclude={"derivation_id"}) == _derive_result(legacy).model_dump(
+            exclude={"derivation_id"}
+        )
+    else:
+        assert wire == advice
+        assert result == _derive_result(legacy)
+
+
+@pytest.mark.parametrize("need", ["supplied_information_sufficient", "external_facts_needed",
+                                  "uncertain"])
+def test_external_evidence_need_serialization_and_no_match(need: str):
+    advice = _semantic_advisory("no_match", "comparison", external_evidence_need=need)
+    request = _fixed_shape_request(
+        task_text="What is 7 + 5?",
+        source_discovery=_discovery(_discovery_source("source_a", "Alpine Register")),
+        semantic_advisory=advice,
+    )
+    assert request.task_context.semantic_advisory.model_dump(mode="json") == advice
+    assert EvidenceShapeDeriveRequest.model_validate_json(
+        request.model_dump_json(exclude_none=True)
+    ) == request
+    result = _derive_result(request)
+    assert result.derivation_status == "not_applicable"
+    assert result.source_match.status == "no_match"
+    assert result.source_match.probe_source_ids == []
+
+
+@pytest.mark.parametrize("update", [
+    {"operation_hint": "invented"}, {"interpretation_status": "invented"},
+    {"candidate_source_ids": ["source_a", "source_a"]},
+    {"candidate_source_ids": ["not_in_inventory", "source_b"]},
+    {"candidate_source_ids": "source_a"}, {"unrecognized_field": True},
+    {"aggregate_function": "sum"},
+])
+def test_external_evidence_need_fallback_keeps_other_validation_strict(update: dict):
+    with pytest.raises(ValidationError):
+        _fixed_shape_request(
+            task_text="Which kiln yielded more intact tiles?",
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory={
+                **_semantic_advisory("ambiguous", "comparison", "source_a", "source_b"),
+                "external_evidence_need": {"bad": "value"}, **update,
+            },
+        )
+
+
+@pytest.mark.parametrize("inventory", ["complete", "partial", "unknown", "unavailable"])
+@pytest.mark.parametrize("source_update", [
+    {}, {"availability": "disabled"}, {"availability": "unknown"},
+    {"availability": "unavailable"}, {"capabilities": ["fetch"]},
+])
+def test_external_evidence_need_never_expands_probe_authority(inventory: str, source_update: dict):
+    source = _discovery_source("source_a", "Alpine Register")
+    source.update(source_update)
+    discovery = _discovery(
+        source, _discovery_source("source_b", "Harbor Register"), inventory_status=inventory,
+    )
+    request = _fixed_shape_request(
+        task_text="Which kiln yielded more intact tiles?", source_discovery=discovery,
+        semantic_advisory=_semantic_advisory(
+            "ambiguous", "comparison", "source_a", "source_b",
+            external_evidence_need="external_facts_needed",
+        ),
+    )
+    result = _derive_result(request)
+    assert result.source_match.matched_source_ids == []
+    assert result.source_match.probe_source_ids == (
+        ["source_a", "source_b"] if inventory == "complete" and not source_update else []
+    )
+    assert "evidence" not in result.model_dump()
+
+
+@pytest.mark.parametrize("need", ["supplied_information_sufficient", "external_facts_needed"])
+def test_external_evidence_need_events_do_not_disclose_input_or_sources(need: str):
+    runtime = _start_runtime()
+    text = "SECRETQUESTIONMARKER kiln counts: A=8, B=3. Which is larger?"
+    response = _derive(runtime, task_text=text, task_context=_context(
+        source_discovery=_discovery(
+            _discovery_source("private_source_a", "Private Register A"),
+            _discovery_source("private_source_b", "Private Register B"),
+        ),
+        semantic_advisory=_semantic_advisory(
+            "ambiguous", "comparison", "private_source_a", "private_source_b",
+            external_evidence_need=need,
+        ),
+    ))
+    assert response.status_code == 200
+    payload = _shape_events(runtime["runtime_session_id"])[0]["event_payload_json"]
+    serialized = json.dumps(payload)
+    for secret in [text, "Private Register", "private_source_a", "private_source_b", need]:
+        assert secret not in serialized
+    assert payload.get("probe_source_count", 0) == (2 if need == "external_facts_needed" else 0)
+
+
+@pytest.mark.parametrize(
+    ("status", "operation", "candidates", "identity"),
+    [
+        ("ambiguous", "comparison", ["source_a", "source_b"],
+         "evidence_shape_c1c69322557a7d90ae068cb8f75d1c90"),
+        ("resolved", "lookup", ["source_a"],
+         "evidence_shape_0177ae71d84bd96c3c65e906cd996752"),
+        ("no_match", "comparison", [], "evidence_shape_40aca4d8f4e1daaddc41619751a35e3a"),
+    ],
+)
+def test_legacy_sender_advisory_wire_and_identity(
+    status: str, operation: str, candidates: list[str], identity: str,
+):
+    # Captured from main before the blanket comparison guard; old sender shape.
+    advice = _semantic_advisory(status, operation, *candidates)
+    request = _fixed_shape_request(
+        task_text="Which kiln yielded more intact tiles?",
+        source_discovery=_discovery(
+            _discovery_source("source_a", "Alpine Register"),
+            _discovery_source("source_b", "Harbor Register"),
+        ),
+        semantic_advisory=advice,
+    )
+    wire = request.model_dump(mode="json", exclude_none=True)
+    assert wire["task_context"]["semantic_advisory"] == advice
+    assert _derive_result(request).derivation_id == identity
+    assert EvidenceShapeDeriveRequest.model_validate(wire) == request
+
+
+@pytest.mark.parametrize("operation", ["lookup", "contradiction_review", "decision_support",
+                                       "exhaustive_review", "aggregate", "unknown"])
+def test_sufficient_information_does_not_change_unrelated_operations(operation: str):
+    request = _fixed_shape_request(
+        task_text="Which kiln yielded more intact tiles?",
+        source_discovery=_discovery(
+            _discovery_source("source_a", "Alpine Register"),
+            _discovery_source("source_b", "Harbor Register"),
+        ),
+        semantic_advisory=_semantic_advisory("ambiguous", operation, "source_a", "source_b"),
+    )
+    wire = request.model_dump(mode="json", exclude_none=True)
+    wire["task_context"]["semantic_advisory"]["external_evidence_need"] = (
+        "supplied_information_sufficient"
+    )
+    enriched = EvidenceShapeDeriveRequest.model_validate(wire)
+    assert _derive_result(enriched).model_dump(exclude={"derivation_id"}) == (
+        _derive_result(request).model_dump(exclude={"derivation_id"})
+    )
+
+
+def test_sufficient_information_does_not_suppress_actionable_request():
+    response = _derive(
+        _start_runtime(), task_text="Delete the smaller group.", interaction_kind="command",
+        task_context=_context(
+            source_discovery=_discovery(
+                _discovery_source("source_a", "Alpine Register"),
+                _discovery_source("source_b", "Harbor Register"),
+            ),
+            semantic_advisory=_semantic_advisory(
+                "ambiguous", "comparison", "source_a", "source_b",
+                external_evidence_need="supplied_information_sufficient",
+            ),
+        ),
+    )
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["derivation_status"] == "derived"
+    assert "action_allowed" not in result
+    assert result["source_match"]["matched_source_ids"] == []
