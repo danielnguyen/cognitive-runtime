@@ -825,31 +825,31 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         or context.high_stakes_accuracy_required
         or context.continuation_of_prior_evidence_task
     )
-    # Only a validated sufficiency hint can keep comparison advice from promoting
+    # Only a validated sufficiency hint can keep ambiguous advice from promoting
     # an ordinary unmatched question. Independent evidence authority takes priority;
     # absent or unusable hints retain legacy routing, not presumed self-containment.
-    comparison_advice_only = False
+    semantic_advice_only = False
     if (
         context.semantic_advisory is not None
         and context.semantic_advisory.external_evidence_need == "supplied_information_sufficient"
         and body.interaction_kind == "question"
         and context.semantic_advisory.interpretation_status == "ambiguous"
-        and semantic_operation == "comparison"
+        and semantic_operation in _SEMANTIC_OPERATION_SHAPES
         and not context_material
         and not distinct_evidence_request
         and not _DIRECT_EVIDENCE_OPERATORS.search(body.task_text)
     ):
         deterministic = _derive_deterministic_source_match(body)
-        comparison_advice_only = (
+        semantic_advice_only = (
             deterministic is not None and deterministic.result.status == "no_match"
         )
     effective_task_shape = _effective_task_shape(body, specialized=specialized)
     source_match = _derive_source_match(
         body,
-        effective_task_shape=None if comparison_advice_only else effective_task_shape,
+        effective_task_shape=None if semantic_advice_only else effective_task_shape,
     )
     source_context_material = (
-        not comparison_advice_only
+        not semantic_advice_only
         and source_match is not None
         and source_match.status in {
             "matched",
@@ -862,7 +862,7 @@ def _derive_result(body: EvidenceShapeDeriveRequest) -> EvidenceShapeResult:
         context.semantic_advisory is not None
         and context.semantic_advisory.interpretation_status != "no_match"
         and semantic_operation not in {None, "unknown"}
-        and not comparison_advice_only
+        and not semantic_advice_only
     )
     reasons = _materiality_reasons(
         body,
