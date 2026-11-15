@@ -19,14 +19,14 @@ Do not turn `runtime_state.py` or `models.py` length into a removal target. Thei
 | BMS `main` | `5120dcdb7e740680cdf3e526a961ab9ddded4516` | Same pinned API procedure; no sibling checkout changes. |
 | Projects `main` | `825c96e891360c064b799bcbe34a32d58c43e11c` | API-only governance and product records. |
 | ai-engineering `main` | `90a43f1b44bece5d9468565fff3adc61588f6516` | API-only shared instructions. |
-| BMS audit draft | `12e3810a28ddee395eac51212450b70cea1a4b03` | [PR #72](https://github.com/danielnguyen/basic-memory-store/pull/72), inspected as a proposal, not independently accepted findings. |
+| BMS audit draft | `12e3810a28ddee395eac51212450b70cea1a4b03` | [BMS change #72](https://github.com/danielnguyen/basic-memory-store/pull/72), inspected as a proposal, not independently accepted findings. |
 | CR issue body | SHA-256 `6733e546fece583ce695c51ef9b1638241a7574df7dee5dbaa2ae723bffb243e` | Live body matches the trusted task; comments read. |
 
-The existing unrelated checkout was preserved; CR uses a separate clean target directory. Policy repositories were read through the expressly authorized API path rather than cloned or synchronized as sibling working trees. CR `AGENTS.md` was read. Shared files read: `AGENTS.md`, `WORKFLOW.md`, `AUTHORITY.md`, `ENGINEERING.md`, `integrations/openhands.md`. Projects sources used: `AGENTS.md`, `process/repository-sync-preflight.md`, `process/recurring-friction-playbook.md`, relevant controller-contract sections, `CCP_CLIENT_ADAPTER_CONTRACT.md`, `ccp-backlog/README.md`, `COMPETITIVE_ASSESSMENT_2026-10-30.md`, `ccp-tech-debt/2026-05-31-cross-repo-architecture-debt.md`, and the conversational qualification checkpoint in `ccp-phase-6-presence/01_Requirement_Checklist.md`.
+The existing unrelated checkout was preserved; CR uses a separate clean target directory. Policy repositories were read through the expressly authorized API path rather than cloned or synchronized as sibling working trees. CR `AGENTS.md` was read. Shared files read: `AGENTS.md`, `WORKFLOW.md`, `AUTHORITY.md`, `ENGINEERING.md`, `integrations/openhands.md`. Projects sources used: `AGENTS.md`, `process/repository-sync-preflight.md`, `process/recurring-friction-playbook.md`, relevant controller-contract sections, `CCP_CLIENT_ADAPTER_CONTRACT.md`, `ccp-backlog/README.md`, `COMPETITIVE_ASSESSMENT_2026-10-30.md`, `ccp-tech-debt/2026-05-31-cross-repo-architecture-debt.md`, and the conversational qualification checkpoint reached through the pinned backlog’s recovery-checkpoint link.
 
-The [backlog][P-backlog] prioritizes one owner's private Telegram conversation, one canonical companion, durable preferences and restart continuity. One opted-in watch and one bounded read-only background responsibility are later MVP increments; multi-persona/social-graph expansion, native voice, avatars and consequential effects are excluded. The [controller hold][P-controller] and paused CO PR #217 remain in force.
+The [backlog][P-backlog] prioritizes one owner's private Telegram conversation, one canonical companion, durable preferences and restart continuity. One opted-in watch and one bounded read-only background responsibility are later MVP increments; multi-persona/social-graph expansion, native voice, avatars and consequential effects are excluded. The [controller hold][P-controller] and paused CO change #217 remain in force.
 
-The [qualification checkpoint][P-qualification] records owner-run Telegram correction retention across a Node-RED restart and CR continuation selection. This is historical recorded evidence, not a replay performed here. Its older active-work wording must not override the backlog's newer paused/unresolved status. Neither establishes the entire MVP as accepted.
+The qualification checkpoint linked from the [pinned backlog][P-qualification] records owner-run Telegram correction retention across a Node-RED restart and CR continuation selection. This is historical recorded evidence, not a replay performed here. Its older active-work wording must not override the backlog's newer paused/unresolved status. Neither establishes the entire MVP as accepted.
 
 “Source-wired” below means a concrete caller exists. It does not mean enabled or observed in production. Deployed revisions, effective flags, adapter configuration, all external callers, database contents, authentication/network deployment controls and real-user latency remain UNKNOWN. No protected host, live service, private memory or provider was accessed. The requested model/reasoning profile was not independently verified from execution configuration.
 
@@ -111,7 +111,7 @@ A shared contract package, BMS-backed CR projection, generic checkpointer, exter
 
 ## Cross-service reconciliation and lowest-risk sequence
 
-[BMS audit #71](https://github.com/danielnguyen/basic-memory-store/issues/71) now has [draft PR #72][B-audit]; [CO audit #240](https://github.com/danielnguyen/chat-orchestrator/issues/240) had no matching audit PR when checked. The BMS draft agrees that canonical records, policy enforcement and exact publication should remain, and identifies direct chat and initiative ownership as subtraction candidates. Its findings remain subject to independent review.
+[BMS audit #71](https://github.com/danielnguyen/basic-memory-store/issues/71) now has [draft change #72][B-audit]; [CO audit #240](https://github.com/danielnguyen/chat-orchestrator/issues/240) had no matching audit PR when checked. The BMS draft agrees that canonical records, policy enforcement and exact publication should remain, and identifies direct chat and initiative ownership as subtraction candidates. Its findings remain subject to independent review.
 
 BMS `main._run_chat` and both chat endpoints (1627–1950) still perform a separate orchestration path; CO's normal orchestration uses BMS conversation/retrieval/message APIs. The [older technical-debt record][P-debt] anticipated this duplication. Retiring that path could remove an entire competing lifecycle; splitting CR's large files cannot. External callers remain unknown, so this is not a declaration that BMS chat is safe to delete.
 
@@ -153,7 +153,7 @@ Acceptance: source-based flow/boundaries, ranked evidence matrix, candidate-spec
 [B-audit]: https://github.com/danielnguyen/basic-memory-store/blob/12e3810a28ddee395eac51212450b70cea1a4b03/docs/audits/ccp-subtractive-architecture-2026-11-15.md
 [P-backlog]: https://github.com/danielnguyen/projects/blob/825c96e891360c064b799bcbe34a32d58c43e11c/ccp-backlog/README.md
 [P-controller]: https://github.com/danielnguyen/projects/blob/825c96e891360c064b799bcbe34a32d58c43e11c/process/chatgpt-controller-contract.md
-[P-qualification]: https://github.com/danielnguyen/projects/blob/825c96e891360c064b799bcbe34a32d58c43e11c/ccp-phase-6-presence/01_Requirement_Checklist.md#current-qualification-checkpoint
+[P-qualification]: https://github.com/danielnguyen/projects/blob/825c96e891360c064b799bcbe34a32d58c43e11c/ccp-backlog/README.md
 [P-debt]: https://github.com/danielnguyen/projects/blob/825c96e891360c064b799bcbe34a32d58c43e11c/ccp-tech-debt/2026-05-31-cross-repo-architecture-debt.md
 
 [R-models]: https://github.com/danielnguyen/cognitive-runtime/blob/f3871f5f9db1b859143669fbc0d7de4cfe310148/api/models.py
