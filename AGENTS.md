@@ -1,28 +1,17 @@
 # CCP Agent Instructions
 
-## Mandatory bootstrap
+## Current instructions and objective
 
-Before trusting local files, repository evidence, or a commit SHA named by a prompt:
+Read the current `danielnguyen/ai-engineering/AGENTS.md`, followed by its relevant workflow, authority, engineering and integration guidance. Use the current target repository source, task and decisions for implementation and review. For conversation-first CCP work, [CO Issue #248](https://github.com/danielnguyen/chat-orchestrator/issues/248) is the canonical product objective; it does not authorize changing other repositories. Do not fetch or clone a sibling planning repository for CCP workflow or product context.
 
-- synchronize this repository and the sibling `../projects` repository from `origin`;
-- update only the declared base branches by fast-forward;
-- stop on unrelated local changes, fetch failure, unsafe divergence, or an unavailable remote baseline;
-- verify every referenced SHA in the repository where it is claimed to exist;
-- when a prompt says a SHA is merged into or contained by a branch, verify that it is reachable from that remote branch;
-- stop before editing or implementation when any verification fails. Do not proceed from stale local state.
+## Repository and commit verification
 
-Then read and follow:
+Before trusting evidence or modifying code, verify the repository origin, clean isolated checkout, fetched base and current PR head. Fast-forward only when safe; never overwrite, reset or stash unrelated work. Verify task-referenced source commits and claimed branch ancestry in their owning repository. A CI-generated GitHub PR merge commit may not arrive with a normal branch fetch: when referenced, explicitly fetch `refs/pull/<number>/merge` and verify the exact SHA, parents and current PR head rather than declaring a valid synthetic merge commit missing. Do not assume such a commit is merged into `main`.
 
-- `../projects/process/repository-sync-preflight.md`
-- `../projects/AGENTS.md`
+Preserve owner/thread isolation, privacy, source truth, action permissions, canonical persistence, independent review and owner-controlled merges/deployments. Stop the affected action on a genuine synchronization, integrity, access or safety failure; do not add permissions or bypass checks to proceed.
 
-These canonical files define the complete procedure and CCP workflow. If either cannot be loaded after synchronization, stop and report the missing governance source.
+## Local containment
 
-## Minimal execution containment
-
-`../projects/AGENTS.md` is the canonical CCP workflow source. Its Minimal CCP Execution Protocol is binding in this repository.
-
-Local containment rules:
 
 - Do not create new planning artifacts, execution briefs, inventory docs, cleanup plans, scripts, or Make targets unless the user explicitly asks for them or the allowed-file list names them.
 - Do not introduce wave, phase, cluster, packet, pass, or requirement labels into production runtime code as architecture, symbols, trace/API fields, or provider-visible wording.
